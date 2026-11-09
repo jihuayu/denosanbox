@@ -141,6 +141,6 @@ async fn real_vendored_npm_esm_fixtures_use_the_same_graph_boundary() {
     assert_eq!(result["equal"], true);
     assert_eq!(result["length"], 12);
     assert_eq!(result["process"], "undefined");
-    assert_eq!(result["worker"], "undefined");
+    assert_eq!(result["worker"], "function");
     assert!(engine.shutdown().await.unwrap().clean);
 }

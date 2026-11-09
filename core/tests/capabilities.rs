@@ -1,9 +1,12 @@
+#[cfg(feature = "deno")]
 use std::time::Duration;
 
 use denosanbox::{
-    BackendKind, Engine, EngineConfig, Error, Feature, InvocationOptions, PluginRequirements,
-    PluginSource, SandboxOptions,
+    BackendKind, Engine, EngineConfig, Error, Feature, PluginRequirements, PluginSource,
 };
+#[cfg(feature = "deno")]
+use denosanbox::{InvocationOptions, SandboxOptions};
+#[cfg(feature = "deno")]
 use serde_json::json;
 
 fn reject_native_code(engine: &Engine) {

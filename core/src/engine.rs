@@ -16,11 +16,6 @@ use tokio::sync::{mpsc, oneshot};
 
 const JOIN_GRACE: Duration = Duration::from_secs(5);
 const MIN_CALL_TIMEOUT: Duration = Duration::from_millis(1);
-/// Memory a root still hands to its descendants after reserving its own heap
-/// ceiling. Matches the measured deno_core baseline of one extra isolate so a
-/// root can always create its first registered child; deeper trees share the
-/// same pool and every per-sandbox heap target stays enforced.
-
 /// Engine owning a backend factory and at most `max_active_sandboxes` workers.
 #[derive(Clone)]
 pub struct Engine {

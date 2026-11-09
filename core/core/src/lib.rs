@@ -12,8 +12,8 @@ mod host;
 mod plugin;
 
 pub use backend::{
-    AckCallback, CreatedDriver, Driver, DriverControl, DriverFactory, Invocation, MetricsObserver,
-    StartOptions, UnavailableFactory,
+    CreatedDriver, Driver, DriverControl, DriverFactory, Invocation, MetricsObserver, StartOptions,
+    UnavailableFactory,
 };
 pub use capabilities::{Capabilities, Feature, PluginRequirements, RuntimeMetrics};
 pub use config::{

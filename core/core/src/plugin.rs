@@ -182,6 +182,7 @@ impl PreparedPlugin {
                 entrypoint: entrypoint.into(),
                 modules: self.graph.modules.clone(),
                 total_bytes: self.graph.total_bytes,
+                original_module_bytes: self.graph.original_module_bytes.clone(),
                 profile: self.graph.profile,
                 limits: self.graph.limits.clone(),
                 trusted: self.graph.trusted.clone(),
@@ -236,11 +237,33 @@ impl PreparedPlugin {
         if count > limits.max_modules {
             return Err(Error::LimitExceeded {
                 limit: "max_modules".to_string(),
-                detail: format!("plugin has {count} modules but the limit is {}", limits.max_modules),
+                detail: format!(
+                    "plugin has {count} modules but the limit is {}",
+                    limits.max_modules
+                ),
+            });
+        }
+        if self.graph.total_bytes > limits.max_graph_bytes {
+            return Err(Error::LimitExceeded {
+                limit: "max_graph_bytes".into(),
+                detail: "original source graph exceeds target limit".into(),
             });
         }
         let mut total = 0usize;
         for (path, source) in &self.graph.modules {
+            if self
+                .graph
+                .original_module_bytes
+                .get(path)
+                .copied()
+                .unwrap_or(0)
+                > limits.max_module_bytes
+            {
+                return Err(Error::LimitExceeded {
+                    limit: "max_module_bytes".into(),
+                    detail: format!("original source module '{path}' exceeds target limit"),
+                });
+            }
             if source.len() > limits.max_module_bytes {
                 return Err(Error::LimitExceeded {
                     limit: "max_module_bytes".to_string(),
@@ -304,6 +327,7 @@ pub(crate) struct PreparedGraph {
     pub(crate) entrypoint: String,
     pub(crate) modules: BTreeMap<String, String>,
     pub(crate) total_bytes: usize,
+    original_module_bytes: BTreeMap<String, usize>,
     pub(crate) profile: CompatibilityProfile,
     /// Limits the graph was prepared and proven within.
     pub(crate) limits: EngineLimits,
@@ -384,6 +408,7 @@ pub fn prepare_with_profile(
     let mut total_bytes = 0usize;
     let mut names = BTreeSet::new();
     let mut modules = BTreeMap::new();
+    let mut original_module_bytes = BTreeMap::new();
     for (path, text) in source.modules {
         validate_path(&path)?;
         if !names.insert(path.clone()) {
@@ -413,6 +438,7 @@ pub fn prepare_with_profile(
                 detail: "transpiled output exceeds module limit".into(),
             });
         }
+        original_module_bytes.insert(path.clone(), text.len());
         modules.insert(path, prepared);
     }
 
@@ -430,9 +456,19 @@ pub fn prepare_with_profile(
             });
         }
         total_bytes = total_bytes.saturating_add(text.len());
+        original_module_bytes.insert((*path).to_string(), text.len());
         modules.insert((*path).to_string(), (*text).to_string());
     }
 
+    let emitted_bytes = modules
+        .values()
+        .fold(0usize, |total, source| total.saturating_add(source.len()));
+    if emitted_bytes > limits.max_graph_bytes {
+        return Err(Error::LimitExceeded {
+            limit: "max_graph_bytes".into(),
+            detail: "transpiled graph exceeds graph limit".into(),
+        });
+    }
     if total_bytes > limits.max_graph_bytes {
         return Err(Error::LimitExceeded {
             limit: "max_graph_bytes".to_string(),
@@ -443,13 +479,6 @@ pub fn prepare_with_profile(
         });
     }
 
-    let emitted_bytes: usize = modules.values().map(String::len).sum();
-    if emitted_bytes > limits.max_graph_bytes {
-        return Err(Error::LimitExceeded {
-            limit: "max_graph_bytes".into(),
-            detail: "transpiled graph exceeds limit".into(),
-        });
-    }
     // Eagerly validate literal imports so a bad graph fails at prepare time.
     // The runtime loader still rechecks every resolution, including computed
     // dynamic imports, against this immutable map.
@@ -464,6 +493,7 @@ pub fn prepare_with_profile(
             entrypoint: source.entrypoint,
             modules,
             total_bytes,
+            original_module_bytes,
             profile,
             limits: limits.clone(),
             trusted: injected

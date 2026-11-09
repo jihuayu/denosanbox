@@ -244,9 +244,8 @@ impl DriverFactory for DenoFactory {
                 // hides the raw namespace, installs mediated globals and
                 // asserts the raw namespace is unreachable. The profile flag
                 // comes from the trusted prepared graph, never from guest input.
-                let node_worker_threads =
-                    plugin.profile() == CompatibilityProfile::PureJsNpm
-                        && plugin.has_reserved_builtin(denosanbox_core::WORKER_THREADS_BUILTIN);
+                let node_worker_threads = plugin.profile() == CompatibilityProfile::PureJsNpm
+                    && plugin.has_reserved_builtin(denosanbox_core::WORKER_THREADS_BUILTIN);
                 let config = format!(
                     "{{nodeWorkerThreads:{node_worker_threads},maxMessageBytes:{limit},maxLogRecordBytes:{record},maxQueuedMessages:{queued},maxQueuedBytes:{bytes},maxChildren:{children},isChild:{child}}}",
                     limit = BOOTSTRAP_MESSAGE_LIMIT,
@@ -255,6 +254,7 @@ impl DriverFactory for DenoFactory {
                     bytes = worker_broker_limits::BYTES,
                     children = context.policy().limits().max_sandboxes(),
                     child = context.worker_depth() > 0,
+
                 );
                 let bootstrap = BOOTSTRAP.replace("__SANDBOX_CONFIG__", &config);
                 runtime
@@ -476,106 +476,141 @@ impl Driver for DenoDriver {
         Ok(())
     }
     fn invoke(&mut self, invocation: Invocation) -> Result<Value> {
-        // Deno may eagerly poll an async op while invoking the JS export.
-        let _runtime_guard = self.executor.enter();
-        if self.control.is_cancelled() {
-            return Err(self.control.error("execution terminated"));
-        }
-        let timeout = invocation
-            .deadline
-            .map(|d| d.duration_since(SystemTime::now()).unwrap_or_default())
-            .unwrap_or(invocation.timeout)
-            .min(invocation.timeout);
-        if timeout.is_zero() {
-            return Err(Error::DeadlineExceeded);
-        }
-        let _watchdog = Watchdog::new(self.control.clone(), timeout)?;
-        let module = self.module.ok_or_else(|| Error::Internal {
-            message: "module not initialized".into(),
-        })?;
-        let namespace = self
-            .runtime
-            .get_module_namespace(module)
-            .map_err(|e| self.control.error(e))?;
-        let mut export = invocation.export;
-        let runtime = &mut self.runtime;
-        let (function, input) = {
-            deno_core::scope!(scope, runtime);
-            let namespace = v8::Local::new(scope, namespace);
-            let mut value = lookup(scope, namespace, &export).ok_or_else(|| Error::Execution {
-                message: "export missing".into(),
+        let result = (|| -> Result<Value> {
+            // Deno may eagerly poll an async op while invoking the JS export.
+            let _runtime_guard = self.executor.enter();
+            if self.control.is_cancelled() {
+                return Err(self.control.error("execution terminated"));
+            }
+            let timeout = invocation
+                .deadline
+                .map(|d| d.duration_since(SystemTime::now()).unwrap_or_default())
+                .unwrap_or(invocation.timeout)
+                .min(invocation.timeout);
+            if timeout.is_zero() {
+                return Err(Error::DeadlineExceeded);
+            }
+            let _watchdog = Watchdog::new(self.control.clone(), timeout)?;
+            let module = self.module.ok_or_else(|| Error::Internal {
+                message: "module not initialized".into(),
             })?;
-            // Child files without an explicit ESM `onmessage` export dispatch
-            // through the trusted global/handler fallback.
-            if export == "onmessage" && !value.is_function() {
-                export = "__denosanboxDispatchWorkerMessage".to_owned();
-                value = lookup(scope, namespace, &export).ok_or_else(|| Error::Execution {
-                    message: "export missing".into(),
-                })?;
-            }
-            let function =
-                v8::Local::<v8::Function>::try_from(value).map_err(|_| Error::Execution {
-                    message: "export is not callable".into(),
-                })?;
-            let input = deno_core::serde_v8::to_v8(scope, invocation.input)
+            let namespace = self
+                .runtime
+                .get_module_namespace(module)
                 .map_err(|e| self.control.error(e))?;
-            (
-                v8::Global::new(scope, function),
-                v8::Global::new(scope, input),
-            )
-        };
-        let result = self.runtime.call_with_args(&function, &[input]);
-        let value = self
-            .executor
-            .block_on(async {
-                tokio::time::timeout(
-                    timeout,
-                    self.runtime
-                        .with_event_loop_future(result, PollEventLoopOptions::default()),
+            let export = invocation.export;
+            let runtime = &mut self.runtime;
+            let (function, input) = {
+                deno_core::scope!(scope, runtime);
+                let namespace = v8::Local::new(scope, namespace);
+                let mut value =
+                    lookup(scope, namespace, &export).ok_or_else(|| Error::Execution {
+                        message: "export missing".into(),
+                    })?;
+                // Child files without an explicit ESM `onmessage` export dispatch
+                // through the bootstrap's fallback, which honours a global
+                // `onmessage`, `addEventListener` and `parentPort` handlers. The
+                // fallback is read from the global object installed readonly by
+                // the trusted bootstrap, never from the guest module namespace.
+                if export == "onmessage" && !value.is_function() {
+                    value = lookup_global(scope, "__denosanboxDispatchWorkerMessage").ok_or_else(
+                        || Error::Execution {
+                            message: "export missing".into(),
+                        },
+                    )?;
+                }
+                let function =
+                    v8::Local::<v8::Function>::try_from(value).map_err(|_| Error::Execution {
+                        message: "export is not callable".into(),
+                    })?;
+                let input = deno_core::serde_v8::to_v8(scope, invocation.input)
+                    .map_err(|e| self.control.error(e))?;
+                (
+                    v8::Global::new(scope, function),
+                    v8::Global::new(scope, input),
                 )
-                .await
-            })
-            .map_err(|_| {
-                self.control.timed_out.store(true, Ordering::Release);
-                self.control.terminate();
-                Error::DeadlineExceeded
-            })?
-            .map_err(|e| self.control.error(e))?;
-        let output = {
-            deno_core::scope!(scope, &mut self.runtime);
-            let value = v8::Local::new(scope, value);
-            let json = v8::json::stringify(scope, value)
-                .ok_or_else(|| self.control.error("result is not JSON serializable"))?;
-            if json.utf8_length(scope) > BOOTSTRAP_MESSAGE_LIMIT {
-                return Err(Error::LimitExceeded {
-                    limit: "max_message_bytes".into(),
-                    detail: "result exceeds 1MiB".into(),
-                });
+            };
+            let result = self.runtime.call_with_args(&function, &[input]);
+            let value = self
+                .executor
+                .block_on(async {
+                    tokio::time::timeout(
+                        timeout,
+                        self.runtime
+                            .with_event_loop_future(result, PollEventLoopOptions::default()),
+                    )
+                    .await
+                })
+                .map_err(|_| {
+                    self.control.timed_out.store(true, Ordering::Release);
+                    self.control.terminate();
+                    Error::DeadlineExceeded
+                })?
+                .map_err(|e| self.control.error(e))?;
+            let output = {
+                deno_core::scope!(scope, &mut self.runtime);
+                let value = v8::Local::new(scope, value);
+                let json = v8::json::stringify(scope, value)
+                    .ok_or_else(|| self.control.error("result is not JSON serializable"))?;
+                if json.utf8_length(scope) > BOOTSTRAP_MESSAGE_LIMIT {
+                    return Err(Error::LimitExceeded {
+                        limit: "max_message_bytes".into(),
+                        detail: "result exceeds 1MiB".into(),
+                    });
+                }
+                serde_json::from_str(&json.to_rust_string_lossy(scope)).map_err(|_| {
+                    Error::Execution {
+                        message: "result exceeds the supported JSON nesting limit".into(),
+                    }
+                })?
+            };
+            Ok(output)
+        })();
+        match &result {
+            Ok(_) => self.completed = self.completed.saturating_add(1),
+            Err(Error::Cancelled | Error::DeadlineExceeded) => {
+                self.cancelled = self.cancelled.saturating_add(1)
             }
-            serde_json::from_str(&json.to_rust_string_lossy(scope)).unwrap_or(Value::Null)
-        };
-        self.completed += 1;
+            _ => {}
+        }
         self.measure_heap();
         self.publish_metrics();
-        Ok(output)
+        result
     }
     fn close(self: Box<Self>) -> Result<CloseReport> {
+        let host = self.control.host.clone();
         let mut report = CloseReport {
             invocations_completed: self.completed,
-            invocations_cancelled: self.completed.saturating_add(self.cancelled),
+            invocations_cancelled: self.cancelled,
             forced_termination: self.control.interrupted.load(Ordering::Acquire)
-                || self.control.timed_out.load(Ordering::Acquire),
+                || self.control.timed_out.load(Ordering::Acquire)
+                || self.control.heap_exceeded.load(Ordering::Acquire),
             closed_cleanly: true,
             pending_host_operations: self.control.host.outstanding(),
         };
-        report.closed_cleanly = report.pending_host_operations == 0;
         *self.control.isolate.lock().unwrap() = None;
+        *self.metrics.heap.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.control.heap_limit.store(0, Ordering::Release);
         drop(self);
+        // Isolate disposal drops async ops; native work keeps its own guards.
+        report.pending_host_operations = host.outstanding();
+        report.closed_cleanly = report.pending_host_operations == 0;
         Ok(report)
     }
     fn metrics(&self) -> RuntimeMetrics {
         self.metrics.snapshot(self.heap_limit)
     }
+}
+
+fn lookup_global<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let key = v8::String::new(scope, name)?;
+    scope
+        .get_current_context()
+        .global(scope)
+        .get(scope, key.into())
 }
 
 fn lookup<'s>(

@@ -58,24 +58,17 @@ pub trait DriverControl: Send + Sync {
 /// invocation. It must be cheap and must not call back into the driver.
 pub type MetricsObserver = Arc<dyn Fn(&RuntimeMetrics) + Send + Sync>;
 
-/// Trusted callback run by the backend on its own owner thread to report the
-/// sandbox's spawn handshake. It returns the JSON value handed back to Rust.
-pub type AckCallback = Arc<dyn Fn() -> std::result::Result<serde_json::Value, Error> + Send + Sync>;
-
 /// Engine-provided hooks for [`Driver::start_with`].
 #[derive(Clone, Default)]
 pub struct StartOptions {
     /// Receives measured snapshots after every invocation.
     pub on_invocation: Option<MetricsObserver>,
-    /// Resolves the sandbox's spawn acknowledgement on the owner thread.
-    pub ack: Option<AckCallback>,
 }
 
 impl std::fmt::Debug for StartOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StartOptions")
             .field("on_invocation", &self.on_invocation.is_some())
-            .field("ack", &self.ack.is_some())
             .finish()
     }
 }
@@ -91,10 +84,8 @@ pub trait Driver {
         Ok(())
     }
 
-    /// Initializes with engine hooks. The default stores the observer and then
-    /// calls [`Driver::start`]; custom `invoke` implementations that want
-    /// metrics should report them via [`Driver::metrics`] and call
-    /// `StartOptions::observe`.
+    /// Initializes with optional engine hooks. The default calls [`Driver::start`].
+    /// Adapters can retain the observer and publish measured invocation snapshots.
     fn start_with(&mut self, options: StartOptions) -> Result<()> {
         let _ = options;
         self.start()

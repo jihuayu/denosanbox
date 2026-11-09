@@ -105,6 +105,10 @@ impl WorkerHandle {
         }
     }
 
+    pub(crate) fn cleanup_complete(&self) -> bool {
+        self.inner.child.cleanup_complete()
+    }
+
     /// Send a JSON message and await the worker's reply.
     ///
     /// Queue and byte permits are held for the whole invocation, including the

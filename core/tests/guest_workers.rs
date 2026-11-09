@@ -10,13 +10,188 @@ use denosanbox::{
 };
 use serde_json::{json, Value};
 
-fn engine() -> Engine {
-    let mut config = EngineConfig::default();
-    config.limits = EngineLimits {
-        max_active_sandboxes: 8,
-        ..EngineLimits::default()
+#[tokio::test]
+async fn module_startup_can_create_and_use_a_child() {
+    let engine = engine();
+    let plugin = engine
+        .prepare(PluginSource {
+            entrypoint: "main.js".into(),
+            modules: BTreeMap::from([
+                (
+                    "main.js".into(),
+                    r#"
+                const worker = new Worker('./child.js', {type:'module'});
+                const received = await new Promise((resolve,reject) => {
+                    worker.onmessage = e => resolve(e.data);
+                    worker.onerror = e => reject(new Error(e.message));
+                    worker.postMessage(41);
+                });
+                await worker.terminate();
+                export function read() { return received + 1; }
+            "#
+                    .into(),
+                ),
+                (
+                    "child.js".into(),
+                    "onmessage = e => postMessage(e.data);".into(),
+                ),
+            ]),
+        })
+        .unwrap();
+    let parent = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine.create(plugin, SandboxOptions::default()),
+    )
+    .await
+    .expect("bounded module startup")
+    .expect("top-level child startup");
+    assert_eq!(
+        parent
+            .call("read", Value::Null, InvocationOptions::default())
+            .await
+            .unwrap(),
+        json!(42)
+    );
+    assert!(parent.close().await.unwrap().closed_cleanly);
+    assert!(engine.shutdown().await.unwrap().clean);
+}
+
+#[tokio::test]
+async fn shared_host_memory_pool_is_never_expanded_for_roots() {
+    let budget = denosanbox::policy::Budget::new(24 * 1024 * 1024);
+    let policy = denosanbox::Policy::default().with_limits(
+        denosanbox::policy::Limits::default().with_heap_target_bytes(16 * 1024 * 1024),
+    );
+    let engine = Engine::with_host_config(
+        EngineConfig::default(),
+        policy.clone(),
+        denosanbox::HostConfig {
+            memory_budget: budget.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let plugin = engine
+        .prepare(PluginSource::single(
+            "main.js",
+            "export function ok(){return 1;}",
+        ))
+        .unwrap();
+    let options = SandboxOptions {
+        policy,
+        ..Default::default()
     };
-    Engine::new(config).unwrap()
+    let first = engine
+        .create(plugin.clone(), options.clone())
+        .await
+        .unwrap();
+    let err = engine.create(plugin, options).await.unwrap_err();
+    assert!(
+        matches!(err, denosanbox::Error::LimitExceeded { .. }),
+        "{err:?}"
+    );
+    assert_eq!(engine.active_sandboxes(), 1);
+    assert_eq!(
+        first
+            .call("ok", Value::Null, InvocationOptions::default())
+            .await
+            .unwrap(),
+        json!(1)
+    );
+    assert!(first.close().await.unwrap().closed_cleanly);
+    assert!(engine.shutdown().await.unwrap().clean);
+    assert_eq!(budget.used(), 0);
+}
+
+#[tokio::test]
+async fn three_children_use_each_tree_slot_once() {
+    let policy = denosanbox::Policy::default().with_limits(
+        denosanbox::policy::Limits::default().with_heap_target_bytes(16 * 1024 * 1024),
+    );
+    let host_config = denosanbox::HostConfig {
+        memory_budget: denosanbox::policy::Budget::new(512 * 1024 * 1024),
+        ..Default::default()
+    };
+    let engine = Engine::with_host_config(
+        EngineConfig::default().with_limits(EngineLimits {
+            max_active_sandboxes: 8,
+            ..Default::default()
+        }),
+        policy.clone(),
+        host_config,
+    )
+    .unwrap();
+    let plugin = engine.prepare(PluginSource {
+        entrypoint: "main.js".into(),
+        modules: BTreeMap::from([
+            ("main.js".into(), r#"
+                let live = [];
+                export async function open() {
+                    live = [1,2,3].map(() => new Worker('./child.js', {type:'module'}));
+                    return await Promise.all(live.map((worker,index) => new Promise((resolve,reject) => {
+                        worker.onmessage = e => resolve(e.data);
+                        worker.onerror = e => reject(new Error(e.message));
+                        worker.postMessage(index+1);
+                    })));
+                }
+                export async function overflow() {
+                    const worker = new Worker('./child.js', {type:'module'});
+                    return await new Promise(resolve => {
+                        worker.onmessage = () => resolve('admitted');
+                        worker.onerror = () => resolve('denied');
+                        worker.postMessage(4);
+                    });
+                }
+            "#.into()),
+            ("child.js".into(), "onmessage = e => postMessage(e.data);".into()),
+        ]),
+    }).unwrap();
+    let parent = engine
+        .create(
+            plugin,
+            SandboxOptions {
+                policy,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let opened = tokio::time::timeout(
+        Duration::from_secs(5),
+        parent.call("open", Value::Null, InvocationOptions::default()),
+    )
+    .await
+    .expect("bounded three-child startup")
+    .unwrap();
+    assert_eq!(opened, json!([1, 2, 3]));
+    assert_eq!(engine.active_sandboxes(), 4);
+    let overflow = tokio::time::timeout(
+        Duration::from_secs(5),
+        parent.call("overflow", Value::Null, InvocationOptions::default()),
+    )
+    .await
+    .expect("bounded admission failure")
+    .unwrap();
+    assert_eq!(overflow, json!("denied"));
+    assert_eq!(engine.active_sandboxes(), 4);
+    assert!(parent.close().await.unwrap().closed_cleanly);
+    assert!(engine.shutdown().await.unwrap().clean);
+    assert_eq!(engine.active_sandboxes(), 0);
+}
+
+fn engine() -> Engine {
+    Engine::with_host_config(
+        EngineConfig::default().with_limits(EngineLimits {
+            max_active_sandboxes: 8,
+            ..EngineLimits::default()
+        }),
+        denosanbox::Policy::default(),
+        denosanbox::HostConfig {
+            memory_budget: denosanbox::policy::Budget::new(1024 * 1024 * 1024),
+            ..Default::default()
+        },
+    )
+    .unwrap()
 }
 
 /// Browser `Worker` profile: two independent child isolates with private state
@@ -38,7 +213,7 @@ export async function run(input) {
     return new Promise((resolve, reject) => {
       worker.onmessage = (event) => resolve(event.data);
       worker.onerror = (event) => reject(new Error(event.message));
-      worker.postMessage({ n: 1 });
+      worker.postMessage({ n: 1, spin: !!(input && input.wait) });
     });
   }
 }
@@ -47,6 +222,7 @@ export async function run(input) {
 const COUNTER_CHILD: &str = r#"
 let counter = 0;
 onmessage = (event) => {
+  if (event.data.spin) { while (true) {} }
   counter += 1;
   postMessage({ counter, got: event.data.n });
 };
@@ -186,9 +362,10 @@ async fn denied_profile_and_forged_builtin_cannot_gain_worker_threads() {
         "main.js",
         "import { Worker } from 'node:worker_threads'; export const m = Worker;",
     );
-    forged
-        .modules
-        .insert("__builtin__/worker_threads.js".into(), "export const Worker = 1;".into());
+    forged.modules.insert(
+        "__builtin__/worker_threads.js".into(),
+        "export const Worker = 1;".into(),
+    );
     assert!(engine
         .prepare_with_profile(forged, CompatibilityProfile::PureJsNpm)
         .is_err());
@@ -216,11 +393,17 @@ async fn denied_profile_and_forged_builtin_cannot_gain_worker_threads() {
 async fn parent_cancellation_closes_descendants_and_keeps_sibling_usable() {
     let engine = engine();
     let left = engine
-        .create(engine.prepare(browser_source()).unwrap(), SandboxOptions::default())
+        .create(
+            engine.prepare(browser_source()).unwrap(),
+            SandboxOptions::default(),
+        )
         .await
         .unwrap();
     let right = engine
-        .create(engine.prepare(browser_source()).unwrap(), SandboxOptions::default())
+        .create(
+            engine.prepare(browser_source()).unwrap(),
+            SandboxOptions::default(),
+        )
         .await
         .unwrap();
     let pending = {
@@ -228,7 +411,7 @@ async fn parent_cancellation_closes_descendants_and_keeps_sibling_usable() {
         tokio::spawn(async move {
             left.call(
                 "run",
-                Value::Null,
+                json!({"wait": true}),
                 InvocationOptions {
                     timeout: Some(Duration::from_secs(10)),
                     deadline: None,
@@ -316,7 +499,14 @@ async fn classify_workers_cannot_claim_classic_semantics() {
         .call("run", Value::Null, InvocationOptions::default())
         .await
         .unwrap();
-    assert_eq!(result, json!(["UnsupportedFeature", "UnsupportedFeature", "UnsupportedFeature"]));
+    assert_eq!(
+        result,
+        json!([
+            "UnsupportedFeature",
+            "UnsupportedFeature",
+            "UnsupportedFeature"
+        ])
+    );
     assert!(root.close().await.unwrap().closed_cleanly);
 }
 
@@ -381,6 +571,9 @@ async fn bounded_queue_and_non_json_messages_are_typed_errors() {
                         };
                         attempt('json', () => worker.postMessage(() => 1));
                         attempt('transfer', () => worker.postMessage({}, [new ArrayBuffer(8)]));
+                        attempt('opaque', () => worker.postMessage(new Map()));
+                        // Shared memory is removed from the global namespace, so
+                        // this fails before any port validator runs.
                         attempt('shared', () => worker.postMessage(new SharedArrayBuffer(8)));
                         for (let i = 0; i < 64; i++) {
                           try { worker.postMessage({ i }); } catch (error) { results.push('queue:' + error.name); break; }
@@ -405,7 +598,11 @@ async fn bounded_queue_and_non_json_messages_are_typed_errors() {
         .collect();
     assert!(items.contains(&"json:DataCloneError"));
     assert!(items.contains(&"transfer:DataCloneError"));
-    assert!(items.contains(&"shared:DataCloneError"));
+    assert!(items.contains(&"opaque:DataCloneError"));
+    assert!(
+        items.contains(&"shared:ReferenceError"),
+        "SharedArrayBuffer must be absent, not clone-checked: {items:?}"
+    );
     assert!(items.contains(&"queue:QuotaExceededError"));
     assert!(root.close().await.unwrap().closed_cleanly);
     let _ = engine.shutdown().await;

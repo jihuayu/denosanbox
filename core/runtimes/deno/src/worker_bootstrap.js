@@ -5,11 +5,9 @@
 (function () {
   'use strict';
   const rawCore = typeof Deno === 'object' && Deno !== null ? Deno.core : undefined;
-  // Trusted, Rust-bound handshake callback (null for roots), consumed below.
   const ops = rawCore && rawCore.ops;
   if (!ops) throw new Error('trusted ops unavailable');
   const config = __SANDBOX_CONFIG__;
-  const childAckCallback = config.childAck;
   const define = Object.defineProperty;
   const freeze = Object.freeze;
   const keys = Object.keys;
@@ -20,6 +18,7 @@
   const stringify = JSON.stringify;
   const parse = JSON.parse;
   const apply = Reflect.apply;
+  const deleteProperty = Reflect.deleteProperty;
   const slice = Array.prototype.slice;
   const thenMethod = Promise.prototype.then;
   const resolvePromise = Promise.resolve.bind(Promise);
@@ -42,7 +41,6 @@
     return text;
   };
   let activeWorkers = 0;
-  let childAck = null;
   let dispatching = false;
   let childClosed = false;
   let outbox = [];
@@ -326,15 +324,7 @@
   readonly('removeEventListener', (type, callback) => childEvents.remove(stringifyText(type), callback));
   readonly('postMessage', childPost);
   readonly('close', closeChild);
-  define(globalThis, '__denosanboxDispatchWorkerMessage', { value: dispatchChild, writable: false, configurable: true });
-  // Engine-dispatched handshake resolved by the native driver. The broker
-  // installs `childAck` for this child (bound by Rust to its own spawn id, no
-  // guest input); it returns null when there is nothing to acknowledge.
-  define(globalThis, '__denosanboxAckWorker', {
-    value: () => (childAck === null ? null : childAck()),
-    writable: false,
-    configurable: true,
-  });
+  readonly('__denosanboxDispatchWorkerMessage', dispatchChild);
   // The `worker_threads` alias objects exist only under the host-approved
   // profile (chosen by trusted native code, never by guest input). In every
   // other profile the reserved builtin is absent from the graph, so the names
@@ -351,6 +341,18 @@
   freeze(Worker.prototype);
   freeze(NodeWorker.prototype);
 
+  // V8 allocates `SharedArrayBuffer` backing stores outside any JS heap limit,
+  // so the constructor is exiled from the heap *before* the bootstrap decides
+  // whether it can be deleted: each literal creates a bounded, collectable
+  // exile; allocation fails once the heap (or budgeted ArrayBuffer allocator)
+  // is exhausted, and the last one is removed by the authoritative check.
+  let sabExiles = 0;
+  while (typeof globalThis.SharedArrayBuffer === 'function'
+      && (sabExiles < 16 || globalThis.SharedArrayBuffer.prototype?.buffer?.byteLength === 0)) {
+    sabExiles++;
+    new globalThis.SharedArrayBuffer(0);
+  }
+
   // Raw trusted bindings are hidden BEFORE any guest module loads. A property
   // that can be redefined or deleted is removed; otherwise it is inerted with
   // an `undefined` value when redefinition is permitted. The bootstrap never
@@ -360,7 +362,7 @@
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
     if (descriptor === undefined) return;
     if (descriptor.configurable) {
-      if (!Reflect.deleteProperty(globalThis, name)) throw new Error('raw namespace removal failed: ' + name);
+      if (!deleteProperty(globalThis, name)) throw new Error('raw namespace removal failed: ' + name);
       return;
     }
     if (descriptor.writable) {
@@ -374,10 +376,14 @@
   for (const name of ['SharedArrayBuffer', 'Atomics', 'WebAssembly']) {
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
     if (descriptor === undefined) continue;
-    if (descriptor.configurable || descriptor.writable) {
-      try { Reflect.deleteProperty(globalThis, name); } catch (_) {}
-      if (typeof globalThis[name] !== 'undefined') Reflect.set(globalThis, name, undefined);
+    if (descriptor.configurable) {
+      deleteProperty(globalThis, name);
+      continue;
     }
+    // `SharedArrayBuffer` reaches this branch only because its constructors
+    // were exiled above; a non-configurable, non-writable binding that the
+    // exile could not neutralize is left for the authoritative check below.
+    if (descriptor.writable) Reflect.set(globalThis, name, undefined);
   }
 
   // Authoritative check: any reachable raw entry point aborts startup with a

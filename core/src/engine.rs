@@ -16,6 +16,10 @@ use tokio::sync::{mpsc, oneshot};
 
 const JOIN_GRACE: Duration = Duration::from_secs(5);
 const MIN_CALL_TIMEOUT: Duration = Duration::from_millis(1);
+/// Memory a root still hands to its descendants after reserving its own heap
+/// ceiling. Matches the measured deno_core baseline of one extra isolate so a
+/// root can always create its first registered child; deeper trees share the
+/// same pool and every per-sandbox heap target stays enforced.
 
 /// Engine owning a backend factory and at most `max_active_sandboxes` workers.
 #[derive(Clone)]
@@ -59,6 +63,15 @@ impl Engine {
     }
     /// Construct with a fixed host authorization ceiling.
     pub fn with_policy(config: EngineConfig, ceiling: Policy) -> Result<Self> {
+        Self::with_host_config(config, ceiling, denosanbox_core::HostConfig::default())
+    }
+
+    /// Construct with trusted schemas, audit storage and shared resource pools.
+    pub fn with_host_config(
+        config: EngineConfig,
+        ceiling: Policy,
+        host_config: denosanbox_core::HostConfig,
+    ) -> Result<Self> {
         config.validate()?;
         let factory: Arc<dyn DriverFactory> = match config.backend {
             BackendKind::Fake => Arc::new(FakeFactory::new()),
@@ -84,7 +97,7 @@ impl Engine {
                 workers: Mutex::new(Vec::new()),
                 hosts: Arc::new(Mutex::new(HostRegistry::default())),
                 ceiling,
-                host_config: denosanbox_core::HostConfig::default(),
+                host_config,
             }),
         })
     }
@@ -209,9 +222,33 @@ impl Engine {
             let registry = self.inner.workers.lock().expect("worker registry poisoned");
             registry.iter().filter_map(Weak::upgrade).collect()
         };
-        let mut metrics = RuntimeMetrics::default();
+        let mut metrics = RuntimeMetrics {
+            completed_invocations: Some(0),
+            cancelled_invocations: Some(0),
+            heap_used_bytes: Some(0),
+            heap_limit_bytes: Some(0),
+        };
         for state in states {
-            metrics.merge(&state.measured_metrics().await);
+            if state.closed_for_calls.load(Ordering::Acquire) {
+                continue;
+            }
+            let snapshot = state.measured_metrics().await;
+            metrics.completed_invocations = metrics
+                .completed_invocations
+                .zip(snapshot.completed_invocations)
+                .map(|(a, b)| a.saturating_add(b));
+            metrics.cancelled_invocations = metrics
+                .cancelled_invocations
+                .zip(snapshot.cancelled_invocations)
+                .map(|(a, b)| a.saturating_add(b));
+            metrics.heap_used_bytes = metrics
+                .heap_used_bytes
+                .zip(snapshot.heap_used_bytes)
+                .map(|(a, b)| a.saturating_add(b));
+            metrics.heap_limit_bytes = metrics
+                .heap_limit_bytes
+                .zip(snapshot.heap_limit_bytes)
+                .map(|(a, b)| a.saturating_add(b));
         }
         metrics
     }
@@ -360,7 +397,7 @@ impl Engine {
         let mut guard = ActiveGuard::reserve(self.inner.clone())?;
         guard.tree_lease = Some(tree_lease);
         let host_config = parent
-            .map(|p| p.state.host.host_config())
+            .map(|parent| parent.state.host.host_config())
             .unwrap_or_else(|| self.inner.host_config.clone());
         let host = HostContext::new_with_config(
             options.policy.clone(),
@@ -382,16 +419,8 @@ impl Engine {
             host.inherit_mounts_from(&parent.state.host)?;
         }
         host.set_worker_depth(parent.map(|p| p.depth() + 1).unwrap_or(0));
-        // Trusted per-context broker and the weak parent factory are bound by
-        // Rust before the isolate thread starts. Guests never supply root IDs:
-        // the parent's own prepared graph and policy are captured here.
-        let base_entrypoint = plugin.entrypoint().to_string();
-        host.set_worker_handler(worker_broker::handler(
-            self.parent_spawner(&host),
-            base_entrypoint,
-            self.inner.config.limits.clone(),
-        ))?;
         host.begin_invocation(default_timeout)?;
+        let base_entrypoint = plugin.entrypoint().to_string();
         let CreatedDriver { init, control } =
             self.inner.factory.create(plugin, &options, host.clone())?;
 
@@ -402,9 +431,9 @@ impl Engine {
             sender,
             control,
             metrics: Arc::new(Mutex::new(RuntimeMetrics::default())),
-            host,
+            host: host.clone(),
             prepared,
-            delegation: options.delegation,
+            delegation: options.delegation.with_limits(options.policy.limits()),
             host_grants: options.host_grants,
             engine: Arc::downgrade(&self.inner),
             children: Mutex::new(Vec::new()),
@@ -423,6 +452,18 @@ impl Engine {
             active: Mutex::new(Some(guard)),
             handles: AtomicUsize::new(1),
         });
+
+        // The trusted broker is bound to this very `WorkerState` (not a
+        // registry lookup), so a module that creates a `Worker` during its
+        // top-level evaluation cannot race registration. It is installed after
+        // the state exists but before the isolate thread is spawned; the
+        // handler captures only weak references, so host -> broker -> state ->
+        // host never forms a strong cycle.
+        host.set_worker_handler(worker_broker::handler(
+            self.state_spawner(&state),
+            base_entrypoint,
+            self.inner.config.limits.clone(),
+        ))?;
 
         if let Some(parent) = parent {
             {
@@ -496,58 +537,36 @@ impl Engine {
 
     /// Builds the trusted parent-side factory handed to the guest broker.
     ///
-    /// The closure never accepts a guest-supplied parent identity: the parent
-    /// handle (its prepared graph, policy ceiling, delegation, grants and
-    /// deadline) is captured by Rust. Children always take the regular
-    /// `Engine::create_child` path: delegation intersection, admission,
-    /// memory reservation, absolute deadline and parent-close propagation.
+    /// The closure never accepts a guest-supplied parent identity: the parent's
+    /// `WorkerState` (its prepared graph, policy ceiling, delegation, grants and
+    /// deadline) is captured by Rust as installed at sandbox construction.
+    /// Children always take the regular `Engine::create_child` path:
+    /// delegation intersection, admission, memory reservation, absolute
+    /// deadline and parent-close propagation.
     ///
-    /// The handler is stored inside this very `HostContext`, so the closure
-    /// holds only weak references: owning either the host or the engine here
-    /// would form an `Arc` cycle (host -> broker -> host/engine).
-    fn parent_spawner(&self, host: &Arc<HostContext>) -> worker_broker::SpawnWorker {
-        let host = Arc::downgrade(host);
+    /// The handler is stored inside the parent's own `HostContext`, so the
+    /// closure holds only weak references: owning the host, the state or the
+    /// engine here would form an `Arc` cycle. Every operation upgrades them;
+    /// once the last owning handle is dropped the upgrade fails with `Closed`.
+    fn state_spawner(&self, state: &Arc<WorkerState>) -> worker_broker::SpawnWorker {
+        let state = Arc::downgrade(state);
         let engine = Arc::downgrade(&self.inner);
         Arc::new(move |entrypoint, options| {
-            let host = host.clone();
+            let state = state.clone();
             let engine = engine.clone();
             Box::pin(async move {
-                let engine = Engine {
-                    inner: engine.upgrade().ok_or(Error::Closed)?,
+                let state = state.upgrade().ok_or(Error::Closed)?;
+                let engine_inner = engine.upgrade().ok_or(Error::Closed)?;
+                // A transient view only; it must never cancel on drop.
+                let parent = SandboxHandle {
+                    state,
+                    limits: engine_inner.config.limits.clone(),
+                    default_timeout: engine_inner.config.limits.default_invocation_timeout,
+                    owns_handle: false,
                 };
-                engine.spawn_for_guest(&host, &entrypoint, options).await
+                engine_child_worker(&parent, &engine_inner, &entrypoint, options).await
             })
         })
-    }
-
-    /// Resolves the trusted parent handle for `host` from the live registry.
-    ///
-    /// Only sandboxes registered for guest work are parents, so dropping the
-    /// last root handle (cancel/close/abandon) also prevents further spawns.
-    fn live_parent(&self, host: &Weak<HostContext>) -> Option<SandboxHandle> {
-        let host = host.upgrade()?;
-        let registry = self.inner.workers.lock().expect("worker registry poisoned");
-        registry
-            .iter()
-            .filter_map(Weak::upgrade)
-            .find(|state| Arc::ptr_eq(&state.host, &host))
-            .map(|state| SandboxHandle {
-                state,
-                limits: self.inner.config.limits.clone(),
-                default_timeout: self.inner.config.limits.default_invocation_timeout,
-                // A transient view only; it must never cancel on drop.
-                owns_handle: false,
-            })
-    }
-
-    async fn spawn_for_guest(
-        &self,
-        host: &Weak<HostContext>,
-        entrypoint: &str,
-        options: SandboxOptions,
-    ) -> Result<WorkerHandle> {
-        let parent = self.live_parent(host).ok_or(Error::Closed)?;
-        engine_child_worker(&parent, entrypoint, options).await
     }
 
     /// Closes every sandbox owned by this engine.
@@ -609,6 +628,10 @@ impl SandboxHandle {
     pub fn prepared_plugin(&self) -> PreparedPlugin {
         self.state.prepared.clone()
     }
+    pub(crate) fn cleanup_complete(&self) -> bool {
+        self.state.joined.load(Ordering::Acquire) && self.state.host.outstanding() == 0
+    }
+
     /// Zero for roots; each registered child increments the depth.
     pub fn depth(&self) -> usize {
         self.state.depth
@@ -1012,9 +1035,6 @@ fn worker_loop(
                 .unwrap_or_else(|e| e.into_inner())
                 .merge(update);
         })),
-        // The Deno backend acknowledges its own spawn id on the owner thread
-        // before the first guest message; other backends have no handshake.
-        ack: None,
     };
     record_metric(&state.metrics, &driver.metrics());
     let started = driver.start_with(start_options);
@@ -1098,15 +1118,23 @@ fn worker_loop(
     state.finished.notify_waiters();
 }
 
-/// Spawn outside any engine lock. The caller has already resolved `parent`
-/// from the live registry (a transient, non-owning handle).
+/// Spawn outside any engine lock, from the parent's transient view.
 async fn engine_child_worker(
     parent: &SandboxHandle,
+    engine_inner: &Arc<EngineInner>,
     entrypoint: &str,
-    options: SandboxOptions,
+    mut options: SandboxOptions,
 ) -> Result<WorkerHandle> {
-    let engine_inner = parent.state.engine.upgrade().ok_or(Error::Closed)?;
-    let plugin = parent.prepared_plugin().resolve_child_entrypoint(entrypoint)?;
+    let inherited_limits = parent
+        .state
+        .host
+        .policy()
+        .limits()
+        .narrow(parent.state.delegation.limits());
+    options.policy = options.policy.with_limits(inherited_limits);
+    let plugin = parent
+        .prepared_plugin()
+        .resolve_child_entrypoint(entrypoint)?;
     let engine = Engine {
         inner: engine_inner.clone(),
     };

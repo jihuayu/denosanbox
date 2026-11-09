@@ -70,7 +70,8 @@ impl EngineLimits {
     /// narrowed set never loosens a previously proven bound.
     #[must_use]
     pub fn narrow(&self, other: &EngineLimits) -> EngineLimits {
-        let pick = |a: Duration, b: Duration| Duration::from_nanos(a.as_nanos().min(b.as_nanos()) as u64);
+        let pick =
+            |a: Duration, b: Duration| Duration::from_nanos(a.as_nanos().min(b.as_nanos()) as u64);
         EngineLimits {
             max_active_sandboxes: self.max_active_sandboxes.min(other.max_active_sandboxes),
             max_pending_invocations: self

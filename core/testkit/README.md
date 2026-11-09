@@ -12,7 +12,7 @@ cargo test --manifest-path core/Cargo.toml --workspace --all-features --locked
 ```
 
 - `core/tests/parity.rs` + this crate: the versioned behavior fixture above, run identically by Python and Node.
-- `core/tests/runtime_limits.rs`: bounded `ArrayBuffer` memory budget (typed `limit_exceeded`, sandbox and siblings stay usable), message/queue bounds, close/cancel/shutdown lifetimes and per-invocation log retention. One ignored case documents the pending runtime fix for narrowed `max_log_bytes`.
+- `core/tests/runtime_limits.rs`: bounded `ArrayBuffer` memory budget (9 MiB is refused with a typed terminal limit; reuse or retirement accepted, explicit close releases it, siblings/new roots stay usable), message/queue bounds, close/cancel/shutdown lifetimes and per-invocation log retention under the effective `max_log_bytes` (no ignored cases).
 - `core/tests/host_security.rs`: guest-spoofed identity/scope cannot replace trusted context, ungranted capabilities are denied before dispatch, schema input/result rejection and bounds, metadata-only audit, late-work cancellation and multi-context isolation.
 - `core/tests/{host_bridge,module_profiles,mounts,workers}.rs` and the `connectors` suite: callback/VFS, language profile, mounts and worker supervision.
 

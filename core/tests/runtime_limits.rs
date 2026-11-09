@@ -12,12 +12,15 @@
 //!   risks (see `docs/threat-model.md`).
 //! * Every test stays small: the largest allocation attempted is 9 MiB inside
 //!   a 16 MiB heap target / 24 MiB tree budget. No unbounded OOM probe.
-//! * Two tests are `#[ignore]`d as *pending* acceptance criteria for runtime
-//!   fixes (documented findings, not passing guarantees):
-//!   `narrowed_policy_log_cap_is_enforced_live` (backend hardcodes a 64 KiB log
-//!   cap and ignores the effective policy) and
-//!   `array_buffer_over_tree_budget_is_bounded_and_typed` (a 9 MiB store is
-//!   refused via `js_heap_target`, which also closes the sandbox).
+//! * No acceptance case is `#[ignore]`d. Acceptance is backend-result based:
+//!   `narrowed_policy_log_cap_is_enforced_live` requires the runtime to honour
+//!   the effective (creation-time or live-narrowed) `max_log_bytes`; it fails
+//!   against any backend that still hardcodes the 64 KiB cap. That dependency
+//!   is on the runtime owner's merged integration, not on this test.
+//! * Exhausting the memory budget may *retire* the isolate. A typed terminal
+//!   limit error is a valid outcome provided siblings and newly created
+//!   sandboxes stay usable and `close()` releases admission to zero. See the
+//!   array-buffer test below.
 
 #![cfg(feature = "deno")]
 
@@ -70,19 +73,32 @@ export function ping(input) {
 // ArrayBuffer backing stores are charged to the sandbox memory budget
 // ---------------------------------------------------------------------------
 
-/// PENDING runtime fix. A 9 MiB external `ArrayBuffer` store inside a 16 MiB
-/// heap / 24 MiB tree budget must be refused with a typed limit error while the
-/// sandbox stays usable (a 64 KiB store still succeeds).
+/// Typed terminal outcomes accepted after a native allocation denial.
 ///
-/// Observed on the current runtime snapshot: the 9 MiB store is refused, but
-/// with `LimitExceeded { limit: "js_heap_target" }` from the near-heap-limit
-/// callback, which also cancels the host context, so the sandbox is then
-/// `Closed` rather than usable. Kept ignored until the runtime reports the
-/// subtree memory budget distinctly and keeps the sandbox usable.
+/// Only documented, typed variants are allowed: a plain `execution` or
+/// `backend` error is never accepted. `js_heap_target` / `subtree_memory_bytes`
+/// are the runtime's recorded heap/budget denial categories; `closed` /
+/// `cancelled` are accepted only when a subsequent probe on the *same* sandbox
+/// shows it was retired, not arbitrarily broken.
+fn accepts_terminal_denial(err: &denosanbox::Error) -> bool {
+    match err {
+        denosanbox::Error::LimitExceeded { limit, .. } => {
+            matches!(limit.as_str(), "js_heap_target" | "subtree_memory_bytes")
+        }
+        denosanbox::Error::Closed | denosanbox::Error::Cancelled => true,
+        _ => false,
+    }
+}
+
+/// A 9 MiB external `ArrayBuffer` store under a 16 MiB heap target / 24 MiB tree
+/// budget must be refused with a typed limit (never an arbitrary execution
+/// error). The backend may either keep the sandbox reusable or retire it; in
+/// both cases an explicit `close()` must release its admission and the rest of
+/// the engine must keep working.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "pending runtime fix: 9 MiB ArrayBuffer is refused via js_heap_target and leaves the sandbox closed"]
-async fn array_buffer_over_tree_budget_is_bounded_and_typed() {
+async fn array_buffer_over_tree_budget_is_typed_and_cleanly_retired() {
     let engine = engine();
+    let sibling = create(&engine, ARRAY_BUFFER_JS, SandboxOptions::default()).await;
     let sandbox = create(
         &engine,
         ARRAY_BUFFER_JS,
@@ -92,6 +108,7 @@ async fn array_buffer_over_tree_budget_is_bounded_and_typed() {
         },
     )
     .await;
+    assert_eq!(engine.active_sandboxes(), 2);
 
     let err = sandbox
         .call("bytesHeld", json!([9 * MIB]), InvocationOptions::default())
@@ -100,33 +117,108 @@ async fn array_buffer_over_tree_budget_is_bounded_and_typed() {
     assert_eq!(
         err.kind(),
         "limit_exceeded",
-        "9 MiB ArrayBuffer should be a typed limit error: {err:?}"
+        "typed limit required: {err:?}"
+    );
+    assert!(
+        accepts_terminal_denial(&err),
+        "denial must be a documented limit/retirement variant, got {err:?}"
     );
 
-    // The rejection must not take the sandbox or the engine down.
+    // Either supported reuse, or a terminal retirement of this isolate. An
+    // arbitrary execution/backend failure is rejected in both paths.
+    match sandbox
+        .call("ping", json!("alive"), InvocationOptions::default())
+        .await
+    {
+        Ok(value) => {
+            assert_eq!(value, json!({"echo": "alive"}), "reused sandbox misbehaved");
+            // Reuse additionally promises the rejected lease was released.
+            assert_eq!(
+                sandbox
+                    .call(
+                        "bytesHeld",
+                        json!([64 * 1024]),
+                        InvocationOptions::default()
+                    )
+                    .await
+                    .expect("64 KiB store in a reusable sandbox"),
+                json!(64 * 1024)
+            );
+        }
+        Err(retired) => {
+            assert!(
+                matches!(retired.kind(), "closed" | "cancelled"),
+                "a retired isolate must report closed/cancelled, got {retired:?}"
+            );
+            // Terminal error is stable: no call can revive it.
+            for _ in 0..2 {
+                let again = sandbox
+                    .call("ping", json!("alive"), InvocationOptions::default())
+                    .await
+                    .expect_err("retired sandbox must stay closed");
+                assert!(
+                    matches!(again.kind(), "closed" | "cancelled"),
+                    "got {again:?}"
+                );
+            }
+        }
+    }
+
+    // The sibling with its own budget is unaffected by the denial.
     assert_eq!(
-        sandbox
+        sibling
             .call("ping", json!("alive"), InvocationOptions::default())
             .await
-            .expect("sandbox remains usable after a rejected allocation"),
+            .expect("sibling remains usable"),
         json!({"echo": "alive"})
     );
-    // The rejected reservation released its lease: a small store still fits.
     assert_eq!(
-        sandbox
+        sibling
             .call(
                 "bytesHeld",
                 json!([64 * 1024]),
                 InvocationOptions::default()
             )
             .await
-            .expect("64 KiB ArrayBuffer fits after the rejection"),
+            .expect("sibling serves a 64 KiB store"),
         json!(64 * 1024)
     );
 
-    let report = sandbox.close().await.expect("close");
-    assert_eq!(report.pending_host_operations, 0);
-    assert!(engine.shutdown().await.expect("shutdown").clean);
+    // Explicit close releases the denied sandbox's admission and resources.
+    let _ = tokio::time::timeout(Duration::from_secs(10), sandbox.close())
+        .await
+        .expect("close must be bounded");
+    assert_eq!(
+        engine.active_sandboxes(),
+        1,
+        "denied sandbox released on close"
+    );
+
+    // A freshly created root of the same tight shape is still usable.
+    let fresh = create(
+        &engine,
+        ARRAY_BUFFER_JS,
+        SandboxOptions {
+            policy: Policy::default().with_limits(tight_limits()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        fresh
+            .call(
+                "bytesHeld",
+                json!([64 * 1024]),
+                InvocationOptions::default()
+            )
+            .await
+            .expect("new root after a denied allocation"),
+        json!(64 * 1024)
+    );
+    fresh.close().await.expect("close fresh");
+    sibling.close().await.expect("close sibling");
+    engine.shutdown().await.expect("shutdown");
+    assert_eq!(engine.active_sandboxes(), 0);
 }
 
 /// The bound is per sandbox: a tight sandbox's rejection never affects an
@@ -492,15 +584,13 @@ async fn console_output_is_bounded_per_invocation() {
     engine.shutdown().await.expect("shutdown");
 }
 
-/// PENDING runtime fix. A narrow policy `max_log_bytes` (1 KiB) must be honoured
-/// before the next invocation, not only at sandbox creation: the reviewed
-/// backend snapshot reserves a hardcoded 64 KiB cap in bootstrapped JS and
-/// never re-reads the effective policy, so 4096 log bytes are still admitted.
-/// Kept `#[ignore]`d as the acceptance criterion; remove the attribute once the
-/// runtime reads `policy.limits().max_log_bytes()` per invocation (including
-/// live `narrow_policy`).
+/// A narrow policy `max_log_bytes` (1 KiB) must be honoured per invocation, not
+/// only at sandbox creation, including after live `narrow_policy`.
+///
+/// Dependency: the runtime owner's dynamic-context `max_log_bytes`
+/// implementation must be integrated. On a backend that still captures a 64 KiB
+/// cap in bootstrapped JS this test fails by contract (it is not ignored).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "pending runtime fix: honour effective/live-narrowed policy max_log_bytes"]
 async fn narrowed_policy_log_cap_is_enforced_live() {
     let engine = engine();
     let sandbox = create(

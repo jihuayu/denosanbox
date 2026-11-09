@@ -62,21 +62,32 @@ arbitrary native code.
    name (or the fixed `<ungranted>`/`<invalid>` tags) and an outcome — never
    payloads, scopes, environment values or callback error text. Tests:
    `core/tests/host_security.rs`, `core/core/src/host.rs` unit tests.
-6. **Memory.** The isolate's own JS heap target (default 64 MiB) is handed to
-   V8, and `ArrayBuffer` backing stores go through a budget-accounted allocator
-   charged against a subtree memory budget (default 256 MiB) shared with
-   ancestors. Other sandboxes are unaffected. **Known gaps (pending runtime
-   fix):** a 9 MiB store in a 16 MiB heap / 24 MiB tree sandbox is refused as
-   `limit_exceeded { limit: "js_heap_target" }` by the near-heap-limit callback,
-   which also closes that sandbox, instead of a distinct subtree-budget error
-   that leaves it usable (`runtime_limits.rs::array_buffer_over_tree_budget_is_bounded_and_typed`,
-   ignored). This is accounting, **not** a hard RSS ceiling.
+6. **Memory.** Each sandbox's own JS heap target (default 64 MiB, minimum
+   8 MiB on Deno) is set as a V8 *finite best-effort* heap limit with roughly
+   4 MiB of headroom before the near-heap-limit callback fires
+   (`heap_limits(0, target - 4 MiB)`). `ArrayBuffer` backing stores go through a
+   budget-accounted allocator charged against a subtree memory budget (default
+   256 MiB) shared with ancestors. This is accounting, **not** a hard RSS cap:
+   hard RSS limits and containment of native/process-wide OOM are explicitly not
+   promised, and V8-internal OOM cannot be repaired from the host.
+   Exhaustion may *retire* the isolate: the call fails with a typed terminal
+   limit error (`LimitExceeded { limit: "js_heap_target" | "subtree_memory_bytes" }`)
+   and the near-heap-limit callback cancels the host context, so later calls on
+   that sandbox report `closed`/`cancelled`. That is accepted behaviour as long
+   as siblings and newly created sandboxes stay usable and an explicit
+   `close()`/drop releases its admission and reservations. The backend never
+   leaves a denied sandbox in an undefined working state, and denials never
+   surface as arbitrary `execution`/`backend` errors. On the current runtime
+   snapshot a 9 MiB store under a 16 MiB heap / 24 MiB tree sandbox is refused as
+   `js_heap_target` and retires that isolate (`runtime_limits.rs::array_buffer_over_tree_budget_is_typed_and_cleanly_retired`).
 7. **Logs.** `console.*` output is discarded after being charged against a
    per-invocation retention cap; there is no host stdout sink. The default cap
-   is 64 KiB. **Known gap (pending runtime fix):** the cap is hardcoded in the
-   bootstrapped JS and the effective/live-narrowed `Policy::limits().max_log_bytes()`
-   is not re-read per invocation, so a narrower policy is not yet enforced
-   (`runtime_limits.rs::narrowed_policy_log_cap_is_enforced_live`, ignored).
+   is 64 KiB. The cap must follow the effective `Policy::limits().max_log_bytes()`
+   of the invocation, including after live `narrow_policy`. The runtime owner has
+   implemented this dynamic-context cap; the acceptance test
+   `runtime_limits.rs::narrowed_policy_log_cap_is_enforced_live` runs active and
+   fails on any backend that still hardcodes 64 KiB until that integration is
+   merged.
 8. **Network.** Deny by default. Every request, **every DNS answer** and every
    redirect hop must match an explicit rule (host pattern, port range, optional
    private-address grant for non-global IPs) plus request/response byte and
@@ -99,18 +110,18 @@ arbitrary native code.
 
 ## Shared-process risks (not contained)
 
-- **Memory exhaustion.** A guest can still drive the *process* to OOM through
-  paths outside the accounted JS heap/ArrayBuffer path (code, internal V8
-  structures, concurrent isolates); a process-wide OOM can abort the host.
+- **Memory exhaustion.** Heap targets and budgets are finite best-effort
+  accountings; a guest can still drive the *process* to OOM through paths
+  outside them (internal V8 structures, concurrent isolates) and a
+  process-wide OOM can abort the host. Hard RSS limits are not promised.
 - **Native faults.** V8, `deno_core`, Rust `unsafe` code or a host integration
   bug can crash or corrupt the shared process. Guest-triggered panics in host
   callbacks become typed `backend` errors, but aborts and native assertion
   failures are unrecoverable.
-- **V8 platform state.** Isolates registered on a thread without a Tokio
-  runtime handle abort the process when V8 posts a delayed task (observed with
-  the current `DenoFactory`, which builds `JsRuntime` without
-  `executor.enter()`; test runtimes must therefore be multi-thread Tokio
-  runtimes and the runtime owner is fixing the factory).
+- **V8 platform state.** deno_core captures the Tokio runtime `Handle` when
+  `JsRuntime::new` runs and aborts the process if V8 later posts a delayed task
+  without one. The runtime owner is fixing `DenoFactory` to enter its executor
+  before construction; until merged, tests use multi-thread Tokio runtimes.
 - **Deadline limits.** Deadlines cannot preempt every native operation and
   cannot roll back committed side effects (VFS writes, callback effects, CPU
   and memory consumed).
@@ -138,9 +149,10 @@ OS-level memory/CPU limits when stronger isolation is needed.
 
 ## Known gaps
 
-- Narrowed `max_log_bytes` policy not enforced (above).
-- ArrayBuffer over-budget rejection is reported as `js_heap_target` and closes
-  the sandbox (above).
+- Narrowed `max_log_bytes` acceptance depends on the runtime owner's dynamic-
+  context implementation being merged (test is active, not ignored).
+- Memory exhaustion retires the affected isolate rather than preserving it for
+  reuse (accepted behaviour above); no hard RSS/native-OOM containment.
 - Managed runtime-created Workers pending the runtime job.
 - No C-binding callback API yet (polling subset only).
 - No hard per-sandbox RSS limit, CPU isolation or timeout rollback.

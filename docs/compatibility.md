@@ -55,12 +55,15 @@ published to any registry by this repository or its CI.
 | `max_pending_invocations` (default 32) | facade queue | `queue_full` when saturated |
 | `max_message_bytes` (default 1 MiB) | facade + backend | inputs and results |
 | invocation timeout (`default_*` 30 s, `max_*` 300 s) | facade + per-sandbox watchdog | terminal for the sandbox |
-| JS heap target (`heap_target_bytes`, default 64 MiB; min 8 MiB on Deno) | V8 near-heap-limit callback + engine check | accounting target, not RSS |
-| subtree memory budget (`memory_budget_bytes`, default 256 MiB) | budget-accounted ArrayBuffer allocator + ancestor reservations | `limit_exceeded`; siblings unaffected; **pending fix:** over-budget reports `js_heap_target` and closes that sandbox |
-| log retention per invocation (64 KiB) | backend op counter | **hardcoded**; narrowed `max_log_bytes` policy pending runtime fix |
+| JS heap target (`heap_target_bytes`, default 64 MiB; min 8 MiB on Deno) | V8 finite heap limit (`target - 4 MiB` before the near-heap-limit callback) + engine check | best-effort target, not RSS |
+| subtree memory budget (`memory_budget_bytes`, default 256 MiB) | budget-accounted ArrayBuffer allocator + ancestor reservations | `limit_exceeded`; exhaustion may retire that isolate (typed terminal error, explicit close releases it); siblings/new sandboxes stay usable |
+| log retention per invocation (64 KiB default) | backend per-invocation counter under the effective policy `max_log_bytes` | dynamic-context support implemented by runtime owner; acceptance test waits on merged integration |
 | host concurrency (`queue_depth`, ≤ 32 per sandbox) | `HostContext` + ancestor budget | control operations bypass admission |
 | schema budgets | `JsonSchema::validate` | depth clamped at 128, node/string/array/property budgets |
 | audit buffer | `HostAudit` | bounded, dropped events counted |
 
 No hard per-sandbox RSS limit, CPU quota or timeout rollback is implemented.
+Heap targets/budgets are finite best-effort accountings; native or process-wide
+OOM is not contained. Guest-created Workers remain forthcoming and the C/Go
+artifacts remain a polling subset until the final integrated C/Go tests pass.
 See the [threat model](threat-model.md) for the shared-process caveats.

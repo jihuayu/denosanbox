@@ -26,8 +26,10 @@ jobs:
       - run: cargo clippy --manifest-path core/Cargo.toml --workspace --all-targets --locked -- -D warnings
       # Real Deno/V8 suites: facade conformance, module profiles, mounts,
       # connectors/VFS, host bridge, runtime limits, host security, worker and
-      # binding parity fixtures. `runtime_limits` includes one ignored,
-      # documented pending-runtime-fix regression (not counted as passing).
+      # binding parity fixtures. `runtime_limits` and `host_security` carry no
+      # ignored cases: the narrowed `max_log_bytes` acceptance depends on the
+      # runtime owner's dynamic-context implementation being merged and fails
+      # here (not skipped) until then.
       - run: cargo test --manifest-path core/Cargo.toml --workspace --all-features --locked
       # Engine-independent contract without V8 (fake backend + policy/modules).
       # Excludes `denosanbox-testkit`: that crate's compile-time fixture is the

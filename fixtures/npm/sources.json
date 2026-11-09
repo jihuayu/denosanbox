@@ -1,0 +1,18 @@
+[
+  {
+    "name": "dequal",
+    "version": "2.0.3",
+    "source": "package/lite/index.mjs",
+    "tarball": "https://registry.npmjs.org/dequal/-/dequal-2.0.3.tgz",
+    "integrity": "sha512-0je+qPKHEMohvfRTCEo3CrPG6cAzAYgmzKyxRiYSSDkS6eGJdyVJm7WaYA5ECaAD9wLB2T4EEeymA5aFVcYXCA==",
+    "sha256": "49ff561397669f6e0707d9eb8542a6fedad14e7930cad610538e596129dd41fe"
+  },
+  {
+    "name": "nanoid",
+    "version": "5.1.5",
+    "source": "package/non-secure/index.js",
+    "tarball": "https://registry.npmjs.org/nanoid/-/nanoid-5.1.5.tgz",
+    "integrity": "sha512-Ir/+ZpE9fDsNH0hQ3C68uyThDXzYcim2EqcZ8zn8Chtt1iylPT9xXJB0kPCnqzgcEGikO9RxSrh63MsmVCU7Fw==",
+    "sha256": "b82c677b1f4372ab454eab3c77ca7e322317842b274a00e1727afa7f6334faf5"
+  }
+]

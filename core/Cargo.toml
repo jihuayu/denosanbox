@@ -8,7 +8,7 @@ description = "Embeddable, thread-affine JavaScript sandbox foundation built on 
 publish = false
 
 [workspace]
-members = ["core", "modules", "runtimes/deno"]
+members = ["core", "modules", "policy", "testkit", "runtimes/deno"]
 resolver = "2"
 
 [dependencies]
@@ -28,9 +28,15 @@ deno = ["dep:denosanbox-deno"]
 fake = []
 
 [dev-dependencies]
+denosanbox-testkit = { path = "testkit" }
 tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [[example]]
 name = "backend"
 path = "../examples/rust/backend.rs"
+required-features = ["deno"]
+
+[[example]]
+name = "benchmark"
+path = "../examples/rust/benchmark.rs"
 required-features = ["deno"]

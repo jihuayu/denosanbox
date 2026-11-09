@@ -1,0 +1,103 @@
+[
+  {
+    "id": "independent-counters",
+    "source": "let count=0; export function run(){ return ++count; }",
+    "steps": [
+      {
+        "sandbox": 0,
+        "export": "run",
+        "input": null,
+        "expected": {
+          "kind": "ok",
+          "value": 1
+        }
+      },
+      {
+        "sandbox": 1,
+        "export": "run",
+        "input": null,
+        "expected": {
+          "kind": "ok",
+          "value": 1
+        }
+      },
+      {
+        "sandbox": 0,
+        "export": "run",
+        "input": null,
+        "expected": {
+          "kind": "ok",
+          "value": 2
+        }
+      }
+    ],
+    "entrypoint": "main.js"
+  },
+  {
+    "id": "async-json-roundtrip",
+    "source": "export async function run(input){ return input; }",
+    "steps": [
+      {
+        "sandbox": 0,
+        "export": "run",
+        "input": {
+          "text": "你好 🌍",
+          "items": [
+            1,
+            null,
+            true
+          ]
+        },
+        "expected": {
+          "kind": "ok",
+          "value": {
+            "text": "你好 🌍",
+            "items": [
+              1,
+              null,
+              true
+            ]
+          }
+        }
+      }
+    ],
+    "entrypoint": "main.js"
+  },
+  {
+    "id": "untrusted-error",
+    "source": "export function run(){ throw new Error(\"fixture error\"); }",
+    "steps": [
+      {
+        "sandbox": 0,
+        "export": "run",
+        "input": null,
+        "expected": {
+          "kind": "err",
+          "code": "execution"
+        }
+      }
+    ],
+    "entrypoint": "main.js"
+  },
+  {
+    "id": "native-aliases-denied",
+    "source": "export function run(){return [typeof process,typeof SharedArrayBuffer,typeof Atomics,typeof WebAssembly];}",
+    "steps": [
+      {
+        "sandbox": 0,
+        "export": "run",
+        "input": null,
+        "expected": {
+          "kind": "ok",
+          "value": [
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined"
+          ]
+        }
+      }
+    ],
+    "entrypoint": "main.js"
+  }
+]

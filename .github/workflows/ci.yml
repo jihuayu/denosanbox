@@ -1,0 +1,54 @@
+name: native-library
+on: [push, pull_request]
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - run: cargo fmt --manifest-path core/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path core/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path core/Cargo.toml --workspace --locked
+      - run: cargo test --manifest-path core/Cargo.toml --no-default-features -p denosanbox -p denosanbox-core -p denosanbox-policy -p denosanbox-modules --locked
+      - run: cargo run --manifest-path core/Cargo.toml --example backend --locked
+      - run: python3 dev/validate-fixtures.py
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'maturin>=1.7,<2' pytest pytest-asyncio
+      - run: maturin build --manifest-path bindings/python/Cargo.toml --locked --out wheels
+      - run: python -m pip install wheels/*.whl
+      - run: python -m pytest bindings/python/tests
+  node:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - run: sh bindings/nodejs/build.sh
+      - run: node --test bindings/nodejs/tests/*.test.cjs
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo +nightly fuzz run boundaries --fuzz-dir core/fuzz -- -max_total_time=10 -max_len=8192

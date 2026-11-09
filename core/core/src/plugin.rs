@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rejects_missing_escaped_scheme_and_ts() {
+    fn prepare_rejects_module_escapes_and_transpiles_ts() {
         let missing = prepare(
             PluginSource::single("main.js", "import './missing.js';"),
             &limits(),

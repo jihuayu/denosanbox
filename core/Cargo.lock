@@ -554,6 +554,7 @@ version = "0.1.0"
 dependencies = [
  "denosanbox-core",
  "denosanbox-deno",
+ "denosanbox-testkit",
  "serde_json",
  "tokio",
 ]
@@ -582,6 +583,18 @@ version = "0.1.0"
 dependencies = [
  "deno_ast",
  "sha2",
+]
+
+[[package]]
+name = "denosanbox-policy"
+version = "0.1.0"
+
+[[package]]
+name = "denosanbox-testkit"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

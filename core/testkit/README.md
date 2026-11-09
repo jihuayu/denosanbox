@@ -1,0 +1,3 @@
+# Shared behavior contract
+
+`fixtures/behavior/v1.json` is executed through the public facade in `core/tests/parity.rs`, through the Python package in `bindings/python/tests/test_parity.py`, and through the native Node package in `bindings/nodejs/tests/parity.test.cjs`. The testkit crate supplies the backend-neutral Rust fixture schema. Each runner creates two isolates, executes the same steps, compares JSON results/typed error categories and explicitly shuts down. A binding may add platform/event-loop/FFI tests independently. The broader declarative adversarial catalog in `fixtures/conformance` is documentation; runtime assertions live in the Rust integration suites.

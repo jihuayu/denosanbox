@@ -24,3 +24,6 @@ pub use plugin::{
 
 /// Version of the public facade data model.
 pub const API_VERSION: &str = "0.1.0";
+
+/// Offline host-side module and package preparation.
+pub use denosanbox_modules as modules;

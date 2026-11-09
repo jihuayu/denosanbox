@@ -27,4 +27,4 @@ pub use package::{
     BACKEND_VERSION, DEFAULT_LIMITS,
 };
 pub use path::validate_path;
-pub use transpile::transpile_module;
+pub use transpile::{import_specifiers, transpile_module};

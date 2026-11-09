@@ -8,4 +8,5 @@ description = "Public data model, errors and backend contract for denosanbox"
 publish = false
 
 [dependencies]
+denosanbox-modules = { path = "../modules", version = "0.1.0" }
 serde_json = "1.0.145"

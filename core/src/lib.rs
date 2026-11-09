@@ -15,3 +15,6 @@ pub use engine::{Engine, SandboxHandle};
 
 /// Public facade version, mirrored by `denosanbox-core::API_VERSION`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Offline host-side module and package preparation.
+pub use denosanbox_core::modules;

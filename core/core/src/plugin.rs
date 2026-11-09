@@ -9,8 +9,8 @@ use crate::Error;
 /// Immutable sources supplied by the host.
 ///
 /// `entrypoint` must be a key in `modules`. Paths are root-relative POSIX
-/// paths such as `main.js` and `lib/util.js`. Only JavaScript ESM (`.js` or
-/// `.mjs`) is accepted by the foundation.
+/// paths such as `main.js` and `lib/util.js`. JavaScript ESM (`.js`/`.mjs`) and TypeScript (`.ts`/`.mts`) are
+/// parsed offline; TypeScript is transpiled before creating a runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSource {
     /// Root-relative entry module path.
@@ -20,6 +20,46 @@ pub struct PluginSource {
 }
 
 impl PluginSource {
+    /// Mount a verified, host-prepared ESM package into this graph.
+    /// Returns its relative entry path (import it from the application module).
+    /// No Node builtin or package installation is enabled by this operation.
+    pub fn add_package(
+        &mut self,
+        package: &denosanbox_modules::PreparedPackage,
+    ) -> Result<String, Error> {
+        if !package.profile.allows_package_graph() {
+            return Err(Error::InvalidPlugin {
+                reason: "package requires the pure-js-npm profile".into(),
+            });
+        }
+        if package.content_digest != package.digest() {
+            return Err(Error::InvalidPlugin {
+                reason: "prepared package was modified".into(),
+            });
+        }
+        let prefix = format!("vendor/{}/", package.name);
+        let mut sources = BTreeMap::new();
+        for (path, source) in &package.sources {
+            let mounted = format!("{prefix}{path}");
+            validate_path(&mounted)?;
+            if self.modules.contains_key(&mounted) {
+                return Err(Error::InvalidPlugin {
+                    reason: "package module collides with existing graph".into(),
+                });
+            }
+            sources.insert(mounted, source.clone());
+        }
+        let entrypoint = format!("{prefix}{}", package.entrypoint);
+        if !sources.contains_key(&entrypoint) {
+            return Err(Error::ModuleNotFound {
+                specifier: entrypoint,
+                referrer: None,
+            });
+        }
+        self.modules.extend(sources);
+        Ok(entrypoint)
+    }
+
     /// Creates a one-module plugin source.
     pub fn single(name: impl Into<String>, source: impl Into<String>) -> Self {
         let name = name.into();
@@ -52,6 +92,24 @@ impl PreparedPlugin {
     /// Root-relative entrypoint path.
     pub fn entrypoint(&self) -> &str {
         &self.graph.entrypoint
+    }
+
+    /// Select a visible entrypoint from this immutable prepared graph.
+    pub fn with_entrypoint(&self, entrypoint: &str) -> Result<Self, Error> {
+        validate_path(entrypoint)?;
+        if !self.graph.modules.contains_key(entrypoint) {
+            return Err(Error::ModuleNotFound {
+                specifier: entrypoint.into(),
+                referrer: None,
+            });
+        }
+        Ok(Self {
+            graph: Arc::new(PreparedGraph {
+                entrypoint: entrypoint.into(),
+                modules: self.graph.modules.clone(),
+                total_bytes: self.graph.total_bytes,
+            }),
+        })
     }
 
     /// Number of modules in the immutable graph.
@@ -140,7 +198,18 @@ pub fn prepare(source: PluginSource, limits: &EngineLimits) -> Result<PreparedPl
             });
         }
         total_bytes = total_bytes.saturating_add(text.len());
-        modules.insert(path, text);
+        let prepared = denosanbox_modules::transpile_module(&path, &text).map_err(|e| {
+            Error::InvalidPlugin {
+                reason: e.to_string(),
+            }
+        })?;
+        if prepared.len() > limits.max_module_bytes {
+            return Err(Error::LimitExceeded {
+                limit: "max_module_bytes".into(),
+                detail: "transpiled output exceeds module limit".into(),
+            });
+        }
+        modules.insert(path, prepared);
     }
     if total_bytes > limits.max_graph_bytes {
         return Err(Error::LimitExceeded {
@@ -152,6 +221,13 @@ pub fn prepare(source: PluginSource, limits: &EngineLimits) -> Result<PreparedPl
         });
     }
 
+    let emitted_bytes: usize = modules.values().map(String::len).sum();
+    if emitted_bytes > limits.max_graph_bytes {
+        return Err(Error::LimitExceeded {
+            limit: "max_graph_bytes".into(),
+            detail: "transpiled graph exceeds limit".into(),
+        });
+    }
     // Eagerly validate literal imports so a bad graph fails at prepare time.
     // The runtime loader still rechecks every resolution, including computed
     // dynamic imports, against this immutable map.
@@ -172,6 +248,9 @@ pub fn prepare(source: PluginSource, limits: &EngineLimits) -> Result<PreparedPl
 
 /// Validates a normalized, root-relative module path.
 pub fn validate_path(path: &str) -> Result<(), Error> {
+    denosanbox_modules::validate_path(path).map_err(|e| Error::InvalidPlugin {
+        reason: e.to_string(),
+    })?;
     if path.is_empty() {
         return Err(Error::InvalidPlugin {
             reason: "module path must not be empty".to_string(),
@@ -216,8 +295,8 @@ pub fn validate_path(path: &str) -> Result<(), Error> {
     }
     let extension = path.rsplit('.').next().unwrap_or("");
     match extension {
-        "js" | "mjs" => Ok(()),
-        "ts" | "tsx" | "mts" | "cts" | "jsx" => Err(Error::UnsupportedLanguage {
+        "js" | "mjs" | "ts" | "mts" => Ok(()),
+        "tsx" | "cts" | "jsx" => Err(Error::UnsupportedLanguage {
             reason: format!(
                 "TypeScript/JSX module '{path}' was supplied but this build has no transpiler; \
          provide JavaScript ESM instead"
@@ -297,201 +376,10 @@ pub fn resolve_relative(referrer: &str, specifier: &str) -> Result<String, Error
     Ok(resolved)
 }
 
-/// Small conservative ES-module import scanner.
-///
-/// It skips comments and ordinary strings, recognizes literal static imports,
-/// `export ... from` clauses, and literal `import("...")` calls. It is not a
-/// JavaScript parser: computed dynamic imports are deliberately left for the
-/// runtime loader, which performs the authoritative visibility check.
+/// Returns imports found by the JavaScript parser. Preparation has already
+/// parsed the source; the runtime still checks computed imports on every load.
 pub fn scan_import_specifiers(source: &str) -> Vec<String> {
-    let bytes = source.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
-            b'\'' | b'"' | b'`' => {
-                let (_, next) =
-                    read_string(bytes, i).unwrap_or_else(|| (String::new(), bytes.len()));
-                i = next;
-            }
-            b if is_ident_start(b) => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() && is_ident_continue(bytes[i]) {
-                    i += 1;
-                }
-                let word = &source[start..i];
-                if word == "import" {
-                    let mut j = skip_trivia(bytes, i);
-                    if j < bytes.len() && bytes[j] == b'(' {
-                        j = skip_trivia(bytes, j + 1);
-                        if j < bytes.len() && matches!(bytes[j], b'\'' | b'"') {
-                            if let Some((spec, _)) = read_string(bytes, j) {
-                                out.push(spec);
-                            }
-                        }
-                    } else if j < bytes.len() && bytes[j] == b'.' {
-                        // import.meta
-                    } else if j < bytes.len() && !matches!(bytes[j], b';' | b'\n' | b'\r') {
-                        // Static import: the first string literal before the statement
-                        // terminator is the module specifier (side-effect imports have no
-                        // `from` token).
-                        if let Some((spec, _)) = first_string_in_statement(bytes, j) {
-                            out.push(spec);
-                        }
-                    }
-                } else if word == "export" {
-                    if let Some((spec, _)) = from_string_in_statement(bytes, i) {
-                        out.push(spec);
-                    }
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    out
-}
-
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
-}
-
-fn is_ident_continue(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
-}
-
-fn skip_trivia(bytes: &[u8], mut i: usize) -> usize {
-    loop {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(bytes.len());
-            continue;
-        }
-        return i;
-    }
-}
-
-fn first_string_in_statement(bytes: &[u8], mut i: usize) -> Option<(String, usize)> {
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' | b'\r' | b';' => return None,
-            b'\'' | b'"' => return read_string(bytes, i),
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i = skip_trivia(bytes, i);
-            }
-            b'`' => {
-                let (_, next) =
-                    read_string(bytes, i).unwrap_or_else(|| (String::new(), bytes.len()));
-                i = next;
-            }
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn from_string_in_statement(bytes: &[u8], mut i: usize) -> Option<(String, usize)> {
-    let mut saw_from = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' | b'\r' | b';' => return None,
-            b'\'' | b'"' => {
-                let (spec, next) = read_string(bytes, i)?;
-                return if saw_from { Some((spec, next)) } else { None };
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i = skip_trivia(bytes, i);
-            }
-            b'`' => {
-                let (_, next) =
-                    read_string(bytes, i).unwrap_or_else(|| (String::new(), bytes.len()));
-                i = next;
-            }
-            b if is_ident_start(b) => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() && is_ident_continue(bytes[i]) {
-                    i += 1;
-                }
-                if &bytes[start..i] == b"from" {
-                    saw_from = true;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn read_string(bytes: &[u8], start: usize) -> Option<(String, usize)> {
-    let quote = *bytes.get(start)?;
-    if !matches!(quote, b'\'' | b'"' | b'`') {
-        return None;
-    }
-    let mut i = start + 1;
-    let mut out = String::new();
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == quote {
-            return Some((out, i + 1));
-        }
-        if quote != b'`' && (b == b'\n' || b == b'\r') {
-            return None;
-        }
-        if b == b'\\' {
-            i += 1;
-            let escaped = *bytes.get(i)?;
-            let ch = match escaped {
-                b'n' => '\n',
-                b'r' => '\r',
-                b't' => '\t',
-                b'0' => '\0',
-                other => other as char,
-            };
-            out.push(ch);
-            i += 1;
-            continue;
-        }
-        out.push(b as char);
-        i += 1;
-    }
-    None
+    denosanbox_modules::import_specifiers(source).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -557,7 +445,11 @@ mod tests {
         .unwrap_err();
         assert!(matches!(scheme, Error::ModuleDenied { .. }));
 
-        let ts = prepare(PluginSource::single("main.ts", "export {};"), &limits()).unwrap_err();
-        assert!(matches!(ts, Error::UnsupportedLanguage { .. }));
+        let ts = prepare(
+            PluginSource::single("main.ts", "export const n: number = 1;"),
+            &limits(),
+        )
+        .unwrap();
+        assert!(!ts.source("main.ts").unwrap().contains(": number"));
     }
 }

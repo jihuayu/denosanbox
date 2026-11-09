@@ -8,7 +8,7 @@ description = "Embeddable, thread-affine JavaScript sandbox foundation built on 
 publish = false
 
 [workspace]
-members = ["core", "runtimes/deno"]
+members = ["core", "modules", "runtimes/deno"]
 resolver = "2"
 
 [dependencies]
@@ -29,3 +29,8 @@ fake = []
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[[example]]
+name = "backend"
+path = "../examples/rust/backend.rs"
+required-features = ["deno"]

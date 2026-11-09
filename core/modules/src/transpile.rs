@@ -198,3 +198,57 @@ export const origin: Point = { x: 0, y: 0 };
         assert_eq!(transpile_module("index.js", source).unwrap(), source);
     }
 }
+
+/// Collect static and literal dynamic imports using the JavaScript AST.
+/// Computed imports are authorized by the runtime loader when evaluated.
+pub fn import_specifiers(source: &str) -> Result<Vec<String>, ModuleError> {
+    use deno_ast::swc::ast::{CallExpr, Callee, ExportAll, Expr, ImportDecl, Lit, NamedExport};
+    use deno_ast::swc::ecma_visit::{Visit, VisitWith};
+    struct Imports(Vec<String>);
+    impl Visit for Imports {
+        fn visit_import_decl(&mut self, n: &ImportDecl) {
+            self.0.push(n.src.value.to_string_lossy().into_owned());
+        }
+        fn visit_named_export(&mut self, n: &NamedExport) {
+            if let Some(src) = &n.src {
+                self.0.push(src.value.to_string_lossy().into_owned());
+            }
+        }
+        fn visit_export_all(&mut self, n: &ExportAll) {
+            self.0.push(n.src.value.to_string_lossy().into_owned());
+        }
+        fn visit_call_expr(&mut self, n: &CallExpr) {
+            if matches!(n.callee, Callee::Import(_)) {
+                if let Some(arg) = n.args.first() {
+                    match &*arg.expr {
+                        Expr::Lit(Lit::Str(s)) => {
+                            self.0.push(s.value.to_string_lossy().into_owned())
+                        }
+                        Expr::Tpl(t) if t.exprs.is_empty() => {
+                            if let Some(s) = t.quasis.first().and_then(|q| q.cooked.as_ref()) {
+                                self.0.push(s.to_string_lossy().into_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            n.visit_children_with(self);
+        }
+    }
+    let parsed = parse_module(ParseParams {
+        specifier: ModuleSpecifier::parse("sandbox:///imports.js").expect("constant URL"),
+        text: Arc::from(source),
+        media_type: MediaType::JavaScript,
+        capture_tokens: false,
+        scope_analysis: false,
+        maybe_syntax: None,
+    })
+    .map_err(|err| ModuleError::ParseError {
+        path: "imports.js".into(),
+        message: err.to_string(),
+    })?;
+    let mut imports = Imports(Vec::new());
+    parsed.program().visit_with(&mut imports);
+    Ok(imports.0)
+}

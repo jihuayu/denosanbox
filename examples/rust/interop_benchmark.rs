@@ -48,6 +48,7 @@ struct Stats {
     calls: u64,
     dispatches: u64,
     wire_bytes: usize,
+    wall_elapsed_us: u128,
     /// Measured-call latencies in microseconds (the clock, never wall totals).
     latencies_us: Vec<u64>,
 }
@@ -65,6 +66,7 @@ impl Stats {
             "host_callback_dispatches": self.dispatches,
             "expected_dispatches": expected_per_call * self.calls,
             "serialized_input_bytes": self.wire_bytes / self.calls as usize,
+            "wall_elapsed_us": self.wall_elapsed_us,
             "latency_us": { "p50": pct(50), "p95": pct(95), "p99": pct(99) }
         })
     }
@@ -82,10 +84,15 @@ async fn run(
 ) -> Result<Stats, Box<dyn std::error::Error>> {
     let dispatched = || counters.0.load(Ordering::SeqCst) + counters.1.load(Ordering::SeqCst);
     let (mut stats, mut previous) = (Stats::default(), dispatched());
+    let mut measured_start = None;
     for i in 0..WARMUP + iterations {
+        if i == WARMUP {
+            measured_start = Some(Instant::now());
+        }
+        let argument = input.clone();
         let start = Instant::now();
         let result = sandbox
-            .call(export, input.clone(), InvocationOptions::default())
+            .call(export, argument, InvocationOptions::default())
             .await?;
         let elapsed_us = start.elapsed().as_micros() as u64;
         let now = dispatched();
@@ -100,6 +107,10 @@ async fn run(
         stats.calls += 1;
         stats.dispatches += expected;
     }
+    stats.wall_elapsed_us = measured_start
+        .expect("at least one measured call")
+        .elapsed()
+        .as_micros();
     Ok(stats)
 }
 
@@ -120,11 +131,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limit = SIZES.iter().map(|(_, size)| *size).max().unwrap_or(0) + 256;
     let sync_counter = Arc::clone(&sync_calls);
     // Both callbacks only return their already-validated input bytes unchanged.
-    let sync = engine.register_host(SYNC, limit, limit, move |ctx, input: &[u8]| {
-        ctx.check_live()?;
-        sync_counter.fetch_add(1, Ordering::SeqCst);
-        Ok(input.to_vec())
-    })?;
+    let sync = engine.register_host(
+        SYNC,
+        limit,
+        limit,
+        move |ctx: &InvocationContext, input: &[u8]| {
+            ctx.check_live()?;
+            sync_counter.fetch_add(1, Ordering::SeqCst);
+            Ok(input.to_vec())
+        },
+    )?;
     let async_counter = Arc::clone(&async_calls);
     let async_ = engine.register_host_async(ASYNC, limit, limit, move |ctx, input: Vec<u8>| {
         let counter = Arc::clone(&async_counter);

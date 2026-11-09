@@ -1,0 +1,1 @@
+// Adapter implementation being generated.

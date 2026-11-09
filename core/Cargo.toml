@@ -1,0 +1,31 @@
+[package]
+name = "denosanbox"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Embeddable, thread-affine JavaScript sandbox foundation built on deno_core"
+publish = false
+
+[workspace]
+members = ["core", "runtimes/deno"]
+resolver = "2"
+
+[dependencies]
+denosanbox-core = { path = "core", version = "0.1.0" }
+denosanbox-deno = { path = "runtimes/deno", version = "0.1.0", optional = true }
+serde_json = "1.0.145"
+tokio = { version = "1.48", features = ["rt", "sync", "time", "macros"] }
+
+[features]
+default = ["deno"]
+# The real deno_core/V8 backend. This is the production backend and the
+# default for normal builds.
+deno = ["dep:denosanbox-deno"]
+# The fake backend is always compiled into denosanbox-core for contract
+# tests. This feature exists to make the intent explicit in dependency
+# graphs; it does not enable a separate crate.
+fake = []
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }

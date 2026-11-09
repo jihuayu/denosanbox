@@ -11,7 +11,24 @@ use std::time::Duration;
 use crate::host_audit::{AuditEvent, AuditOutcome, HostAudit};
 use crate::host_schema::{JsonSchema, SchemaLimits};
 use crate::{Error, Result};
-use denosanbox_policy::Budget;
+use denosanbox_mounts::{MountAccess, MountTable};
+use denosanbox_policy::{Budget, Lease, VirtualPath};
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+
+pub type WorkerFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
+pub type WorkerHandler = Arc<dyn Fn(String, Value) -> WorkerFuture + Send + Sync>;
+#[derive(Default)]
+struct WorkerHandlerState(Option<WorkerHandler>);
+impl std::fmt::Debug for WorkerHandlerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerHandlerState")
+            .field("installed", &self.0.is_some())
+            .finish()
+    }
+}
+
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +51,7 @@ pub struct HostConfig {
     pub audit: Arc<HostAudit>,
     /// Shared ancestor admission pool. Clone this config for sibling sandboxes.
     pub host_budget: Arc<Budget>,
+    pub memory_budget: Arc<Budget>,
 }
 impl Default for HostConfig {
     fn default() -> Self {
@@ -42,6 +60,7 @@ impl Default for HostConfig {
             schema_limits: SchemaLimits::default(),
             audit: Arc::new(HostAudit::default()),
             host_budget: Budget::new(32),
+            memory_budget: Budget::new(256 * 1024 * 1024),
         }
     }
 }
@@ -72,6 +91,17 @@ pub struct HostContext {
     closed: AtomicBool,
     config: HostConfig,
     host_budget: Arc<Budget>,
+    memory_budget: Arc<Budget>,
+    vfs_leases: Mutex<BTreeMap<String, Lease>>,
+    mounts: Mutex<MountTable>,
+    worker_handler: Mutex<WorkerHandlerState>,
+}
+
+fn mount_error(error: denosanbox_mounts::Error) -> Error {
+    Error::Policy {
+        kind: "MountedResource".into(),
+        message: error.to_string(),
+    }
 }
 
 fn policy_error(error: denosanbox_policy::Error) -> Error {
@@ -144,6 +174,9 @@ impl HostContext {
         let host_budget = config
             .host_budget
             .child(limits.queue_depth().min(32) as u64);
+        let memory_budget = config
+            .memory_budget
+            .child(limits.heap_target_bytes() as u64);
         Ok(Arc::new(Self {
             id,
             view: Mutex::new(ResourceView::new(id, policy, view_limits)),
@@ -157,6 +190,10 @@ impl HostContext {
             closed: AtomicBool::new(false),
             config,
             host_budget,
+            memory_budget,
+            vfs_leases: Mutex::new(BTreeMap::new()),
+            mounts: Mutex::new(MountTable::new(id, 16, limits.max_message_bytes())),
+            worker_handler: Mutex::new(WorkerHandlerState::default()),
         }))
     }
     pub fn id(&self) -> SandboxId {
@@ -172,8 +209,12 @@ impl HostContext {
     pub fn host_config(&self) -> HostConfig {
         HostConfig {
             host_budget: self.host_budget.clone(),
+            memory_budget: self.memory_budget.clone(),
             ..self.config.clone()
         }
+    }
+    pub fn memory_budget(&self) -> Arc<Budget> {
+        self.memory_budget.clone()
     }
     pub fn audit(&self) -> Arc<HostAudit> {
         self.config.audit.clone()
@@ -218,6 +259,14 @@ impl HostContext {
         if let Ok(mut view) = self.view.lock() {
             view.close();
         }
+        if let Ok(mut leases) = self.vfs_leases.lock() {
+            leases.clear();
+        }
+        // A filesystem call may be blocked on a remote disk. Do not wait for its
+        // mount-table lock from the supervisor cancellation path.
+        if let Ok(mut mounts) = self.mounts.try_lock() {
+            let _ = mounts.close(self.id);
+        }
     }
     fn live(&self) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
@@ -231,13 +280,94 @@ impl HostContext {
             .narrow_policy(requested)
             .map_err(policy_error)
     }
-    pub fn read(&self, path: &str) -> Result<Vec<u8>> {
-        self.live()?;
-        lock(&self.view)?.read(path).map_err(policy_error)
+    pub fn mount_directory(
+        &self,
+        prefix: &str,
+        host_path: &Path,
+        access: MountAccess,
+    ) -> Result<()> {
+        let (_guard, _admission) = self.reserve_work()?;
+        let result = lock(&self.mounts)?
+            .add_mount(self.id, prefix, host_path, access)
+            .map_err(mount_error);
+        self.finish_resource(result)
     }
-    pub fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+    pub fn inherit_mounts_from(&self, parent: &HostContext) -> Result<()> {
+        let (_guard, _admission) = self.reserve_work()?;
+        parent.live()?;
+        let inherited = lock(&parent.mounts)?
+            .clone_for(self.id)
+            .map_err(mount_error)?;
+        parent.live()?;
+        *lock(&self.mounts)? = inherited;
+        self.finish_resource(Ok(()))
+    }
+    fn finish_resource<T>(&self, result: Result<T>) -> Result<T> {
+        if self.is_closed() {
+            if let Ok(mut mounts) = self.mounts.try_lock() {
+                let _ = mounts.close(self.id);
+            }
+        }
         self.live()?;
-        lock(&self.view)?.write(path, data).map_err(policy_error)
+        result
+    }
+    fn resolved_path(&self, path: &str) -> Result<(String, Policy)> {
+        let view = lock(&self.view)?;
+        Ok((
+            view.resolve(path)
+                .map_err(policy_error)?
+                .as_str()
+                .to_string(),
+            view.policy().clone(),
+        ))
+    }
+    /// Synchronous trusted-host convenience. Guest operations use read_async.
+    pub fn read(&self, path: &str) -> Result<Vec<u8>> {
+        let (_guard, _admission) = self.reserve_work()?;
+        self.finish_resource(self.read_inner(path))
+    }
+    fn read_inner(&self, path: &str) -> Result<Vec<u8>> {
+        self.live()?;
+        let (path, policy) = self.resolved_path(path)?;
+        let mounts = lock(&self.mounts)?;
+        if mounts.contains(&path) {
+            return mounts.read(self.id, &policy, &path).map_err(mount_error);
+        }
+        drop(mounts);
+        lock(&self.view)?.read(&path).map_err(policy_error)
+    }
+    /// Synchronous trusted-host convenience. Guest operations use write_async.
+    pub fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+        let (_guard, _admission) = self.reserve_work()?;
+        self.finish_resource(self.write_inner(path, data))
+    }
+    fn write_inner(&self, path: &str, data: &[u8]) -> Result<()> {
+        self.live()?;
+        let (path, policy) = self.resolved_path(path)?;
+        let mounts = lock(&self.mounts)?;
+        if mounts.contains(&path) {
+            return mounts
+                .write(self.id, &policy, &path, data)
+                .map_err(mount_error);
+        }
+        drop(mounts);
+        let mut view = lock(&self.view)?;
+        let mut leases = lock(&self.vfs_leases)?;
+        // Charge the incoming Vec allocation before replacing the old one.
+        let lease = self
+            .memory_budget
+            .reserve(data.len() as u64)
+            .map_err(policy_error)?;
+        view.write(&path, data).map_err(policy_error)?;
+        leases.insert(path, lease);
+        Ok(())
+    }
+    pub async fn read_async(self: &Arc<Self>, path: String) -> Result<Vec<u8>> {
+        self.offload(move |context| context.read_inner(&path)).await
+    }
+    pub async fn write_async(self: &Arc<Self>, path: String, data: Vec<u8>) -> Result<()> {
+        self.offload(move |context| context.write_inner(&path, &data))
+            .await
     }
     pub fn env_get(&self, name: &str) -> Result<Option<String>> {
         self.live()?;
@@ -248,14 +378,143 @@ impl HostContext {
         lock(&self.view)?.env_set(name, value).map_err(policy_error)
     }
     pub fn set_cwd(&self, path: &str) -> Result<()> {
+        let (_guard, _admission) = self.reserve_work()?;
+        self.finish_resource(self.set_cwd_inner(path))
+    }
+    fn set_cwd_inner(&self, path: &str) -> Result<()> {
         self.live()?;
-        lock(&self.view)?.set_cwd(path).map_err(policy_error)
+        let (path, policy) = self.resolved_path(path)?;
+        let mounts = lock(&self.mounts)?;
+        if mounts.contains(&path) {
+            mounts
+                .is_dir(self.id, &policy, &path)
+                .map_err(mount_error)?;
+            drop(mounts);
+            return lock(&self.view)?
+                .set_external_cwd(VirtualPath::parse(&path).map_err(policy_error)?)
+                .map_err(policy_error);
+        }
+        drop(mounts);
+        lock(&self.view)?.set_cwd(&path).map_err(policy_error)
+    }
+    pub async fn set_cwd_async(self: &Arc<Self>, path: String) -> Result<()> {
+        self.offload(move |context| context.set_cwd_inner(&path))
+            .await
     }
     pub fn cwd(&self) -> Result<String> {
         self.live()?;
         Ok(lock(&self.view)?.cwd().as_str().to_string())
     }
 
+    fn reserve_work(&self) -> Result<(Outstanding, Lease)> {
+        self.live()?;
+        let admission = self.host_budget.reserve(1).map_err(policy_error)?;
+        let mut active = self.outstanding.load(Ordering::Acquire);
+        loop {
+            if active >= self.max_host_calls {
+                return Err(Error::QueueFull {
+                    capacity: self.max_host_calls,
+                });
+            }
+            match self.outstanding.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok((Outstanding(self.outstanding.clone()), admission)),
+                Err(actual) => active = actual,
+            }
+        }
+    }
+    async fn offload<T, F>(self: &Arc<Self>, work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&HostContext) -> Result<T> + Send + 'static,
+    {
+        let deadline = self.deadline()?;
+        deadline.check().map_err(policy_error)?;
+        let (guard, admission) = self.reserve_work()?;
+        let owner = self.clone();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("denosanbox-resource-io".into())
+            .spawn(move || {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&owner)))
+                        .unwrap_or_else(|_| {
+                            Err(Error::Backend {
+                                message: "resource worker panicked".into(),
+                            })
+                        })
+                        .and_then(|value| {
+                            owner.live()?;
+                            deadline.check().map_err(policy_error)?;
+                            Ok(value)
+                        });
+                if owner.is_closed() {
+                    if let Ok(mut mounts) = owner.mounts.try_lock() {
+                        let _ = mounts.close(owner.id);
+                    }
+                }
+                drop(admission);
+                drop(guard);
+                let _ = sender.send(result);
+            })
+            .map_err(|_| Error::Backend {
+                message: "resource worker unavailable".into(),
+            })?;
+        loop {
+            self.live()?;
+            deadline.check().map_err(policy_error)?;
+            tokio::select! {
+                result=&mut receiver=>{self.live()?;deadline.check().map_err(policy_error)?;return result.map_err(|_|Error::Backend{message:"resource worker exited".into()})?;},
+                _=tokio::time::sleep(Duration::from_millis(5))=>{}
+            }
+        }
+    }
+    /// Install the trusted facade broker once, before running guest initialization.
+    pub fn set_worker_handler(&self, handler: WorkerHandler) -> Result<()> {
+        self.live()?;
+        let mut slot = lock(&self.worker_handler)?;
+        if slot.0.is_some() {
+            return Err(Error::InvalidConfiguration {
+                reason: "worker broker already installed".into(),
+            });
+        }
+        slot.0 = Some(handler);
+        Ok(())
+    }
+    pub async fn worker_operation(
+        self: &Arc<Self>,
+        operation: String,
+        input: Value,
+    ) -> Result<Value> {
+        self.live()?;
+        let deadline = self.deadline()?;
+        let handler =
+            lock(&self.worker_handler)?
+                .0
+                .clone()
+                .ok_or_else(|| Error::UnsupportedFeature {
+                    feature: "managed_workers".into(),
+                })?;
+        let control = matches!(operation.as_str(), "close" | "cancel" | "terminate");
+        let _admission = if control {
+            None
+        } else {
+            Some(self.reserve_work()?)
+        };
+        let mut future = (handler)(operation, input);
+        loop {
+            self.live()?;
+            deadline.check().map_err(policy_error)?;
+            tokio::select! {
+                result=&mut future=>{self.live()?;deadline.check().map_err(policy_error)?;return result;},
+                _=tokio::time::sleep(Duration::from_millis(5))=>{}
+            }
+        }
+    }
     pub fn protocol_version(&self) -> u16 {
         denosanbox_policy::PROTOCOL_VERSION
     }
@@ -691,5 +950,59 @@ mod tests {
             assert_eq!(first.await.unwrap().unwrap(),json!(null));
             assert_eq!(global.used(),0);
         });
+    }
+    #[test]
+    fn private_vfs_bytes_share_ancestor_memory_and_release_on_close() {
+        let hosts = Arc::new(Mutex::new(HostRegistry::default()));
+        let config = HostConfig {
+            memory_budget: Budget::new(5),
+            ..Default::default()
+        };
+        let global = config.memory_budget.clone();
+        let policy = Policy::default()
+            .allow_read("/tmp")
+            .unwrap()
+            .allow_write("/tmp")
+            .unwrap();
+        let a = HostContext::new_with_config(policy.clone(), hosts.clone(), vec![], config.clone())
+            .unwrap();
+        let b = HostContext::new_with_config(policy, hosts, vec![], config).unwrap();
+        a.write("/tmp/a", b"123").unwrap();
+        assert_eq!(global.used(), 3);
+        assert!(b.write("/tmp/b", b"456").is_err());
+        assert!(b.read("/tmp/b").is_err());
+        a.cancel();
+        assert_eq!(global.used(), 0);
+        b.write("/tmp/b", b"456").unwrap();
+        assert_eq!(global.used(), 3);
+        b.cancel();
+        assert_eq!(global.used(), 0);
+    }
+    #[test]
+    fn worker_control_hook_survives_saturated_host_admission() {
+        let hosts = Arc::new(Mutex::new(HostRegistry::default()));
+        let config = HostConfig {
+            host_budget: Budget::new(1),
+            ..Default::default()
+        };
+        let pool = config.host_budget.clone();
+        let context =
+            HostContext::new_with_config(Policy::default(), hosts, vec![], config).unwrap();
+        context
+            .set_worker_handler(Arc::new(|operation, _| {
+                Box::pin(async move { Ok(json!(operation)) })
+            }))
+            .unwrap();
+        let _busy = pool.reserve(1).unwrap();
+        context.begin_invocation(Duration::from_secs(1)).unwrap();
+        assert!(runtime()
+            .block_on(context.worker_operation("create".into(), json!({})))
+            .is_err());
+        assert_eq!(
+            runtime()
+                .block_on(context.worker_operation("close".into(), json!({})))
+                .unwrap(),
+            json!("close")
+        );
     }
 }

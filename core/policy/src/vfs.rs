@@ -277,6 +277,15 @@ impl ResourceView {
         Ok(())
     }
 
+    /// Trusted embedder hook after validating a directory in an external mount.
+    /// Guest callers must use the host context's mounted-directory checks.
+    pub fn set_external_cwd(&mut self, path: VirtualPath) -> Result<()> {
+        self.open()?;
+        self.policy.check_read(&path)?;
+        self.cwd = path;
+        Ok(())
+    }
+
     /// Set a logical env var. Requires the `env` capability.
     pub fn env_set(&mut self, name: &str, value: &str) -> Result<()> {
         self.open()?;

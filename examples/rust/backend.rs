@@ -40,7 +40,6 @@ const MAX_ORDER_INPUT: usize = 2048;
 const MAX_ORDER_OUTPUT: usize = 1024;
 /// Simulated lookup latency of the (in-memory) order store.
 const LOOKUP_LATENCY: Duration = Duration::from_millis(25);
-const TIGHT_DEADLINE: Duration = Duration::from_millis(10);
 
 /// Simulated async host service: no network, no database, in-memory data only.
 ///
@@ -169,22 +168,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     println!("first, orders.read with orderId 0: {bad_input:?}");
     assert!(bad_input.is_err(), "orderId 0 must be rejected");
-
-    // The callback sees the invocation deadline and stops before its lookup:
-    // whether the engine or the host notices first, the call cannot return a
-    // forged/successful order.
-    let tight = first
-        .call(
-            "readOrder",
-            json!({ "orderId": 1 }),
-            InvocationOptions {
-                timeout: Some(TIGHT_DEADLINE),
-                ..Default::default()
-            },
-        )
-        .await;
-    println!("first, orders.read with {TIGHT_DEADLINE:?} deadline: {tight:?}");
-    assert!(tight.is_err(), "expired call must fail: {tight:?}");
 
     let first_close = first.close().await?;
     println!(

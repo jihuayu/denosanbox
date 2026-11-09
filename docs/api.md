@@ -10,7 +10,7 @@ The facade is `core/src/lib.rs`. Public values contain no Deno/V8 objects. The e
 
 ## Advanced Rust host configuration
 
-`Engine::with_host_config(config, ceiling: Policy, HostConfig)` installs trusted host state before any sandbox is created. `HostConfig` holds per-capability JSON schemas and their limits, a shared `HostAudit`, a shared host-concurrency `Budget` (default 32 slots) and a shared managed-memory `Budget` (default 512 MiB); clone the config so sibling sandboxes share the same pools. Explicitly smaller pools are never expanded automatically. These advanced shared-pool, schema and audit controls are Rust-facade features: Python, Node, C and Go expose their own ceilings, requests, grants, callbacks and mounts but not this `HostConfig` surface.
+`Engine::with_host_config(config, ceiling: Policy, HostConfig)` installs trusted host state before any sandbox is created. `HostConfig` holds per-capability JSON schemas and their limits, a shared `HostAudit`, a shared host-concurrency `Budget` (default 32 slots) and a shared managed-memory `Budget` (default 512 MiB); clone the config so sibling sandboxes share the same pools. Explicitly smaller pools are never expanded automatically. These advanced shared-pool, schema and audit controls are Rust-facade features: Python and Node expose documented engine options, sandbox requests, grants, callbacks and mounts. C and Go expose capability ceilings, grants and callbacks with the fixed ABI limits; they have no mount or numeric sandbox-option surface. None exposes this `HostConfig` surface.
 
 ## Invoke and cancel
 

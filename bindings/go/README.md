@@ -49,10 +49,10 @@ shutdown, err := engine.Close()
 
 `Sandbox.Call` submits one native job and polls in 50 ms bounded waits. Context
 cancellation calls the core's terminal sandbox cancel and returns the context
-error. Context cancellation preserves the deadline identity of the native call
-(the call keeps the deadline it was admitted with, regardless of which side
-finishes first), so a race between Go's context and native completion cannot
-turn a deadline error into a cancellation or vice versa. A cancelled sandbox
+error. If the context deadline has elapsed, a racing native deadline result
+still maps to `context.DeadlineExceeded`, even before the Go timer updates
+`ctx.Err()`. A native timeout earlier than the context deadline remains a typed
+native deadline error. A cancelled sandbox
 cannot be reused; later calls report `StatusClosed` or `StatusCancelled`.
 
 `Close` returns the core close/shutdown report. A report with `ClosedCleanly` or

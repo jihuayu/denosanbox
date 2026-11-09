@@ -289,7 +289,6 @@ trusted scope, ungranted denial, callback cancellation, sanitized failures, and
 explicit close before interpreter shutdown. Shared behavior fixtures also run
 against the Rust runner and the native Node package.
 
-The final rerun of this suite at implementation commit `4156653` is pending a
-fixture correction and is not recorded as passing; see
-[VALIDATION.md](VALIDATION.md) for the last verified results and reproducible
-commands.
+The installed production wheel built from `4156653` passed all 41 tests after
+the cross-engine regression test was corrected to use Deno (`56e014a`). See
+[VALIDATION.md](VALIDATION.md) for the verified results and reproducible commands.

@@ -3,9 +3,10 @@
 Scope: implementation commit `4156653`, Linux x86_64, CPython 3.12,
 Rust 1.99.1, `deno_core 0.413.0`, PyO3 0.23.5, pyo3-async-runtimes 0.23.0.
 
-The final production-wheel rerun at this commit is **pending a fixture
-correction** and is not recorded as passing here. Do not treat older counts or
-pass results as the final result.
+The production wheel was built with `--locked`, installed into a fresh private
+venv, and imported from `site-packages`. All **41 tests passed** after the
+cross-engine regression test was corrected to use the real Deno backend
+(`56e014a`). No production code or wheel rebuild was needed for that test fix.
 
 ## Reproducible commands
 
@@ -13,7 +14,7 @@ Build and install the production wheel from a local artifact (nothing is
 published):
 
 ```sh
-cd bindings/python
+# Run from the repository root.
 python -m venv .venv
 . .venv/bin/activate
 python -m pip install "maturin>=1.7,<2.0" pytest pytest-asyncio
@@ -33,8 +34,8 @@ never fall back to fake execution.
 Contract-only build (no JavaScript execution):
 
 ```sh
-maturin develop --no-default-features --features fake
-python -m pytest tests/test_fake_contract.py
+maturin develop --manifest-path bindings/python/Cargo.toml --no-default-features --features fake
+python -m pytest bindings/python/tests/test_fake_contract.py
 ```
 
 ## What the suite covers
@@ -77,11 +78,9 @@ timers, streaming, `eval`/classic Workers, transferables/`SharedArrayBuffer`,
 `sharedEnv` or native Workers; live heap, tree-memory and sandbox-count policy
 changes are unsupported (recreate the sandbox).
 
-## Last verified run (historical)
+## Artifact verification
 
-Before the final commit, the production wheel (rebuilt and reinstalled against
-the then-current core) ran the complete suite successfully, including the four
-host callback cases, the direct real-runtime cases, the shared behavior
-fixtures and the deterministic contract cases, with no production test skipped.
-Those counts predate later fixture and test changes and are **not** the final
-result for `4156653`.
+The installed extension was loaded from the private venv rather than an editable
+checkout. Its wheel SHA-256 was
+`be5e6deb4c1ba904654ce58ef03b585bc0143a34880c90d2a7476841f9e6b248`.
+This records one local Linux build; no wheel was published.

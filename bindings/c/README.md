@@ -39,8 +39,8 @@ shared target directory.
 
 ## API shape
 
-- Opaque owned `u64` tokens for engine, sandbox, job, buffer, context and
-  callback handles. Tokens are kind-checked and generated from one monotonic,
+- Opaque owned `u64` tokens for engine, sandbox, job, buffer and callback
+  handles; callback context tokens are borrowed and expire on callback return. Tokens are kind-checked and generated from one monotonic,
   non-reused registry.
 - `deno_engine_new`, `deno_engine_create_sandbox` (source cap 8 MiB).
 - `deno_sandbox_call_submit` (export cap 128 bytes, JSON input cap 1 MiB,
@@ -63,7 +63,7 @@ shared target directory.
 - `deno_engine_new_with_capabilities` fixes the engine's capability-name
   ceiling; `deno_engine_new` remains deny-all.
 - `deno_engine_register_host(engine, name, ..., callback, release, user_data)`
-  registers a callback (bounded input/output, 1..=64 MiB). Registration alone
+  registers a callback (bounded input/output, 1 byte through 64 MiB). Registration alone
   grants nothing; ownership of `user_data` transfers only on
   `DENO_STATUS_OK`.
 - `deno_engine_create_sandbox_with_grants` grants scopes from trusted host JSON;

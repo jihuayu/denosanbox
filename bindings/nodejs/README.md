@@ -169,7 +169,8 @@ finally { await sandbox.close(); await engine.shutdown(); }
 Trusted callback context has `sandboxId`, `scope`, dispatch-time `remainingMs`,
 and an `AbortSignal`. Callback input is a separate JSON value. Cancellation,
 close, and deadlines abort the signal; callbacks must cooperate and check it.
-Non-cooperative work remains owned/accounted by core and close may return false.
+Non-cooperative work remains owned/accounted by core and close may report
+`closedCleanly: false`.
 `Symbol.asyncDispose` throws `incomplete_close` rather than discarding a false
 cleanup report. Timeouts do not roll back committed side effects. Callbacks
 execute on the Node event loop, so avoid synchronous blocking work. N-API

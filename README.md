@@ -1,6 +1,6 @@
 # denosanbox
 
-An embeddable Rust library that runs host-prepared JavaScript and TypeScript module graphs in independent Deno/V8 isolates inside the host process. The production backend is embedded `deno_core`; there is no Deno executable, sidecar or subprocess at build or run time. The public API is `Engine → PreparedPlugin → SandboxHandle → Invocation`. Language bindings call the Rust facade directly.
+An embeddable Rust library that runs host-prepared JavaScript and TypeScript module graphs in independent Deno/V8 isolates inside the host process. The production backend is embedded `deno_core`; guest execution uses no Deno executable, sidecar or subprocess. The public API is `Engine → PreparedPlugin → SandboxHandle → Invocation`. Language bindings call the Rust facade directly.
 
 This is an experimental native library. It mediates guest APIs and isolates JavaScript state. Memory limits are finite accounting targets; native faults, aborts and process-wide out-of-memory failures are not contained. See [the threat model](docs/threat-model.md), the [API/lifecycle contract](docs/api.md) and the [compatibility matrix](docs/compatibility.md).
 
@@ -18,7 +18,7 @@ cargo test --manifest-path core/Cargo.toml --workspace --all-features --locked
 cargo clippy --manifest-path core/Cargo.toml --workspace --all-targets --locked -- -D warnings
 ```
 
-The example prepares an in-memory ESM module, creates two independent sandboxes, observes counters `1, 2` and `1`, closes both and shuts down the engine inside an existing Tokio host. The explicit `fake` backend (`BackendKind::Fake`) exercises lifecycle contracts and does not execute JavaScript.
+The example prepares an in-memory ESM module, creates two independent sandboxes, observes counters `1, 2` and `1`, calls an async `orders.read` capability with per-tenant trusted scopes, closes both and shuts down the engine inside an existing Tokio host. The explicit `fake` backend (`BackendKind::Fake`) exercises lifecycle contracts and does not execute JavaScript.
 
 ```rust,ignore
 use denosanbox::{Engine, EngineConfig, InvocationOptions, PluginSource, SandboxOptions};
@@ -32,7 +32,7 @@ sandbox.close().await?;
 engine.shutdown().await?;
 ```
 
-`Engine::with_host_config(EngineConfig, ceiling: Policy, HostConfig)` is the advanced Rust-only entry point. `HostConfig` carries capability input/output schemas and schema budgets, a shared `HostAudit` sink, the shared host-concurrency pool and a shared managed-memory pool (default 512 MiB, `Budget::new(32)` host slots). The other SDKs do not expose these advanced shared-pool, schema or audit controls; they expose engine ceilings, per-sandbox requests, grants and mounts through their own documented APIs.
+`Engine::with_host_config(EngineConfig, ceiling: Policy, HostConfig)` is the advanced Rust-only entry point. `HostConfig` carries capability input/output schemas and schema budgets, a shared `HostAudit` sink, the shared host-concurrency pool and a shared managed-memory pool (default 512 MiB, `Budget::new(32)` host slots). The other SDKs do not expose these advanced shared-pool, schema or audit controls; each SDK documents its available ceilings, requests, grants and resource APIs.
 
 ## Bindings
 
@@ -47,7 +47,7 @@ The Rust facade and each language package are versioned independently. [Binding 
 
 Modules are supplied as immutable, host-prepared graphs. Module graph validation happens at `create` (and re-validates a `PreparedPlugin` against the creating engine's limits, including cross-engine limits); static imports, re-exports and computed dynamic imports resolve only inside the frozen graph and ordinary relative paths — nothing is downloaded. JS/MJS and TS/MTS (transpiled, not type-checked) are supported; JSX/TSX, CommonJS, JSON modules, WASM and native addons are rejected. Only approved builtins (the explicit `worker_threads` alias in the `PureJsNpm` profile) are available. The [offline package preparation](core/modules/README.md) verifies SHA-256 digests and rejects lifecycle scripts/native dependencies; there is no npm installer and no runtime package download. [Real npm fixtures](fixtures/npm/sources.json) exercise dequal and nanoid/non-secure.
 
-Guest APIs are explicit capabilities (`sandbox.{fs,env,host,cwd,chdir,exit}`, policy-gated `fetch`, managed Workers). The runtime never exposes raw `Deno.core`, host process environment, signals, subprocess creation, FFI, inspector or shared memory (`WebAssembly`/`SharedArrayBuffer`/`Atomics` are removed). Guest message/queue, permission, log and deadline self-narrowing applies to subsequent checks; live heap, tree-memory and sandbox-count changes are explicitly unsupported (recreate the sandbox). Existing children retain their creation ceilings and a root cancel revokes its whole subtree.
+Guest APIs are explicit capabilities (`sandbox.{fs,env,host,cwd,chdir,exit}`, policy-gated `fetch`, managed Workers). The runtime never exposes raw `Deno.core`, host process environment, signals, subprocess creation, FFI, inspector or shared memory (`WebAssembly`/`SharedArrayBuffer`/`Atomics` are removed). Policy message/queue, permission, log and deadline self-narrowing applies to subsequent checks; live heap, tree-memory and sandbox-count changes are explicitly unsupported (recreate the sandbox). Existing children retain their creation ceilings and a root cancel revokes its whole subtree.
 
 Managed guest Workers are a bounded JSON request/reply subset. During the child's message handler the guest may `postMessage` JSON and receive replies; there are no unsolicited top-level pushes, timers, streaming, `eval`/classic Workers, transferables, `SharedArrayBuffer`, `sharedEnv` or native Workers. The browser `Worker` `terminate()` returns a joinable Promise. The `node:worker_threads` alias exists only in the explicit `PureJsNpm` profile.
 
@@ -59,9 +59,9 @@ Defaults are set so the default sandbox count is usable: the global active sandb
 
 ## Validation
 
-[Shared behavior fixtures](core/testkit/README.md) run through the Rust, Python and Node native APIs. Rust integration suites cover state/module isolation, policy denial and quotas, cancellation, deadlines, resource ownership, managed Workers, guest-worker limits, host security and teardown. [Boundary fuzzing](core/fuzz/README.md) exercises malformed frames, paths and permission intersections. [Benchmarks](dev/benchmarks/README.md) record commands, hardware/configuration and one measured run (an observation, not a capacity claim); current numbers should be measured anew.
+[Shared behavior fixtures](core/testkit/README.md) run through the Rust, Python and Node native APIs. Rust integration suites cover state/module isolation, policy denial and quotas, cancellation, deadlines, resource ownership, managed Workers, guest-worker limits, host security and teardown. [Boundary fuzzing](core/fuzz/README.md) exercises malformed frames, paths and permission intersections. [Benchmarks](dev/benchmarks/README.md) record commands, hardware/configuration and one measured run (an observation, not a capacity claim); the artifact records production implementation `4156653`.
 
-Final validation at implementation commit `4156653`: clean `cargo fmt --check` and all-target Clippy `-D warnings` pass; Rust `--all-features` 211 passed and `--no-default-features` 155 passed (one ignored upstream doc-test in each); `dev/validate-fixtures.py` 8 passed; Node 22/22 tests with no skips plus an installed-`npm pack` smoke test; C/Go `bindings/c/test.sh` and the Go race deadline/cancel tests 10× pass. The Python final rerun is pending a fixture correction and the fuzz job is pending CI; see [Python validation](bindings/python/VALIDATION.md).
+Final validation at implementation commit `4156653`: clean `cargo fmt --check` and all-target Clippy `-D warnings` pass; Rust `--all-features` 211 passed and `--no-default-features` 155 passed (one ignored upstream doc-test in each); `dev/validate-fixtures.py` 8 passed; Node 22/22 tests with no skips plus an installed-`npm pack` smoke test; C/Go `bindings/c/test.sh` and the Go race deadline/cancel tests 10× pass. The installed Python wheel passed 41 tests after the cross-engine regression test was corrected to use Deno. The bounded fuzz smoke runs in CI; see [Python validation](bindings/python/VALIDATION.md).
 
 Reproduce the final validation commands:
 

@@ -34,7 +34,7 @@ are tested from locally built wheel / `npm pack` artifacts.
 
 ## Core API compatibility
 
-- The Rust facade's data model is frozen at `API_VERSION = "0.1.0"`; bindings
+- The Rust facade reports `API_VERSION = "0.1.0"`; bindings
   consume that facade directly and version themselves independently.
 - The backend is chosen per engine at construction (`EngineConfig.backend`,
   default `BackendKind::Deno`). There is no runtime-swap API and no live sandbox
@@ -76,7 +76,7 @@ accounting targets, not hard RSS bounds or native OOM/crash containment.
 | `max_message_bytes` | 1 MiB | facade + backend | inputs, results, Worker messages |
 | invocation deadline | 30 s default, 300 s max | facade + per-sandbox watchdog | terminal for the sandbox |
 | log retention per invocation (`max_log_bytes`) | 64 KiB | backend per-invocation counter under the effective policy | follows live narrowing of the invocation's effective policy |
-| schema budgets | depth 128, node/string/array/property budgets | `JsonSchema::validate` | Rust `HostConfig` only |
+| schema budgets | depth 32 by default (hard traversal ceiling 128), node/string/array/property budgets | `JsonSchema::validate` | Rust `HostConfig` only |
 | audit buffer | bounded, dropped events counted | `HostAudit` | Rust `HostConfig` only |
 
 `narrow_policy` narrows permissions, messages, queue, log and deadline for

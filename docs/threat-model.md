@@ -166,8 +166,9 @@ OS-level memory/CPU limits when stronger isolation is needed.
   `dev/validate-fixtures.py` 8 passed; Node 22/22 with no skips plus an installed
   `npm pack` smoke test; `bindings/c/test.sh` (C examples, `go test -race`, Go
   example) and the Go race deadline/cancel tests 10×.
-- **Pending:** the Python final rerun (fixture correction) and fuzz runs in CI
-  are not recorded as passing here. The declarative `fixtures/conformance`
+- **Python:** the installed production wheel passed 41 tests after the
+  cross-engine fixture was corrected to use Deno (`56e014a`).
+- **Fuzz:** the bounded nightly smoke target runs in CI. The declarative `fixtures/conformance`
   catalog is only validated structurally by `dev/validate-fixtures.py`; it never
   executes JavaScript.
 

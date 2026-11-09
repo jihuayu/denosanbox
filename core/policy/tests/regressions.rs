@@ -246,3 +246,13 @@ fn failed_vfs_write_does_not_create_partial_directories() {
     assert!(view.mkdir("/file").is_err());
     assert!(view.write("/tmp", b"x").is_err());
 }
+
+#[test]
+fn dns_requires_explicit_host_and_port_permission() {
+    let n = NetworkRules::deny_all().allow("api.example", 443).unwrap();
+    assert!(n.check_host("api.example", 443).is_ok());
+    assert!(n.check_host("secret.exfil.example", 443).is_err());
+    assert!(n.check_host("api.example", 80).is_err());
+    assert!(n.check_host("api.example", 0).is_err());
+    assert!(n.check_host("API.example", 443).is_err());
+}

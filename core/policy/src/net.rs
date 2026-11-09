@@ -142,6 +142,22 @@ impl NetworkRules {
         Ok(self)
     }
 
+    /// Authorize the canonical hostname and port before performing DNS, so a
+    /// denied hostname cannot leak guest data through resolution side effects.
+    pub fn check_host(&self, host: &str, port: u16) -> Result<()> {
+        let host = HostPattern::parse(host).map_err(|_| Error::network_denied("invalid host"))?;
+        if port != 0
+            && self
+                .rules
+                .iter()
+                .any(|r| r.host == host && r.ports.iter().any(|p| p.contains(port)))
+        {
+            Ok(())
+        } else {
+            Err(Error::network_denied("connection destination denied"))
+        }
+    }
+
     /// Check the actual addresses to be connected; connectors must pin these
     /// addresses when dialing and repeat this check at every redirect.
     pub fn check(&self, host: &str, port: u16, resolved: &[IpAddr]) -> Result<()> {

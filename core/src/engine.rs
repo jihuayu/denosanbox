@@ -438,6 +438,7 @@ impl Engine {
             close_requested: AtomicBool::new(false),
             closed_for_calls: AtomicBool::new(false),
             in_flight: AtomicBool::new(false),
+            queued_calls: Arc::new(AtomicUsize::new(0)),
             completed: AtomicU64::new(0),
             cancelled: AtomicU64::new(0),
             join: Mutex::new(None),
@@ -650,7 +651,9 @@ impl SandboxHandle {
         if self.state.closed_for_calls.load(Ordering::SeqCst) {
             return Err(Error::Closed);
         }
-        check_message_size(&input, self.limits.max_message_bytes)?;
+        let policy_limits = self.state.host.policy().limits();
+        let message_limit = self.limits.max_message_bytes.min(policy_limits.max_message_bytes());
+        check_message_size(&input, message_limit)?;
 
         let now = Instant::now();
         let requested_timeout = options
@@ -692,16 +695,21 @@ impl SandboxHandle {
             }
             None => relative_deadline,
         };
-        let deadline = deadline.min(self.state.expires);
+        let policy_deadline = now.checked_add(policy_limits.deadline()).ok_or_else(|| Error::InvalidConfiguration {
+            reason: "policy deadline overflows monotonic clock".into(),
+        })?;
+        let deadline = deadline.min(self.state.expires).min(policy_deadline);
         if deadline <= Instant::now() {
             return Err(Error::DeadlineExceeded);
         }
 
+        let queue_slot = QueueSlot::reserve(&self.state.queued_calls,
+            self.limits.max_pending_invocations.min(policy_limits.queue_depth()))?;
         let input_lease = self
             .state
             .host
             .memory_budget()
-            .reserve(self.limits.max_message_bytes as u64)
+            .reserve(message_limit as u64)
             .map_err(|_| Error::LimitExceeded {
                 limit: "queued_message_bytes".into(),
                 detail: "ancestor message budget exhausted".into(),
@@ -715,8 +723,10 @@ impl SandboxHandle {
         };
         match self.state.sender.try_send(WorkerMsg::Call(CallJob {
             invocation,
+            deadline,
             reply: reply_tx,
             _input_lease: input_lease,
+            queue_slot: Some(queue_slot),
         })) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -731,7 +741,8 @@ impl SandboxHandle {
         match tokio::time::timeout_at(tokio_deadline, reply_rx).await {
             Ok(Ok(result)) => {
                 let value = result?;
-                check_message_size(&value, self.limits.max_message_bytes)?;
+                check_message_size(&value, self.limits.max_message_bytes.min(
+                    self.state.host.policy().limits().max_message_bytes()))?;
                 Ok(value)
             }
             Ok(Err(_)) => Err(Error::Closed),
@@ -877,8 +888,27 @@ enum WorkerMsg {
 
 struct CallJob {
     invocation: Invocation,
+    deadline: Instant,
     reply: oneshot::Sender<Result<Value>>,
     _input_lease: denosanbox_core::policy::Lease,
+    queue_slot: Option<QueueSlot>,
+}
+
+struct QueueSlot(Arc<AtomicUsize>);
+impl QueueSlot {
+    fn reserve(counter: &Arc<AtomicUsize>, capacity: usize) -> Result<Self> {
+        let mut queued = counter.load(Ordering::Acquire);
+        loop {
+            if queued >= capacity { return Err(Error::QueueFull { capacity }); }
+            match counter.compare_exchange_weak(queued, queued + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(Self(counter.clone())),
+                Err(current) => queued = current,
+            }
+        }
+    }
+}
+impl Drop for QueueSlot {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
 }
 
 struct WorkerState {
@@ -899,6 +929,7 @@ struct WorkerState {
     close_requested: AtomicBool,
     closed_for_calls: AtomicBool,
     in_flight: AtomicBool,
+    queued_calls: Arc<AtomicUsize>,
     completed: AtomicU64,
     cancelled: AtomicU64,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -1056,7 +1087,8 @@ fn worker_loop(
         };
         match msg {
             WorkerMsg::Close => break,
-            WorkerMsg::Call(job) => {
+            WorkerMsg::Call(mut job) => {
+                drop(job.queue_slot.take());
                 if state.close_requested.load(Ordering::SeqCst) {
                     state.cancelled.fetch_add(1, Ordering::SeqCst);
                     let _ = job.reply.send(Err(Error::Closed));
@@ -1066,21 +1098,20 @@ fn worker_loop(
                 if state.close_requested.load(Ordering::SeqCst) {
                     state.control.cancel();
                 }
-                let duration = job
-                    .invocation
-                    .deadline
-                    .and_then(|d| d.duration_since(SystemTime::now()).ok())
-                    .unwrap_or(Duration::ZERO);
-                let result = state
-                    .host
-                    .begin_invocation(duration)
+                let duration = job.deadline.saturating_duration_since(Instant::now())
+                    .min(state.host.policy().limits().deadline());
+                job.invocation.timeout = job.invocation.timeout.min(duration);
+                job.invocation.deadline = Some(SystemTime::now() + duration);
+                let result = check_message_size(&job.invocation.input,
+                    state.host.policy().limits().max_message_bytes())
+                    .and_then(|_| state.host.begin_invocation(duration))
                     .and_then(|_| driver.invoke(job.invocation));
                 state.in_flight.store(false, Ordering::SeqCst);
                 match &result {
                     Ok(_) => {
                         state.completed.fetch_add(1, Ordering::SeqCst);
                     }
-                    Err(Error::Cancelled) => {
+                    Err(Error::Cancelled | Error::DeadlineExceeded) => {
                         state.cancelled.fetch_add(1, Ordering::SeqCst);
                     }
                     Err(_) => {}
@@ -1101,13 +1132,17 @@ fn worker_loop(
             let _ = job.reply.send(Err(Error::Closed));
         }
     }
-    let report = driver.close().unwrap_or(CloseReport {
+    let mut report = driver.close().unwrap_or(CloseReport {
         invocations_completed: state.completed.load(Ordering::SeqCst),
         invocations_cancelled: state.cancelled.load(Ordering::SeqCst),
         forced_termination: state.control.is_cancelled(),
         closed_cleanly: false,
         pending_host_operations: state.host.outstanding(),
     });
+    // The supervisor also observes accepted calls drained without entering
+    // the backend, so its counters define the facade's close report.
+    report.invocations_completed = state.completed.load(Ordering::SeqCst);
+    report.invocations_cancelled = state.cancelled.load(Ordering::SeqCst);
     *state.report.lock().expect("report mutex poisoned") = Some(report);
 
     state.finished.notify_waiters();
@@ -1258,7 +1293,12 @@ mod tests {
         for queued in queued {
             let _ = queued.await.unwrap();
         }
-        let _ = sandbox.close().await.unwrap();
+        let report = sandbox.close().await.unwrap();
+        assert_eq!(report.invocations_completed, 0);
+        assert_eq!(
+            report.invocations_cancelled,
+            engine.limits().max_pending_invocations as u64 + 1,
+        );
     }
 
     #[tokio::test]

@@ -51,12 +51,13 @@ impl std::error::Error for ConnectorError {}
 pub type Result<T> = std::result::Result<T, ConnectorError>;
 pub type ResolveFuture = Pin<Box<dyn Future<Output = Result<Vec<IpAddr>>> + Send>>;
 
-/// Per-query completion token issued by the trusted resolver. Resolution is
-/// owned by one request, never by the shared resolver object: dropping the
-/// async future (deadline/cancellation) does not release the lease, because
-/// native `getaddrinfo` cannot be aborted. The lease is released only when the
-/// resolver's own work for that query really finishes. A resolver that cannot
-/// retain the lease for native work must report it as still pending here.
+/// Per-query completion token issued by the trusted resolver for exactly one
+/// query. Resolution is owned by that query, never by the shared resolver
+/// object: dropping the async future (deadline/cancellation) does not release
+/// the lease, because native `getaddrinfo` cannot be aborted. The lease settles
+/// only when the resolver's own work for that query really ends. A resolver
+/// that cannot retain the lease for native work must report it as still
+/// pending here.
 #[derive(Debug)]
 pub struct ResolutionLease {
     done: Arc<CompletionSlot>,
@@ -69,12 +70,7 @@ impl ResolutionLease {
             done: AtomicBool::new(false),
         });
         let completion = ResolutionCompletion(Arc::clone(&slot));
-        (
-            Self {
-                done: slot,
-            },
-            completion,
-        )
+        (Self { done: slot }, completion)
     }
     /// A lease for work that is already complete (synchronous answers).
     pub fn completed() -> Self {
@@ -86,11 +82,6 @@ impl ResolutionLease {
     }
     pub fn is_settled(&self) -> bool {
         self.done.done.load(Ordering::Acquire)
-    }
-    /// Settle this lease directly, e.g. when a custom resolver's work ended
-    /// behind a clone of the lease. Does not abort outstanding native work.
-    pub fn finish(&self) {
-        self.done.done.store(true, Ordering::Release);
     }
 }
 
@@ -115,13 +106,19 @@ impl Drop for ResolutionCompletion {
 
 /// Trusted host extension point. Guest data cannot replace the resolver.
 ///
-/// Extension contract: `resolve` must hand back a [`ResolutionLease`] for this
-/// query only and keep it unsettled until its work finishes. If the resolver
-/// offloads to non-cooperative native work (e.g. `getaddrinfo`), it must move
-/// ownership of the lease into that work so the lease survives cancellation of
-/// the returned future. The connector then reports this request as still
-/// owning host work until that lease settles; it never consults shared,
-/// resolver-wide or cross-request state.
+/// Extension contract: [`Resolver::resolve`] returns a future for one query and
+/// **no lease**; the caller only sees the result. [`Resolver::begin`] returns
+/// the same future together with a [`ResolutionLease`] for that query only,
+/// which must stay unsettled until that query's work finishes. The default
+/// `begin` is only for already-complete async answers (`ResolutionLease::completed()`).
+///
+/// A custom resolver whose work is non-cooperative (e.g. native `getaddrinfo`
+/// on a thread, or a shared resolver that cannot be aborted) must override
+/// `begin` and retain the [`ResolutionCompletion`] inside the actual work, so
+/// the lease survives cancellation of the returned future. The connector then
+/// reports this request as still owning host work until that lease settles; it
+/// never consults shared, resolver-wide or cross-request state. An
+/// already-complete async answer may rely on the default contract.
 pub trait Resolver: Send + Sync {
     fn resolve(&self, host: String, port: u16) -> ResolveFuture;
     /// Trait default for already-complete answers; implementations with native
@@ -237,7 +234,7 @@ impl std::fmt::Debug for HttpConnector {
 }
 impl HttpConnector {
     pub fn new(limits: ConnectorLimits) -> Result<Self> {
-        Self::with_resolver(limits, Arc::new(SystemResolver::default()))
+        Self::with_resolver(limits, Arc::new(SystemResolver))
     }
     pub fn with_resolver(limits: ConnectorLimits, resolver: Arc<dyn Resolver>) -> Result<Self> {
         if limits.timeout.is_zero()
@@ -251,6 +248,15 @@ impl HttpConnector {
             return Err(ConnectorError::InvalidRequest);
         }
         Ok(Self { limits, resolver })
+    }
+    /// Reports whether an inherited proxy pre-empts any of these URLs.
+    #[doc(hidden)]
+    pub fn proxy_is_configured_for(&self, urls: &[&str]) -> bool {
+        urls.iter().any(|url| {
+            Url::parse(url)
+                .map(|url| proxy_applies(&url))
+                .unwrap_or(true)
+        })
     }
     /// Run one whole request (resolution and transport) and return its result
     /// together with this request's resolution lease. The lease lets an owner
@@ -278,22 +284,21 @@ impl HttpConnector {
         }
         let mut lease = ResolutionLease::completed();
         let slot = Cell::new(None);
-        let work = self.execute_inner(request, &policy, &slot);
-        tokio::pin!(work);
-        let timer = tokio::time::sleep(remaining.min(self.limits.timeout));
-        tokio::pin!(timer);
-        let mut tick = tokio::time::interval(Duration::from_millis(5));
-        let result = loop {
-            tokio::select! {
-                biased;
-                _ = &mut timer => break Err(ConnectorError::DeadlineExceeded),
-                _ = tick.tick() => { if cancellation.is_cancelled() { break Err(ConnectorError::Cancelled); } }
-                result = &mut work => break if cancellation.is_cancelled() { Err(ConnectorError::Cancelled) } else { result },
+        let result = {
+            let work = self.execute_inner(request, &policy, &slot);
+            tokio::pin!(work);
+            let timer = tokio::time::sleep(remaining.min(self.limits.timeout));
+            tokio::pin!(timer);
+            let mut tick = tokio::time::interval(Duration::from_millis(5));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut timer => break Err(ConnectorError::DeadlineExceeded),
+                    _ = tick.tick() => { if cancellation.is_cancelled() { break Err(ConnectorError::Cancelled); } }
+                    result = &mut work => break if cancellation.is_cancelled() { Err(ConnectorError::Cancelled) } else { result },
+                }
             }
         };
-        // The future is dropped only after this point, so a resolution that was
-        // in flight has already stored its lease above.
-        drop(work);
         if let Some(adopted) = slot.take() {
             lease = adopted;
         }
@@ -352,11 +357,9 @@ impl HttpConnector {
             .check_host(host, port)
             .map_err(|_| ConnectorError::Denied)?;
         let (future, owned) = self.resolver.begin(host.to_owned(), port);
-        // Record ownership before awaiting so a dropped/hung future still
-        // leaves its lease with this request.
-        if !owned.is_settled() {
-            lease.set(Some(owned));
-        }
+        // Record this hop's query lease, replacing any earlier hop's, so the
+        // request is charged only for its most recent still-running query.
+        lease.set(Some(owned));
         let ips = future.await?;
         if ips.is_empty() || ips.len() > 16 {
             return Err(ConnectorError::Denied);
@@ -405,9 +408,7 @@ impl HttpConnector {
             if proxy_applies(&url) {
                 return Err(ConnectorError::UnsupportedProxy);
             }
-            let ips = self
-            .resolve_checked(&host, port, policy, lease)
-            .await?;
+            let ips = self.resolve_checked(&host, port, policy, lease).await?;
             let sockets: Vec<_> = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())

@@ -1,0 +1,632 @@
+{
+  "metadata": {
+    "measured_at": "2026-11-09T14:31:21.027058+00:00",
+    "implementation_sha": "58337c36bb3a8bb38353c17ec962c08ff94b9672",
+    "benchmark_sha": "a989a2624215aebd44a1ae890e1d1817dba4c760",
+    "command": "cargo run --manifest-path core/Cargo.toml --example interop_benchmark --locked -- 200",
+    "profile": "unoptimized debug with debuginfo; embedded V8 native archive selected by lockfile",
+    "hardware": "AMD EPYC 9V74; cpu.max=400000 100000; memory.max=17179869184; shared Linux x86_64 cloud host",
+    "toolchain": "Rust 1.99.1; deno_core0.413.0",
+    "conditions": "3 sequential runs; 10 warmups per mode/size; 200 measured calls per mode/size/run; official DSH review and independent GC probes on the same shared host",
+    "interpretation": "full roundtrip observations, not isolated FFI cost or production capacity; summary is median of3 run-level percentiles, not pooled-sample percentiles; no optimized release measurement"
+  },
+  "summary": [
+    {
+      "serialized_input_bytes": 64,
+      "mode": "host_to_guest_echo",
+      "median_of_run_percentiles_us": {
+        "p50": 230,
+        "p95": 1841,
+        "p99": 4042
+      }
+    },
+    {
+      "serialized_input_bytes": 64,
+      "mode": "guest_to_sync_host_callback",
+      "median_of_run_percentiles_us": {
+        "p50": 517,
+        "p95": 3658,
+        "p99": 6933
+      }
+    },
+    {
+      "serialized_input_bytes": 64,
+      "mode": "guest_to_async_host_callback_ready",
+      "median_of_run_percentiles_us": {
+        "p50": 608,
+        "p95": 916,
+        "p99": 1637
+      }
+    },
+    {
+      "serialized_input_bytes": 1024,
+      "mode": "host_to_guest_echo",
+      "median_of_run_percentiles_us": {
+        "p50": 361,
+        "p95": 505,
+        "p99": 710
+      }
+    },
+    {
+      "serialized_input_bytes": 1024,
+      "mode": "guest_to_sync_host_callback",
+      "median_of_run_percentiles_us": {
+        "p50": 614,
+        "p95": 962,
+        "p99": 1483
+      }
+    },
+    {
+      "serialized_input_bytes": 1024,
+      "mode": "guest_to_async_host_callback_ready",
+      "median_of_run_percentiles_us": {
+        "p50": 758,
+        "p95": 1166,
+        "p99": 3009
+      }
+    },
+    {
+      "serialized_input_bytes": 65536,
+      "mode": "host_to_guest_echo",
+      "median_of_run_percentiles_us": {
+        "p50": 8125,
+        "p95": 11390,
+        "p99": 13723
+      }
+    },
+    {
+      "serialized_input_bytes": 65536,
+      "mode": "guest_to_sync_host_callback",
+      "median_of_run_percentiles_us": {
+        "p50": 11589,
+        "p95": 14419,
+        "p99": 18856
+      }
+    },
+    {
+      "serialized_input_bytes": 65536,
+      "mode": "guest_to_async_host_callback_ready",
+      "median_of_run_percentiles_us": {
+        "p50": 12229,
+        "p95": 15805,
+        "p99": 19058
+      }
+    }
+  ],
+  "runs": [
+    {
+      "metadata": {
+        "build_profile": "debug",
+        "platform": "linux",
+        "arch": "x86_64",
+        "backend": "deno",
+        "iterations": 200,
+        "warmup_per_mode_size": 10,
+        "engines": 1,
+        "sandboxes": 1,
+        "host_callbacks": 2,
+        "guest_exports": [
+          "echo",
+          "callSync",
+          "callAsync"
+        ],
+        "message_cap": "default, not overridden (64KiB fits)",
+        "payload": "identical {\"data\":<x bytes>} per size, shared by all modes"
+      },
+      "results": [
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 0,
+          "expected_dispatches": 0,
+          "serialized_input_bytes": 64,
+          "wall_elapsed_us": 336306,
+          "latency_us": {
+            "p50": 362,
+            "p95": 3799,
+            "p99": 11027
+          },
+          "size": "small_64B",
+          "mode": "host_to_guest_echo",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 64,
+          "wall_elapsed_us": 205204,
+          "latency_us": {
+            "p50": 568,
+            "p95": 3658,
+            "p99": 6933
+          },
+          "size": "small_64B",
+          "mode": "guest_to_sync_host_callback",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 64,
+          "wall_elapsed_us": 218656,
+          "latency_us": {
+            "p50": 678,
+            "p95": 2767,
+            "p99": 5048
+          },
+          "size": "small_64B",
+          "mode": "guest_to_async_host_callback_ready",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 0,
+          "expected_dispatches": 0,
+          "serialized_input_bytes": 1024,
+          "wall_elapsed_us": 295681,
+          "latency_us": {
+            "p50": 454,
+            "p95": 4051,
+            "p99": 7847
+          },
+          "size": "1KiB",
+          "mode": "host_to_guest_echo",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 1024,
+          "wall_elapsed_us": 431668,
+          "latency_us": {
+            "p50": 1048,
+            "p95": 5180,
+            "p99": 9274
+          },
+          "size": "1KiB",
+          "mode": "guest_to_sync_host_callback",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 1024,
+          "wall_elapsed_us": 426467,
+          "latency_us": {
+            "p50": 1051,
+            "p95": 6024,
+            "p99": 8424
+          },
+          "size": "1KiB",
+          "mode": "guest_to_async_host_callback_ready",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 0,
+          "expected_dispatches": 0,
+          "serialized_input_bytes": 65536,
+          "wall_elapsed_us": 3241604,
+          "latency_us": {
+            "p50": 10515,
+            "p95": 27177,
+            "p99": 29751
+          },
+          "size": "64KiB",
+          "mode": "host_to_guest_echo",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 65536,
+          "wall_elapsed_us": 4529065,
+          "latency_us": {
+            "p50": 16441,
+            "p95": 33429,
+            "p99": 36317
+          },
+          "size": "64KiB",
+          "mode": "guest_to_sync_host_callback",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 65536,
+          "wall_elapsed_us": 4151664,
+          "latency_us": {
+            "p50": 15576,
+            "p95": 29456,
+            "p99": 35965
+          },
+          "size": "64KiB",
+          "mode": "guest_to_async_host_callback_ready",
+          "iterations": 200
+        }
+      ],
+      "teardown": {
+        "sync_host_callback_calls_total": 630,
+        "async_host_callback_calls_total": 630,
+        "close": {
+          "closed_cleanly": true,
+          "invocations_completed": 1890,
+          "forced_termination": false,
+          "pending_host_operations": 0
+        },
+        "shutdown": {
+          "clean": true,
+          "sandboxes_closed": 1
+        }
+      },
+      "explanation": [
+        "Latencies are full roundtrip: host JSON serialization, sandbox dispatch, guest execution (including sandbox.host.call for callback modes), host callback dispatch and response serialization/deserialization. They are not isolated FFI cost.",
+        "All modes use the same guest signatures and the same payload value; callbacks return their validated input bytes unchanged under explicit grants.",
+        "Sequential successful calls only, after 10 warmup calls per mode and size; no deadline probes or concurrency. Percentiles use nearest rank: ceil(n*p/100)-1 in a sorted sample.",
+        "latency_us percentiles cover measured calls only; teardown callback totals include warmups.",
+        "No capacity, throughput ceiling or hardware claims are made."
+      ]
+    },
+    {
+      "metadata": {
+        "build_profile": "debug",
+        "platform": "linux",
+        "arch": "x86_64",
+        "backend": "deno",
+        "iterations": 200,
+        "warmup_per_mode_size": 10,
+        "engines": 1,
+        "sandboxes": 1,
+        "host_callbacks": 2,
+        "guest_exports": [
+          "echo",
+          "callSync",
+          "callAsync"
+        ],
+        "message_cap": "default, not overridden (64KiB fits)",
+        "payload": "identical {\"data\":<x bytes>} per size, shared by all modes"
+      },
+      "results": [
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 0,
+          "expected_dispatches": 0,
+          "serialized_input_bytes": 64,
+          "wall_elapsed_us": 106411,
+          "latency_us": {
+            "p50": 230,
+            "p95": 1841,
+            "p99": 4042
+          },
+          "size": "small_64B",
+          "mode": "host_to_guest_echo",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 64,
+          "wall_elapsed_us": 244882,
+          "latency_us": {
+            "p50": 517,
+            "p95": 4518,
+            "p99": 9315
+          },
+          "size": "small_64B",
+          "mode": "guest_to_sync_host_callback",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 64,
+          "wall_elapsed_us": 119224,
+          "latency_us": {
+            "p50": 531,
+            "p95": 747,
+            "p99": 1637
+          },
+          "size": "small_64B",
+          "mode": "guest_to_async_host_callback_ready",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 0,
+          "expected_dispatches": 0,
+          "serialized_input_bytes": 1024,
+          "wall_elapsed_us": 74618,
+          "latency_us": {
+            "p50": 302,
+            "p95": 502,
+            "p99": 710
+          },
+          "size": "1KiB",
+          "mode": "host_to_guest_echo",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 1024,
+          "wall_elapsed_us": 140605,
+          "latency_us": {
+            "p50": 586,
+            "p95": 962,
+            "p99": 1483
+          },
+          "size": "1KiB",
+          "mode": "guest_to_sync_host_callback",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 1024,
+          "wall_elapsed_us": 163514,
+          "latency_us": {
+            "p50": 738,
+            "p95": 1010,
+            "p99": 1158
+          },
+          "size": "1KiB",
+          "mode": "guest_to_async_host_callback_ready",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 0,
+          "expected_dispatches": 0,
+          "serialized_input_bytes": 65536,
+          "wall_elapsed_us": 2078256,
+          "latency_us": {
+            "p50": 7817,
+            "p95": 9416,
+            "p99": 10780
+          },
+          "size": "64KiB",
+          "mode": "host_to_guest_echo",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 65536,
+          "wall_elapsed_us": 2881304,
+          "latency_us": {
+            "p50": 11589,
+            "p95": 14160,
+            "p99": 16535
+          },
+          "size": "64KiB",
+          "mode": "guest_to_sync_host_callback",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 65536,
+          "wall_elapsed_us": 3063422,
+          "latency_us": {
+            "p50": 12229,
+            "p95": 15805,
+            "p99": 18893
+          },
+          "size": "64KiB",
+          "mode": "guest_to_async_host_callback_ready",
+          "iterations": 200
+        }
+      ],
+      "teardown": {
+        "sync_host_callback_calls_total": 630,
+        "async_host_callback_calls_total": 630,
+        "close": {
+          "closed_cleanly": true,
+          "invocations_completed": 1890,
+          "forced_termination": false,
+          "pending_host_operations": 0
+        },
+        "shutdown": {
+          "clean": true,
+          "sandboxes_closed": 1
+        }
+      },
+      "explanation": [
+        "Latencies are full roundtrip: host JSON serialization, sandbox dispatch, guest execution (including sandbox.host.call for callback modes), host callback dispatch and response serialization/deserialization. They are not isolated FFI cost.",
+        "All modes use the same guest signatures and the same payload value; callbacks return their validated input bytes unchanged under explicit grants.",
+        "Sequential successful calls only, after 10 warmup calls per mode and size; no deadline probes or concurrency. Percentiles use nearest rank: ceil(n*p/100)-1 in a sorted sample.",
+        "latency_us percentiles cover measured calls only; teardown callback totals include warmups.",
+        "No capacity, throughput ceiling or hardware claims are made."
+      ]
+    },
+    {
+      "metadata": {
+        "build_profile": "debug",
+        "platform": "linux",
+        "arch": "x86_64",
+        "backend": "deno",
+        "iterations": 200,
+        "warmup_per_mode_size": 10,
+        "engines": 1,
+        "sandboxes": 1,
+        "host_callbacks": 2,
+        "guest_exports": [
+          "echo",
+          "callSync",
+          "callAsync"
+        ],
+        "message_cap": "default, not overridden (64KiB fits)",
+        "payload": "identical {\"data\":<x bytes>} per size, shared by all modes"
+      },
+      "results": [
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 0,
+          "expected_dispatches": 0,
+          "serialized_input_bytes": 64,
+          "wall_elapsed_us": 44151,
+          "latency_us": {
+            "p50": 169,
+            "p95": 373,
+            "p99": 779
+          },
+          "size": "small_64B",
+          "mode": "host_to_guest_echo",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 64,
+          "wall_elapsed_us": 118906,
+          "latency_us": {
+            "p50": 502,
+            "p95": 971,
+            "p99": 1671
+          },
+          "size": "small_64B",
+          "mode": "guest_to_sync_host_callback",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 64,
+          "wall_elapsed_us": 130321,
+          "latency_us": {
+            "p50": 608,
+            "p95": 916,
+            "p99": 1161
+          },
+          "size": "small_64B",
+          "mode": "guest_to_async_host_callback_ready",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 0,
+          "expected_dispatches": 0,
+          "serialized_input_bytes": 1024,
+          "wall_elapsed_us": 86386,
+          "latency_us": {
+            "p50": 361,
+            "p95": 505,
+            "p99": 709
+          },
+          "size": "1KiB",
+          "mode": "host_to_guest_echo",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 1024,
+          "wall_elapsed_us": 140897,
+          "latency_us": {
+            "p50": 614,
+            "p95": 784,
+            "p99": 1329
+          },
+          "size": "1KiB",
+          "mode": "guest_to_sync_host_callback",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 1024,
+          "wall_elapsed_us": 188109,
+          "latency_us": {
+            "p50": 758,
+            "p95": 1166,
+            "p99": 3009
+          },
+          "size": "1KiB",
+          "mode": "guest_to_async_host_callback_ready",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 0,
+          "expected_dispatches": 0,
+          "serialized_input_bytes": 65536,
+          "wall_elapsed_us": 2204483,
+          "latency_us": {
+            "p50": 8125,
+            "p95": 11390,
+            "p99": 13723
+          },
+          "size": "64KiB",
+          "mode": "host_to_guest_echo",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 65536,
+          "wall_elapsed_us": 2872722,
+          "latency_us": {
+            "p50": 11463,
+            "p95": 14419,
+            "p99": 18856
+          },
+          "size": "64KiB",
+          "mode": "guest_to_sync_host_callback",
+          "iterations": 200
+        },
+        {
+          "completed_calls": 200,
+          "host_callback_dispatches": 200,
+          "expected_dispatches": 200,
+          "serialized_input_bytes": 65536,
+          "wall_elapsed_us": 2891661,
+          "latency_us": {
+            "p50": 11474,
+            "p95": 15366,
+            "p99": 19058
+          },
+          "size": "64KiB",
+          "mode": "guest_to_async_host_callback_ready",
+          "iterations": 200
+        }
+      ],
+      "teardown": {
+        "sync_host_callback_calls_total": 630,
+        "async_host_callback_calls_total": 630,
+        "close": {
+          "closed_cleanly": true,
+          "invocations_completed": 1890,
+          "forced_termination": false,
+          "pending_host_operations": 0
+        },
+        "shutdown": {
+          "clean": true,
+          "sandboxes_closed": 1
+        }
+      },
+      "explanation": [
+        "Latencies are full roundtrip: host JSON serialization, sandbox dispatch, guest execution (including sandbox.host.call for callback modes), host callback dispatch and response serialization/deserialization. They are not isolated FFI cost.",
+        "All modes use the same guest signatures and the same payload value; callbacks return their validated input bytes unchanged under explicit grants.",
+        "Sequential successful calls only, after 10 warmup calls per mode and size; no deadline probes or concurrency. Percentiles use nearest rank: ceil(n*p/100)-1 in a sorted sample.",
+        "latency_us percentiles cover measured calls only; teardown callback totals include warmups.",
+        "No capacity, throughput ceiling or hardware claims are made."
+      ]
+    }
+  ]
+}

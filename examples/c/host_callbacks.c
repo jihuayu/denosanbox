@@ -195,7 +195,8 @@ int main(void) {
         CHECK(deno_engine_close(plain, &report, &error) == DENO_STATUS_OK,
               "plain engine closes");
         deno_error_free(&error);
-        CHECK(atomic_load(&echo_released) == 0, "plain close keeps userdata");
+        CHECK(atomic_load(&echo_released) == 1,
+              "plain engine close retires callback registration");
         CHECK(deno_engine_free(plain, &error) == DENO_STATUS_OK, "plain engine frees");
         deno_error_free(&error);
         CHECK(atomic_load(&echo_released) == 1,
@@ -385,8 +386,8 @@ int main(void) {
     CHECK(deno_sandbox_free(alpha, &error) == DENO_STATUS_OK, "alpha frees");
     deno_error_free(&error);
     CHECK(atomic_load(&echo_released) == 0, "beta still holds echo userdata");
-    /* The engine registry keeps the slow registration owner until the engine is
-     * freed, so closing its last sandbox is not enough to release userdata. */
+    /* Closing a sandbox releases its grant, but the engine registration stays
+     * live until engine shutdown retires it. */
     CHECK(atomic_load(&slow_released) == 0,
           "engine registration keeps slow userdata after its sandbox closes");
     CHECK(deno_sandbox_close(beta, &report, &error) == DENO_STATUS_OK, "beta closes");
@@ -398,8 +399,10 @@ int main(void) {
     deno_engine_shutdown_report shutdown;
     CHECK(deno_engine_close(engine, &shutdown, &error) == DENO_STATUS_OK, "engine closes");
     deno_error_free(&error);
-    CHECK(atomic_load(&echo_released) == 0, "close keeps callback owner until free");
-    CHECK(atomic_load(&slow_released) == 0, "engine owner still keeps slow userdata");
+    CHECK(atomic_load(&echo_released) == 1,
+          "engine close retires echo callback registration");
+    CHECK(atomic_load(&slow_released) == 1,
+          "engine close retires slow callback registration");
     CHECK(deno_engine_free(engine, &error) == DENO_STATUS_OK, "engine frees");
     deno_error_free(&error);
     CHECK(atomic_load(&echo_released) == 1, "echo userdata released exactly once after free");

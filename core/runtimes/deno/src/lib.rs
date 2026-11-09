@@ -1,6 +1,7 @@
 //! Thread-affine in-process deno_core/V8 backend. No guest operating-system ops.
 mod buffers;
 use deno_core::error::ModuleLoaderError;
+use deno_core::futures::task::AtomicWaker;
 use deno_core::OpState;
 use deno_core::{
     v8, JsRuntime, ModuleId, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse,
@@ -20,11 +21,13 @@ const BOOTSTRAP_MESSAGE_LIMIT: usize = 1024 * 1024;
 const MAX_LOG_RECORD_BYTES: usize = 64 * 1024;
 use serde_json::Value;
 use std::cell::RefCell;
+use std::future::{poll_fn, Future};
 use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
 };
+use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 /// Parent-inbox limits mirrored into the frozen bootstrap closures.
@@ -47,12 +50,42 @@ struct Control {
     isolate: Mutex<Option<v8::IsolateHandle>>,
     metrics: Arc<MetricsShared>,
     heap_limit: Arc<std::sync::atomic::AtomicUsize>,
+    awaiter: AtomicWaker,
 }
 impl Control {
     fn terminate(&self) {
         if let Some(isolate) = self.isolate.lock().unwrap().as_ref() {
             isolate.terminate_execution();
         }
+        // Interrupting V8 does not settle an already-pending JS promise.
+        // Wake the Rust executor too, so it can observe the terminal flag.
+        self.awaiter.wake();
+    }
+    async fn interruptible<F, T, E>(&self, future: F) -> Result<T>
+    where
+        F: Future<Output = std::result::Result<T, E>>,
+        E: ToString,
+    {
+        let mut future = Box::pin(future);
+        poll_fn(|cx| {
+            // Register before checking: termination before registration is
+            // caught by the flag; termination afterwards wakes this poll.
+            self.awaiter.register(cx.waker());
+            let result = if self.is_cancelled() || self.heap_exceeded.load(Ordering::Acquire) {
+                Poll::Ready(Err(self.error("execution terminated")))
+            } else {
+                future
+                    .as_mut()
+                    .poll(cx)
+                    .map(|result| result.map_err(|error| self.error(error)))
+            };
+            if result.is_ready() {
+                // Do not retain an executor waker after successful work.
+                self.awaiter.take();
+            }
+            result
+        })
+        .await
     }
     fn error(&self, fallback: impl ToString) -> Error {
         if self.heap_exceeded.load(Ordering::Acquire) {
@@ -196,6 +229,7 @@ impl DriverFactory for DenoFactory {
             isolate: Mutex::new(None),
             metrics: metrics.clone(),
             heap_limit,
+            awaiter: AtomicWaker::new(),
         });
         let thread_control = control.clone();
         let options = options.clone();
@@ -462,12 +496,12 @@ impl Driver for DenoDriver {
                 .load_main_es_module(&specifier)
                 .await
                 .map_err(|e| control.error(e))?;
-            let _ = control;
             let evaluation = runtime.mod_evaluate(module);
-            runtime
-                .with_event_loop_future(evaluation, PollEventLoopOptions::default())
-                .await
-                .map_err(|e| self.control.error(e))?;
+            control
+                .interruptible(
+                    runtime.with_event_loop_future(evaluation, PollEventLoopOptions::default()),
+                )
+                .await?;
             Ok::<_, Error>(module)
         });
         let module = module?;
@@ -531,13 +565,16 @@ impl Driver for DenoDriver {
                 )
             };
             let result = self.runtime.call_with_args(&function, &[input]);
+            let control = self.control.clone();
             let value = self
                 .executor
                 .block_on(async {
                     tokio::time::timeout(
                         timeout,
-                        self.runtime
-                            .with_event_loop_future(result, PollEventLoopOptions::default()),
+                        control.interruptible(
+                            self.runtime
+                                .with_event_loop_future(result, PollEventLoopOptions::default()),
+                        ),
                     )
                     .await
                 })
@@ -545,8 +582,7 @@ impl Driver for DenoDriver {
                     self.control.timed_out.store(true, Ordering::Release);
                     self.control.terminate();
                     Error::DeadlineExceeded
-                })?
-                .map_err(|e| self.control.error(e))?;
+                })??;
             let output = {
                 deno_core::scope!(scope, &mut self.runtime);
                 let value = v8::Local::new(scope, value);

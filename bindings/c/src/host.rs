@@ -1,11 +1,13 @@
 //! Scoped C host callbacks.
 //!
 //! A registration creates one native owner that holds the foreign function
-//! pointers plus the caller's `u64` user data. The owner is shared by the C
-//! engine's callback map, every `RegisteredCallback` handle installed on a
-//! sandbox, and every in-flight invocation. The user data is only ever given to
-//! the foreign `release` function once the last of those owners is gone. That
-//! release call never runs while a registry lock is held.
+//! pointers plus the caller's `u64` user data. The core `HostRegistry` handler
+//! owns the callback capture, and a dispatched `Dispatch` keeps its handler
+//! alive while the callback runs. The C engine's callback map stores only
+//! `RegisteredCallback` lookup metadata; it is not an owner of the foreign
+//! user data. Engine shutdown retires registry handlers, and a running dispatch
+//! keeps its owner until it returns. Release is never called under a registry
+//! lock.
 
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -210,7 +212,9 @@ impl CTrampoline {
     }
 }
 
-/// The C engine wrapper: the real engine plus its owned callback registrations.
+/// The C engine wrapper: the real engine plus callback lookup metadata.
+/// Actual callback captures are owned by the core registry and in-flight
+/// dispatches.
 pub(crate) struct CEngine {
     pub(crate) inner: Engine,
     pub(crate) ceiling: Policy,
@@ -232,9 +236,9 @@ impl CEngine {
         })
     }
 
-    /// Drops one registration owner. Called only after the engine really closed:
-    /// a still-running non-cooperative callback keeps its own owner, so the user
-    /// data is released only when that callback returns.
+    /// Drops one C lookup-metadata entry. The core registry still owns the
+    /// callback handler until engine shutdown; an in-flight dispatch retains
+    /// its handler until the callback returns.
     pub(crate) fn forget(&self, name: &str) -> Option<RegisteredCallback> {
         self.callbacks
             .lock()
@@ -243,6 +247,8 @@ impl CEngine {
     }
 
     pub(crate) fn forget_all(&self) {
+        // This clears lookup metadata only. The core registry owns handlers;
+        // an in-flight dispatch retains its capture until it returns.
         self.callbacks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

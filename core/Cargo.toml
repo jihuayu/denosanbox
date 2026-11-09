@@ -40,3 +40,8 @@ required-features = ["deno"]
 name = "benchmark"
 path = "../examples/rust/benchmark.rs"
 required-features = ["deno"]
+
+[[example]]
+name = "interop_benchmark"
+path = "../examples/rust/interop_benchmark.rs"
+required-features = ["deno"]

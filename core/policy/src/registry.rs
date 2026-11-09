@@ -174,10 +174,37 @@ struct Grant {
     generation: Generation,
     scope: String,
 }
+
+/// Callback handlers drained from a [`HostRegistry`].
+///
+/// Owns the detached closures until dropped. Drop them outside every registry
+/// and worker lock: a handler may capture an engine (and hence the registry),
+/// and its destructor may reenter engine methods.
+#[must_use = "detached callbacks are released when this owner is dropped"]
+pub struct RetiredCallbacks(Vec<Handler>);
+impl fmt::Debug for RetiredCallbacks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetiredCallbacks")
+            .field("handlers", &self.0.len())
+            .finish()
+    }
+}
+impl RetiredCallbacks {
+    /// Number of detached handlers still held by this owner.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 pub struct HostRegistry {
-    callbacks: HashMap<CallbackId, (RegisteredCallback, Handler)>,
+    /// Metadata is kept after retirement as a closed-owner tombstone; the
+    /// handler is `None` once drained by [`Self::retire_callbacks`].
+    callbacks: HashMap<CallbackId, (RegisteredCallback, Option<Handler>)>,
     grants: HashMap<(SandboxId, CallbackId), Grant>,
     closed: HashSet<SandboxId>,
+    retired: bool,
     next_id: u64,
     next_grant: u64,
     capacity: usize,
@@ -208,6 +235,7 @@ impl HostRegistry {
             callbacks: HashMap::new(),
             grants: HashMap::new(),
             closed: HashSet::new(),
+            retired: false,
             next_id: 1,
             next_grant: 1,
             capacity,
@@ -248,6 +276,7 @@ impl HostRegistry {
         output_limit: usize,
         callback: Handler,
     ) -> Result<RegisteredCallback> {
+        self.check_live()?;
         if self.callbacks.len() >= self.capacity {
             return Err(Error::limit_exceeded("callback registry full"));
         }
@@ -275,7 +304,8 @@ impl HostRegistry {
             output_limit,
         };
         self.next_id = next;
-        self.callbacks.insert(meta.id, (meta.clone(), callback));
+        self.callbacks
+            .insert(meta.id, (meta.clone(), Some(callback)));
         Ok(meta)
     }
     pub fn grant(
@@ -284,10 +314,11 @@ impl HostRegistry {
         cb: &RegisteredCallback,
         scope: &str,
     ) -> Result<()> {
+        self.check_live()?;
         if self.closed.contains(&sandbox) {
             return Err(Error::stale_handle("sandbox closed"));
         }
-        if self.callbacks.get(&cb.id).map(|(m, _)| m) != Some(cb) {
+        if !self.registered(cb) {
             return Err(Error::unknown_callback("callback not registered"));
         }
         if !valid_scope(scope) {
@@ -306,6 +337,38 @@ impl HostRegistry {
             },
         );
         Ok(())
+    }
+    /// Revoke every grant and detach every registered callback handler.
+    ///
+    /// Idempotent. `RegisteredCallback` metadata and callback ids stay valid
+    /// (as closed tombstones), and id/generation counters are preserved. Later
+    /// registration, grants, dispatch and result acceptance are rejected.
+    /// Dispatches already prepared own their handler until dropped, so running
+    /// work retains its callback; its result is then rejected as late.
+    pub fn retire_callbacks(&mut self) -> RetiredCallbacks {
+        self.retired = true;
+        self.grants.clear();
+        RetiredCallbacks(
+            self.callbacks
+                .values_mut()
+                .filter_map(|(_, handler)| handler.take())
+                .collect(),
+        )
+    }
+    /// Whether [`Self::retire_callbacks`] has detached every handler.
+    pub fn is_retired(&self) -> bool {
+        self.retired
+    }
+    fn check_live(&self) -> Result<()> {
+        if self.retired {
+            return Err(Error::stale_handle("host registry retired"));
+        }
+        Ok(())
+    }
+    /// Trusted metadata of a registered callback, whether or not its handler
+    /// has been detached by retirement.
+    fn registered(&self, cb: &RegisteredCallback) -> bool {
+        self.callbacks.get(&cb.id).map(|(meta, _)| meta) == Some(cb)
     }
     pub fn revoke_grant(&mut self, sandbox: SandboxId, cb: &RegisteredCallback) -> bool {
         self.grants.remove(&(sandbox, cb.id)).is_some()
@@ -333,10 +396,11 @@ impl HostRegistry {
         input: Vec<u8>,
     ) -> Result<InvocationRequest> {
         ctx.check_live()?;
+        self.check_live()?;
         if self.closed.contains(&ctx.sandbox_id) {
             return Err(Error::stale_handle("sandbox closed"));
         }
-        if self.callbacks.get(&cb.id).map(|(m, _)| m) != Some(cb) {
+        if !self.registered(cb) {
             return Err(Error::unknown_callback("callback not registered"));
         }
         let grant = self
@@ -368,9 +432,8 @@ impl HostRegistry {
         let handler = self
             .callbacks
             .get(&cb.id)
-            .ok_or_else(|| Error::unknown_callback("callback not registered"))?
-            .1
-            .clone();
+            .and_then(|(_, handler)| handler.clone())
+            .ok_or_else(|| Error::unknown_callback("callback retired"))?;
         Ok(Dispatch { request, handler })
     }
     /// Convenience for an exclusively owned registry. For a shared registry,
@@ -386,6 +449,7 @@ impl HostRegistry {
     }
     pub fn accept_result(&self, req: &InvocationRequest, output: Vec<u8>) -> Result<Vec<u8>> {
         req.context.check_live()?;
+        self.check_live()?;
         let grant = self
             .grants
             .get(&(req.sandbox_id, req.callback_id))
@@ -486,6 +550,75 @@ mod tests {
                 .kind(),
             ErrorKind::LateResult
         );
+    }
+
+    #[test]
+    fn retire_detaches_handlers_and_keeps_tombstones() {
+        let (mut reg, cb, ctx, id) = setup();
+        // A prepared dispatch owns its own handler across retirement.
+        let dispatch = reg.prepare_dispatch(&ctx, &cb, b"x".to_vec()).unwrap();
+        let retired = reg.retire_callbacks();
+        assert_eq!(retired.len(), 1);
+        assert!(!retired.is_empty());
+        drop(retired);
+        assert!(reg.is_retired());
+        assert!(
+            reg.retire_callbacks().is_empty(),
+            "retirement is idempotent"
+        );
+        // Metadata and the id remain observable; registration stays closed.
+        assert_eq!(cb.name(), "echo");
+        assert!(reg
+            .register("echo", 8, 8, |_: &InvocationContext, _: &[u8]| Ok(vec![]))
+            .is_err());
+        assert!(reg
+            .register_async("a2", 8, 8, |_, _| async { Ok(vec![]) })
+            .is_err());
+        let other = SandboxId::from_host_parts(7, 3);
+        assert!(reg.grant(other, &cb, "records.read").is_err());
+        assert_eq!(
+            reg.prepare_dispatch(&ctx, &cb, vec![]).unwrap_err().kind(),
+            ErrorKind::StaleHandle
+        );
+        // The already-prepared invocation never runs its detached handler late.
+        let (request, output) = dispatch.run().unwrap();
+        assert_eq!(
+            reg.accept_result(&request, output).unwrap_err().kind(),
+            ErrorKind::StaleHandle
+        );
+        // Sandbox-close bookkeeping still works against the tombstones.
+        assert_eq!(reg.retired_owners(), 0);
+        reg.close_sandbox(id);
+        reg.forget_sandbox(id);
+        assert_eq!(reg.retired_owners(), 0);
+    }
+
+    #[test]
+    fn retire_drops_captures_outside_the_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let held = Tracked(drops.clone());
+        let registry = std::sync::Mutex::new(HostRegistry::default());
+        registry
+            .lock()
+            .unwrap()
+            .register("held", 8, 8, move |_: &InvocationContext, _: &[u8]| {
+                let _ = &held;
+                Ok(vec![])
+            })
+            .unwrap();
+        let retired = registry.lock().unwrap().retire_callbacks();
+        // Detached but not yet released: the owner holds it until dropped.
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(retired.len(), 1);
+        drop(retired);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

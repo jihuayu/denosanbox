@@ -76,8 +76,10 @@ shared target directory.
   never forwarded.
 - `release(user_data)` is called exactly once by native code after the last
   registration, sandbox grant and in-flight invocation no longer references the
-  callback. There are no deferred tombstones and no global-thread heuristic: a
-  callback that is still running keeps its owner alive, and
+  callback. `deno_engine_close` retires registrations and may call `release`
+  before `deno_engine_free`; an already-dispatched callback keeps its owner
+  until it returns. `deno_engine_free` releases the engine token and lookup
+  metadata. There are no deferred tombstones or global-thread heuristic, and
   `deno_sandbox_pending_host_operations` reports work that outlived a close.
 - Context tokens are borrowed; only the native owner releases them.
 

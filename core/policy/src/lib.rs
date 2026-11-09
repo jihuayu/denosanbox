@@ -28,7 +28,7 @@ pub use policy::{Policy, PolicyError};
 pub use protocol::{decode_error, encode_error, Frame, FrameKind, MAX_PAYLOAD, PROTOCOL_VERSION};
 pub use registry::{
     AsyncCallback, Callback, CallbackFuture, CallbackId, Dispatch, HostRegistry, InvocationContext,
-    InvocationRequest, RegisteredCallback,
+    InvocationRequest, RegisteredCallback, RetiredCallbacks,
 };
 pub use resource::{ResourceRecord, ResourceRegistry, ResourceSpec};
 pub use vfs::{ResourceView, ViewLimits};

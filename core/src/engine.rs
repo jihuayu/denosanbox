@@ -105,10 +105,11 @@ impl Engine {
         output_limit: usize,
         callback: impl denosanbox_core::policy::Callback + 'static,
     ) -> Result<RegisteredCallback> {
-        self.inner
-            .hosts
-            .lock()
-            .unwrap()
+        let mut hosts = self.inner.hosts.lock().unwrap();
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Closed);
+        }
+        hosts
             .register(name, input_limit, output_limit, callback)
             .map_err(map_policy)
     }
@@ -125,10 +126,11 @@ impl Engine {
         Fut:
             std::future::Future<Output = denosanbox_core::policy::Result<Vec<u8>>> + Send + 'static,
     {
-        self.inner
-            .hosts
-            .lock()
-            .unwrap()
+        let mut hosts = self.inner.hosts.lock().unwrap();
+        if self.inner.shutting_down.load(Ordering::SeqCst) || hosts.is_retired() {
+            return Err(Error::Closed);
+        }
+        hosts
             .register_async(name, input_limit, output_limit, callback)
             .map_err(map_policy)
     }
@@ -443,6 +445,7 @@ impl Engine {
             cancelled: AtomicU64::new(0),
             join: Mutex::new(None),
             report: Mutex::new(None),
+            driver_disposed: AtomicBool::new(false),
             finished: Arc::new(tokio::sync::Notify::new()),
             joined: Arc::new(AtomicBool::new(false)),
             active: Mutex::new(Some(guard)),
@@ -565,7 +568,14 @@ impl Engine {
         })
     }
 
-    /// Closes every sandbox owned by this engine.
+    /// Closes every sandbox owned by this engine and freezes host registration.
+    ///
+    /// Registered host callback handlers are detached from the registry and
+    /// their captures dropped here, outside all registry and worker locks and
+    /// before waiting on any sandbox. A callback invocation that already
+    /// started keeps its own handler until it really returns. Sandbox
+    /// cancellation still propagates; retirement never frees running callback
+    /// captures prematurely. Idempotent and safe to call concurrently.
     ///
     /// Joining happens on native reaper threads, never on the async executor.
     pub async fn shutdown(&self) -> Result<ShutdownReport> {
@@ -586,6 +596,17 @@ impl Engine {
         for state in &states {
             state.request_close();
         }
+
+        // Snapshot and cancel workers before releasing captures: a callback
+        // may own the last external sandbox handle. Keep those states alive
+        // until their shutdown reports have been collected.
+        let retired = {
+            let mut hosts = self.inner.hosts.lock().expect("host registry poisoned");
+            hosts.retire_callbacks()
+        };
+        // User captures may reenter Engine methods from Drop. Never run their
+        // destructors under a registry/worker lock or retain them across await.
+        drop(retired);
 
         let mut report = ShutdownReport::default();
         for state in &states {
@@ -956,6 +977,7 @@ struct WorkerState {
     cancelled: AtomicU64,
     join: Mutex<Option<JoinHandle<()>>>,
     report: Mutex<Option<CloseReport>>,
+    driver_disposed: AtomicBool,
     finished: Arc<tokio::sync::Notify>,
     joined: Arc<AtomicBool>,
     active: Mutex<Option<ActiveGuard>>,
@@ -1018,23 +1040,33 @@ impl WorkerState {
                 }
             }
             let joined = self.joined.load(Ordering::Acquire);
-            let mut report = self
-                .report
-                .lock()
-                .expect("report mutex poisoned")
-                .clone()
-                .unwrap_or_else(|| CloseReport {
-                    invocations_completed: self.completed.load(Ordering::SeqCst),
-                    invocations_cancelled: self.cancelled.load(Ordering::SeqCst),
-                    forced_termination: self.control.is_cancelled(),
-                    closed_cleanly: false,
-                    pending_host_operations: self.host.outstanding(),
-                });
+            let driver_report = self.report.lock().expect("report mutex poisoned").clone();
+            let waiting_for_host_work = driver_report
+                .as_ref()
+                .is_some_and(|report| report.pending_host_operations > 0);
+            let mut report = driver_report.unwrap_or_else(|| CloseReport {
+                invocations_completed: self.completed.load(Ordering::SeqCst),
+                invocations_cancelled: self.cancelled.load(Ordering::SeqCst),
+                forced_termination: self.control.is_cancelled(),
+                closed_cleanly: false,
+                pending_host_operations: self.host.outstanding(),
+            });
             if !joined {
                 report.closed_cleanly = false;
                 report.forced_termination = true;
             }
             report.pending_host_operations = self.host.outstanding();
+            if joined
+                && self.driver_disposed.load(Ordering::Acquire)
+                && waiting_for_host_work
+                && report.pending_host_operations == 0
+            {
+                // A successfully disposed driver may have reported native
+                // work still draining. Reobserve that work, rather than
+                // retaining its old incomplete snapshot forever. Driver
+                // disposal errors have no successful pending-work report.
+                report.closed_cleanly = true;
+            }
             let children: Vec<_> = self
                 .children
                 .lock()
@@ -1089,7 +1121,11 @@ fn worker_loop(
     let start_ok = started.is_ok();
     let _ = startup.send(started);
     if !start_ok {
-        let report = driver.close().unwrap_or(CloseReport {
+        let closed = driver.close();
+        state
+            .driver_disposed
+            .store(closed.is_ok(), Ordering::Release);
+        let report = closed.unwrap_or(CloseReport {
             closed_cleanly: false,
             ..CloseReport::default()
         });
@@ -1158,7 +1194,11 @@ fn worker_loop(
             let _ = job.reply.send(Err(Error::Closed));
         }
     }
-    let mut report = driver.close().unwrap_or(CloseReport {
+    let closed = driver.close();
+    state
+        .driver_disposed
+        .store(closed.is_ok(), Ordering::Release);
+    let mut report = closed.unwrap_or(CloseReport {
         invocations_completed: state.completed.load(Ordering::SeqCst),
         invocations_cancelled: state.cancelled.load(Ordering::SeqCst),
         forced_termination: state.control.is_cancelled(),

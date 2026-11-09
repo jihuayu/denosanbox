@@ -1,7 +1,7 @@
 # Native ABI validation — 2026-11-09
 
 Linux x86_64, Rust 1.99.1, Go 1.27.3, production implementation
-`41566532a2f00c3eb94f7fe3fcca481f8b66b352`.
+`b11bb6c2a45f13bc061b64f8e5ffdb3787bfa47b`.
 
 ```sh
 sh bindings/c/test.sh
@@ -20,9 +20,11 @@ passed for the native C crate. Execution uses no Deno executable or sidecar.
 
 The host-callback example passed 62 checks, including capability grants, trusted
 scope, borrowed-context expiry, input/output ownership, stale handles, and
-release after engine free. Registration ownership transfers only on success;
-release waits for the final registration/grant/in-flight owner. Non-cooperative
-callbacks retain ownership until they actually return, even after cancellation.
+exactly-once release. Registration ownership transfers only on success.
+`deno_engine_close` retires callback registrations, so release may run during
+close before `deno_engine_free`; an in-flight callback retains its owner until
+it actually returns, even after cancellation. Free still releases the engine
+token and does not trigger a second callback release.
 
 Go callback tests cover scoped cancellation and cleanup without persistent
 handle tombstones. Deadline/context/cancellation cases also passed ten repeated

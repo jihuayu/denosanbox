@@ -93,6 +93,14 @@ successful response. Cancellation cannot roll back an already completed host
 side effect. Non-cooperative work remains owned and counted until it actually
 ends, even if the caller has already received a deadline error.
 
+The Deno adapter explicitly wakes its Rust waiter when execution is cancelled,
+including during module evaluation or an exported function awaiting a host
+promise. Interrupting V8 alone does not necessarily settle that promise. The
+private waker is registered before checking terminal flags, then cleared after
+completion; this avoids both a lost cancellation wake and retaining a completed
+executor task. Close still has a bounded worker-join grace and can report
+incomplete native work.
+
 ## GC and resource ownership
 
 JSON messages sever object identity across heaps; they do not make native
@@ -109,6 +117,11 @@ retiring a registration must not prematurely release an in-flight foreign
 callback or report its work as finished. Dropping registration metadata alone
 does not unregister a callback. Individual registration disposal is not yet
 exposed by the public engine API.
+
+For the C ABI, `deno_engine_close` ends the engine's callback registrations and
+may run `release(user_data)` before `deno_engine_free`. The engine token still
+needs to be freed separately. A callback actually running on a native thread
+continues to own its userdata until it returns.
 
 Do not use `FinalizationRegistry`, Python `__del__`, or forced GC as the primary
 join/cancel mechanism: finalizers cannot guarantee an async close completes.

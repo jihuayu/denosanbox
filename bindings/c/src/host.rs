@@ -247,9 +247,8 @@ impl CEngine {
     }
 
     pub(crate) fn forget_all(&self) {
-        // This clears lookup metadata only. Core shutdown has already retired
-        // registration handlers, except for captures retained by in-flight
-        // dispatches.
+        // This clears lookup metadata only. The core registry owns handlers;
+        // an in-flight dispatch retains its capture until it returns.
         self.callbacks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

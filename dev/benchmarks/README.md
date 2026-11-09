@@ -25,6 +25,10 @@ excludes warmup but includes harness checks; individual invocation latencies
 exclude constructing/cloning the caller's input. Percentiles use nearest rank.
 
 `interop-linux-x64-debug.json` retains three actual debug runs and their context.
+They measure baseline implementation `58337c3`, before the callback-retirement
+and async-cancellation fixes; their implementation and benchmark commits are
+recorded separately in the artifact. They are retained as a measured baseline,
+not silently relabelled as a measurement of later code.
 Each run completed 1,890 invocations including warmups, with 630 sync and 630
 async callback dispatches. The table below is the median of the three per-run
 p50 values, not a pooled percentile:

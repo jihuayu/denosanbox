@@ -214,17 +214,23 @@ impl HostContext {
         let dispatch = lock(&self.registry)?
             .prepare_dispatch(&context, &grant.callback, input)
             .map_err(policy_error)?;
-        self.outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                if n < self.max_host_calls {
-                    n.checked_add(1)
-                } else {
-                    None
-                }
-            })
-            .map_err(|_| Error::QueueFull {
-                capacity: self.max_host_calls,
-            })?;
+        let mut active = self.outstanding.load(Ordering::Acquire);
+        loop {
+            if active >= self.max_host_calls {
+                return Err(Error::QueueFull {
+                    capacity: self.max_host_calls,
+                });
+            }
+            match self.outstanding.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => active = actual,
+            }
+        }
         let guard = Outstanding(self.outstanding.clone());
         let owner = self.clone();
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
@@ -285,5 +291,130 @@ impl HostContext {
 impl Drop for HostContext {
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+    #[test]
+    fn async_callback_has_trusted_scope_and_releases_registry_lock() {
+        let hosts = Arc::new(Mutex::new(HostRegistry::default()));
+        let inner = hosts.clone();
+        let cb = hosts
+            .lock()
+            .unwrap()
+            .register_async(
+                "orders.read",
+                1024,
+                1024,
+                move |ctx: InvocationContext, input: Vec<u8>| {
+                    let inner = inner.clone();
+                    async move {
+                        assert_eq!(ctx.scope(), "tenant-a");
+                        assert!(inner.try_lock().is_ok());
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        Ok(input)
+                    }
+                },
+            )
+            .unwrap();
+        let ctx = HostContext::new(
+            Policy::default().allow_capability("orders.read").unwrap(),
+            hosts,
+            vec![HostGrant {
+                callback: cb,
+                scope: "tenant-a".into(),
+            }],
+        )
+        .unwrap();
+        ctx.begin_invocation(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            runtime()
+                .block_on(ctx.call("orders.read".into(), json!({"tenant":"forged"})))
+                .unwrap(),
+            json!({"tenant":"forged"})
+        );
+        assert_eq!(ctx.outstanding(), 0);
+        assert!(runtime()
+            .block_on(ctx.call("orders.write".into(), json!(null)))
+            .is_err());
+        ctx.cancel();
+        assert!(ctx.is_closed());
+    }
+    #[test]
+    fn noncooperative_callback_remains_accounted_after_deadline() {
+        let hosts = Arc::new(Mutex::new(HostRegistry::default()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let finish_rx = Mutex::new(finish_rx);
+        let cb = hosts
+            .lock()
+            .unwrap()
+            .register(
+                "blocking",
+                128,
+                128,
+                move |_: &InvocationContext, _: &[u8]| {
+                    started_tx.send(()).unwrap();
+                    finish_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    Ok(b"null".to_vec())
+                },
+            )
+            .unwrap();
+        let ctx = HostContext::new(
+            Policy::default().allow_capability("blocking").unwrap(),
+            hosts,
+            vec![HostGrant {
+                callback: cb,
+                scope: "test".into(),
+            }],
+        )
+        .unwrap();
+        ctx.begin_invocation(Duration::from_millis(25)).unwrap();
+        assert!(matches!(
+            runtime().block_on(ctx.call("blocking".into(), json!(null))),
+            Err(Error::DeadlineExceeded)
+        ));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(ctx.outstanding(), 1);
+        ctx.cancel();
+        assert_eq!(ctx.outstanding(), 1);
+        finish_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while ctx.outstanding() != 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(ctx.outstanding(), 0);
+    }
+    #[test]
+    fn resource_views_and_narrowing_stay_private() {
+        let hosts = Arc::new(Mutex::new(HostRegistry::default()));
+        let policy = Policy::default()
+            .allow_read("/tmp")
+            .unwrap()
+            .allow_write("/tmp")
+            .unwrap()
+            .allow_capability("env")
+            .unwrap();
+        let a = HostContext::new(policy.clone(), hosts.clone(), vec![]).unwrap();
+        let b = HostContext::new(policy, hosts, vec![]).unwrap();
+        a.write("/tmp/a", b"private").unwrap();
+        a.env_set("TZ", "sandbox-only").unwrap();
+        assert!(b.read("/tmp/a").is_err());
+        assert_eq!(b.env_get("TZ").unwrap(), None);
+        a.narrow_policy(&Policy::default()).unwrap();
+        assert!(a.read("/tmp/a").is_err());
     }
 }

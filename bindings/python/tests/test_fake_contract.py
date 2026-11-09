@@ -234,3 +234,37 @@ async def test_input_is_bounded_before_json_parsing() -> None:
             # This would be invalid JSON too: the size limit must reject it first.
             with pytest.raises(denosanbox.LimitExceededError):
                 await sandbox.call("echo", "x" * 17)
+
+
+async def test_default_create_inherits_tight_host_numeric_ceiling() -> None:
+    """Regression: unspecified numeric options used to start from
+    `Limits::default()` and exceed a legitimately tighter host ceiling."""
+
+    js = "export async function one() { return 1; }"
+    for options in (
+        denosanbox.EngineOptions(deadline_ms=1000),
+        denosanbox.EngineOptions(max_message_bytes=64),
+        denosanbox.EngineOptions(max_sandboxes=1),
+        denosanbox.EngineOptions(heap_target_bytes=16 * 1024 * 1024),
+    ):
+        engine = Engine("fake", options=options)
+        try:
+            sandbox = await engine.create(engine.prepare(js))
+            assert await sandbox.call("echo", "null") == "null"
+            assert (await sandbox.close()).closed_cleanly
+        finally:
+            assert (await engine.shutdown()).clean
+
+
+async def test_explicit_above_ceiling_numeric_request_is_policy_error() -> None:
+    engine = Engine("fake", options=denosanbox.EngineOptions(max_message_bytes=64))
+    try:
+        prepared = engine.prepare("export async function one() { return 1; }")
+        # Not silently clamped: the core rejects the verbatim request.
+        with pytest.raises(denosanbox.PolicyError):
+            await engine.create(prepared, options=denosanbox.SandboxOptions(max_message_bytes=65))
+        within = await engine.create(prepared, options=denosanbox.SandboxOptions(max_message_bytes=32))
+        assert await within.call("echo", "null") == "null"
+        assert (await within.close()).closed_cleanly
+    finally:
+        assert (await engine.shutdown()).clean

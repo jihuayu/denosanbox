@@ -186,6 +186,11 @@ fn positive(name: &str, value: Option<i64>) -> Result<Option<usize>> {
 pub struct NativeEngine {
     engine: Engine,
     callbacks: Mutex<BTreeMap<String, RegisteredCallback>>,
+    /// Numeric limits of the immutable trusted creation ceiling. Per-sandbox
+    /// numeric defaults are filled from here, never from `Limits::default()`,
+    /// so an unspecified sandbox option can never exceed the ceiling.
+    /// Capabilities and read/write roots are deliberately *not* inherited.
+    ceiling_limits: policy::Limits,
 }
 
 #[napi]
@@ -296,6 +301,7 @@ impl NativeEngine {
         // explicit capabilities/roots above. Per-sandbox requests are still
         // narrowed against it by `Engine::with_policy`/`create`.
         let ceiling = ceiling.with_limits(limits);
+        let ceiling_limits = ceiling.limits();
         Ok(Self {
             engine: Engine::with_policy(
                 EngineConfig::new(BackendKind::Deno).with_limits(engine_limits),
@@ -303,6 +309,7 @@ impl NativeEngine {
             )
             .map_err(native_error)?,
             callbacks: Mutex::new(BTreeMap::new()),
+            ceiling_limits,
         })
     }
 
@@ -519,7 +526,9 @@ impl NativeEngine {
                 .allow_write(&root)
                 .map_err(|_| invalid(format!("invalid write root '{root}'")))?;
         }
-        let mut policy_limits = requested.limits();
+        // Fill unspecified numeric options from the trusted creation ceiling.
+        // The core validates every explicit override against that ceiling.
+        let mut policy_limits = self.ceiling_limits;
         if let Some(ms) = options.deadline_ms {
             if ms <= 0 {
                 return Err(invalid("deadlineMs must be greater than zero".into()));

@@ -102,10 +102,8 @@ const PRIVATE_JS = `export async function roundtrip(input) {
 
 test('private VFS read/write and env come from engine ceiling and sandbox request', async () => {
   const js = `${PRIVATE_JS}
-  export function inspect(){ return sandbox.env.get('PRIVATE'); }
-  export function inspectFile(){ return sandbox.fs.readTextFile('/private/value'); }`;
-  // The ceiling must authorize every capability the sandbox requests.
-  const engine = new Engine({hostCapabilities: ['env', 'fs'], readRoots: ['/private'], writeRoots: ['/private']});
+  export function inspect(){ return sandbox.env.get('PRIVATE'); }`;
+  const engine = new Engine({hostCapabilities: ['env'], readRoots: ['/private'], writeRoots: ['/private']});
   try {
     // A sandbox request above the ceiling fails closed with a policy error.
     await assert.rejects(
@@ -114,17 +112,16 @@ test('private VFS read/write and env come from engine ceiling and sandbox reques
     const allowed = await engine.create(engine.prepare(js), {
       capabilities: ['env'], readRoots: ['/private'], writeRoots: ['/private'],
     });
-    // A/B isolation: B may use env and files (capability granted) but gets no
-    // filesystem roots, so its env view is empty and its file is missing.
-    const other = await engine.create(engine.prepare(js), {capabilities: ['env', 'fs']});
+    // A/B isolation: B gets ONLY the `env` capability and no filesystem roots.
+    // Its env view is empty; file read/write is denied because the core checks
+    // read/write *roots*, not a capability. No extra capability is invented.
+    const other = await engine.create(engine.prepare(js), {capabilities: ['env']});
     // A guest-supplied ID/value can never add authority.
     assert.deepEqual(await allowed.call('roundtrip', {value: 'a', sandboxId: 'sbx-forged'}), {text: 'a', env: 'a'});
     assert.equal(await allowed.call('inspect', null), 'a');
     assert.equal(await other.call('inspect', null), null);
-    await assert.rejects(other.call('inspectFile', null),
-      e => e instanceof SandboxError && /Denied/.test(e.message));
     await assert.rejects(other.call('roundtrip', {value: 'b'}),
-      e => e instanceof SandboxError && /Denied/.test(e.message));
+      e => e instanceof SandboxError && e.kind === 'execution' && /Denied/.test(e.message));
     assert.equal(await allowed.call('inspect', null), 'a');
     await allowed.close(); await other.close();
     // Ungranted `env` is denied by the runtime, never answered with null.
@@ -184,7 +181,8 @@ test('a plugin prepared by one engine cannot bypass another engine limits', asyn
 });
 
 test('engine hard limits are enforced by the facade', async () => {
-  const k = new Engine({maxSandboxes: 1});
+  // Engine admission is `maxActiveSandboxes`; `maxSandboxes` is a tree-budget seed.
+  const k = new Engine({maxActiveSandboxes: 1});
   try {
     const plugin = k.prepare('export function id(x){return x;}');
     const only = await k.create(plugin);
@@ -194,7 +192,8 @@ test('engine hard limits are enforced by the facade', async () => {
     assert.equal(k.activeSandboxes, 0);
   } finally { assert.equal(await k.shutdown(), true); }
 
-  const m = new Engine({maxMessageBytes: 64});
+  // Engine hard limits and per-sandbox policy limits are independently enforced.
+  const m = new Engine({engineMessageBytes: 64});
   try {
     const sandbox = await m.create(m.prepare('export function echo(x){return x;}'));
     await assert.rejects(sandbox.call('echo', {x: 'y'.repeat(200)}), e => e instanceof SandboxError && e.kind === 'limit_exceeded');
@@ -279,4 +278,45 @@ test('multiple engines in one process keep independent lifecycles', async () => 
   assert.equal(await b.call('next', null), 2);
   assert.equal((await b.close()).closedCleanly, true);
   assert.equal(await two.shutdown(), true);
+});
+
+test('default create inherits tight host numeric ceiling; explicit above-ceiling rejected', async () => {
+  const js = 'export function one(){return 1;}';
+  const tight = [
+    {maxMessageBytes: 64},
+    {maxSandboxes: 1},
+    {heapTargetBytes: 16 * 1024 * 1024, memoryBudgetBytes: 24 * 1024 * 1024},
+  ];
+  for (const options of tight) {
+    const engine = new Engine(options);
+    try {
+      const plugin = engine.prepareModules({'main.js': js});
+      // Unspecified SandboxOptions numeric values inherit the creation ceiling.
+      const sandbox = await engine.create(plugin);
+      assert.equal(await sandbox.call('one', null), 1);
+      if (options.maxMessageBytes) {
+        await assert.rejects(sandbox.call('one', {payload:'x'.repeat(200)}),
+          e => e instanceof SandboxError && e.kind === 'limit_exceeded');
+        assert.equal(await sandbox.call('one', null), 1);
+      }
+      assert.equal((await sandbox.close()).closedCleanly, true);
+    } finally { assert.equal(await engine.shutdown(), true); }
+  }
+  const engine = new Engine({maxMessageBytes: 64});
+  try {
+    const plugin = engine.prepareModules({'main.js': js});
+    // An explicit larger request is not clamped: the core rejects it verbatim.
+    await assert.rejects(engine.create(plugin, {maxMessageBytes: 65}),
+      e => e instanceof SandboxError && e.kind === 'policy');
+    const within = await engine.create(plugin, {maxMessageBytes: 32});
+    assert.equal(await within.call('one', null), 1);
+    await within.close();
+  } finally { assert.equal(await engine.shutdown(), true); }
+  // Capabilities are not inherited from the ceiling: files stay denied by root.
+  const caps = new Engine({hostCapabilities: ['env']});
+  try {
+    const sandbox = await caps.create(caps.prepare(js));
+    assert.equal(await sandbox.call('one', null), 1);
+    await sandbox.close();
+  } finally { assert.equal(await caps.shutdown(), true); }
 });

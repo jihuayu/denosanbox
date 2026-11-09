@@ -144,6 +144,11 @@ impl PyInvocationContext {
 struct NativeEngine {
     inner: Engine,
     callbacks: Mutex<BTreeMap<String, RegisteredCallback>>,
+    /// Numeric limits of the immutable trusted creation ceiling. Per-sandbox
+    /// numeric defaults are filled from here, never from `Limits::default()`,
+    /// so an unspecified `SandboxOptions` value can never exceed the ceiling.
+    /// Capabilities and read/write roots are deliberately *not* inherited.
+    ceiling_limits: policy::Limits,
 }
 
 #[pymethods]
@@ -272,12 +277,14 @@ impl NativeEngine {
             policy_limits = policy_limits.with_max_log_bytes(value);
         }
         ceiling = ceiling.with_limits(policy_limits);
+        let ceiling_limits = ceiling.limits();
 
         let engine = Engine::with_policy(EngineConfig::new(backend).with_limits(limits), ceiling)
             .map_err(error_to_py)?;
         Ok(Self {
             inner: engine,
             callbacks: Mutex::new(BTreeMap::new()),
+            ceiling_limits,
         })
     }
 
@@ -377,8 +384,11 @@ impl NativeEngine {
                 )
             })?;
         }
-        let mut policy_limits = requested.limits();
-        let max_message_bytes = max_message_bytes.unwrap_or(engine_max_message_bytes);
+        // Fill unspecified numeric options from the trusted creation ceiling.
+        // The core validates every explicit override against that ceiling.
+        let mut policy_limits = self.ceiling_limits;
+        let max_message_bytes = max_message_bytes
+            .unwrap_or(engine_max_message_bytes.min(self.ceiling_limits.max_message_bytes()));
         if let Some(ms) = deadline_ms {
             policy_limits = policy_limits.with_deadline(Duration::from_millis(ms));
         }

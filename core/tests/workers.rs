@@ -7,6 +7,10 @@ use denosanbox::{Engine, EngineConfig, PluginSource, SandboxOptions, WorkerHandl
 use serde_json::json;
 
 async fn root(engine: &Engine) -> denosanbox::SandboxHandle {
+    root_with_options(engine, SandboxOptions::default()).await
+}
+
+async fn root_with_options(engine: &Engine, options: SandboxOptions) -> denosanbox::SandboxHandle {
     let source = PluginSource {
         entrypoint: "root.js".into(),
         modules: BTreeMap::from([
@@ -27,13 +31,10 @@ async fn root(engine: &Engine) -> denosanbox::SandboxHandle {
         ]),
     };
     let plugin = engine.prepare(source).expect("approved module graph");
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        engine.create(plugin, SandboxOptions::default()),
-    )
-    .await
-    .expect("bounded root startup")
-    .expect("create root")
+    tokio::time::timeout(Duration::from_secs(3), engine.create(plugin, options))
+        .await
+        .expect("bounded root startup")
+        .expect("create root")
 }
 
 async fn child(engine: &Engine, parent: &denosanbox::SandboxHandle) -> WorkerHandle {
@@ -239,4 +240,33 @@ async fn queued_byte_budget_counts_inflight_payloads() {
     })
     .await
     .expect("byte budget and control path remain bounded");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn child_cannot_multiply_a_narrowed_ancestor_sandbox_budget() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let policy = denosanbox::Policy::default()
+        .with_limits(denosanbox::policy::Limits::default().with_max_sandboxes(1));
+    let parent = root_with_options(
+        &engine,
+        SandboxOptions {
+            policy: policy.clone(),
+            delegation: policy,
+            ..SandboxOptions::default()
+        },
+    )
+    .await;
+    let error = WorkerHandle::spawn(
+        &engine,
+        &parent,
+        "child.js",
+        SandboxOptions::default(),
+        WorkerOptions::default(),
+    )
+    .await
+    .expect_err("a root consuming its one-node subtree budget cannot create a child");
+    assert_eq!(error.kind(), "limit_exceeded");
+    assert_eq!(engine.active_sandboxes(), 1);
+    parent.close().await.unwrap();
+    engine.shutdown().await.unwrap();
 }

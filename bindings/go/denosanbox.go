@@ -373,8 +373,9 @@ func (s *Sandbox) Call(
 	if timeout < 0 {
 		return nil, &Error{Status: StatusInvalidArgument, Message: "timeout must be nonnegative"}
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
+	ctxDeadline, hasCtxDeadline := ctx.Deadline()
+	if hasCtxDeadline {
+		remaining := time.Until(ctxDeadline)
 		if remaining <= 0 {
 			return nil, context.DeadlineExceeded
 		}
@@ -440,10 +441,41 @@ func (s *Sandbox) Call(
 				return nil, err
 			}
 			continue
+		case C.DENO_STATUS_DEADLINE:
+			// The native deadline watchdog can win the race against the Go
+			// context's own timer goroutine: ctx.Err() may still be nil for a
+			// moment after the caller's deadline really passed. The identity is
+			// decided by the deadline itself, not by timer scheduling.
+			nativeErr := takeError(&cerr)
+			if err := ctxDeadlineError(ctx, ctxDeadline, hasCtxDeadline, nativeErr); err != nil {
+				return nil, err
+			}
+			return nil, nativeErr
 		default:
 			return nil, takeError(&cerr)
 		}
 	}
+}
+
+// ctxDeadlineError reports the caller's context error when the native
+// invocation ended in a deadline that is not earlier than the caller's own
+// context deadline (time.Now is monotonic, so the comparison is immune to wall
+// clock jumps). Everything else keeps the structured native error: an
+// explicitly earlier native timeout, an engine policy end, or a manual
+// cancellation all stay distinguishable.
+func ctxDeadlineError(ctx context.Context, deadline time.Time, hasDeadline bool, nativeErr error) error {
+	if err := ctx.Err(); err != nil {
+		// Already observed by the context (cancelled or deadline exceeded).
+		return err
+	}
+	native, ok := nativeErr.(*Error)
+	if !ok || native == nil || native.Status != StatusDeadline {
+		return nil
+	}
+	if !hasDeadline || time.Now().Before(deadline) {
+		return nil
+	}
+	return context.DeadlineExceeded
 }
 
 // Cancel terminates the sandbox using core cancellation semantics. It is

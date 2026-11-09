@@ -167,3 +167,68 @@ func TestContextDeadlinePreservesGoErrorIdentity(t *testing.T) {
 		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
 	}
 }
+
+// TestNativeDeadlineEarlierThanContextKeepsTypedError ensures a native call
+// timeout that is genuinely earlier than the caller's context deadline is not
+// misreported as context.DeadlineExceeded: the structured native error is kept.
+func TestNativeDeadlineEarlierThanContextKeepsTypedError(t *testing.T) {
+	engine, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	sandbox, err := engine.Create(`export function spin() { while(true){} }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = sandbox.Call(ctx, "spin", json.RawMessage("null"), 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("native timeout call succeeded")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("early native timeout misreported as ctx deadline: %v", err)
+	}
+	var typed *Error
+	if !errors.As(err, &typed) || typed.Status != StatusDeadline {
+		t.Fatalf("expected structured StatusDeadline error, got %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("context deadline fired; test needs the native timeout to win (ctx.Err=%v)", ctx.Err())
+	}
+	if waited := time.Since(start); waited >= 5*time.Second {
+		t.Fatalf("call did not end on its native timeout (waited %s)", waited)
+	}
+}
+
+// TestManualCancelBeforeContextDeadlineKeepsCancelIdentity ensures a manual
+// cancellation that races a native deadline end still reports context.Canceled.
+func TestManualCancelBeforeContextDeadlineKeepsCancelIdentity(t *testing.T) {
+	engine, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	sandbox, err := engine.Create(`export function spin() { while(true){} }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { _, err := sandbox.Call(ctx, "spin", json.RawMessage("null"), time.Second); result <- err }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled call did not return")
+	}
+}

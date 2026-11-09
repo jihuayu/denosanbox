@@ -2,6 +2,7 @@
 //! and live policy changes that cannot safely alter allocated resources.
 
 use std::time::Duration;
+use std::{future::Future, task::Poll};
 
 use denosanbox::policy::Limits;
 use denosanbox::{
@@ -68,11 +69,15 @@ async fn policy_queue_depth_counts_pending_calls_and_close_accounts_for_cancella
     let sandbox = create_with_policy(&engine, MODULE, policy).await;
 
     let blocked_sandbox = sandbox.clone();
-    let blocked = tokio::spawn(async move {
-        blocked_sandbox
-            .call("block", Value::Null, InvocationOptions::default())
-            .await
-    });
+    let mut blocked =
+        std::pin::pin!(blocked_sandbox.call("block", Value::Null, InvocationOptions::default()));
+    // Poll the call itself once, so its job is definitely enqueued before an
+    // echo can race it. Spawning a task alone does not establish that order.
+    std::future::poll_fn(|cx| match blocked.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(outcome) => panic!("blocking call completed unexpectedly: {outcome:?}"),
+    })
+    .await;
     let queued = enqueue_behind_blocked_call(&sandbox).await;
 
     let third = sandbox
@@ -87,8 +92,7 @@ async fn policy_queue_depth_counts_pending_calls_and_close_accounts_for_cancella
     sandbox.cancel();
     let blocked_result = tokio::time::timeout(Duration::from_secs(1), blocked)
         .await
-        .expect("blocked call observes cancellation")
-        .expect("blocked task joins");
+        .expect("blocked call observes cancellation");
     assert!(
         matches!(&blocked_result, Err(Error::Cancelled)),
         "{blocked_result:?}"

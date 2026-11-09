@@ -233,3 +233,24 @@ fn fifo_is_rejected_without_waiting_for_a_writer() {
         .unwrap()
         .is_err());
 }
+
+#[test]
+fn logical_cwd_directory_validation_never_follows_symlink_aliases() {
+    use std::os::unix::fs::symlink;
+    let root = TestDir::new();
+    let owner = SandboxId::mint();
+    std::fs::create_dir(root.path().join("dir")).unwrap();
+    std::fs::write(root.path().join("file"), b"data").unwrap();
+    symlink("dir", root.path().join("alias")).unwrap();
+    let mut mounts = MountTable::new(owner, 1, 64);
+    mounts
+        .add_mount(owner, "/mount", root.path(), MountAccess::ReadOnly)
+        .unwrap();
+    assert!(mounts.is_dir(owner, &policy(), "/mount").unwrap());
+    assert!(mounts.is_dir(owner, &policy(), "/mount/dir").unwrap());
+    assert!(mounts.is_dir(owner, &policy(), "/mount/alias").is_err());
+    assert!(mounts.is_dir(owner, &policy(), "/mount/file").is_err());
+    assert!(mounts
+        .is_dir(owner, &Policy::default(), "/mount/dir")
+        .is_err());
+}

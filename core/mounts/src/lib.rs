@@ -189,6 +189,23 @@ impl MountTable {
         }
         Ok(bytes)
     }
+    /// Validate a directory for a host-mediated logical cwd change. Symlinks
+    /// remain denied at every component, including the final directory.
+    pub fn is_dir(&self, owner: SandboxId, policy: &Policy, path: &str) -> Result<bool> {
+        self.check(owner)?;
+        let path = VirtualPath::parse(path).map_err(|_| Error::InvalidPath)?;
+        policy.check_read(&path).map_err(|_| Error::Denied)?;
+        let (prefix, mount) = self
+            .mounts
+            .iter()
+            .find(|(p, _)| p.is_ancestor_or_equal(&path))
+            .ok_or(Error::NotMounted)?;
+        let mut dir = mount.dir.try_clone()?;
+        for part in path.segments().skip(prefix.depth()) {
+            dir = dir.open_dir_nofollow(part)?;
+        }
+        Ok(true)
+    }
     /// Writes are bounded but not transactional. A returned I/O error can occur
     /// after truncation or partial writing; cancellation does not roll it back.
     pub fn write(&self, owner: SandboxId, policy: &Policy, path: &str, data: &[u8]) -> Result<()> {

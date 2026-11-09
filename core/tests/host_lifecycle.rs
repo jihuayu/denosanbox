@@ -263,12 +263,19 @@ async fn running_callback_retains_capture_until_real_completion() {
             .await
     });
     started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    let report = tokio::time::timeout(Duration::from_secs(2), engine.shutdown())
-        .await
-        .unwrap()
-        .unwrap();
+    let shutdown = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.shutdown().await })
+    };
+    // Shutdown may await the worker join grace. Registry retirement must
+    // happen before that await, while the running callback keeps its owner.
+    let retired = tokio::time::timeout(Duration::from_secs(2), async {
+        while idle_drops.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
     let observed = (
-        report.clean,
         idle_drops.load(Ordering::SeqCst),
         drops.load(Ordering::SeqCst),
         engine.active_sandboxes(),
@@ -279,7 +286,17 @@ async fn running_callback_retains_capture_until_real_completion() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(observed, (false, 1, 0, 1));
+    let report = tokio::time::timeout(Duration::from_secs(6), shutdown)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        retired.is_ok(),
+        "retirement must precede waiting for the callback"
+    );
+    assert_eq!(observed, (1, 0, 1));
+    assert_eq!(report.sandboxes_closed, 1);
     assert!(outcome.is_err());
     wait_until(
         "capture and admission release",

@@ -6,13 +6,14 @@ stable :class:`SandboxError` hierarchy and adds deterministic async context
 manager helpers.
 
 Only a single process-local sandbox runtime is used. There is no sidecar and
-no subprocess. Host callback registration is not exposed because the current
-Rust facade has no registration API.
+no subprocess. Async host callbacks use the running Python event loop and require explicit
+host capability ceilings and per-sandbox grants.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any, Final
 
 from . import _native
@@ -29,6 +30,7 @@ __all__ = [
     "ExecutionError",
     "InvalidConfigurationError",
     "InvalidPluginError",
+    "InvocationContext",
     "LimitExceededError",
     "ModuleDeniedError",
     "ModuleNotFoundSandboxError",
@@ -42,6 +44,7 @@ __all__ = [
     "UnsupportedLanguageError",
     "BackendError",
     "InternalError",
+    "PolicyError",
 ]
 
 
@@ -142,6 +145,11 @@ class InvalidConfigurationError(SandboxError):
     code = "invalid_configuration"
 
 
+class PolicyError(SandboxError):
+    kind = "policy"
+    code = "policy"
+
+
 class InternalError(SandboxError):
     kind = "internal"
     code = "internal"
@@ -165,6 +173,7 @@ _KIND_TO_ERROR: dict[str, type[SandboxError]] = {
         BackendError,
         InvalidConfigurationError,
         InternalError,
+        PolicyError,
     )
 }
 
@@ -188,6 +197,7 @@ async def _await_native(awaitable: Any) -> Any:
 
 # Report value objects are owned by the extension. They expose read-only
 # attributes and are the actual types returned by ``close``/``shutdown``.
+InvocationContext = _native.InvocationContext
 CloseReport = _native.CloseReport
 ShutdownReport = _native.ShutdownReport
 
@@ -268,6 +278,8 @@ class Sandbox:
             self._closed = True
             raise
         except _native.NativeError as exc:
+            if getattr(exc, "kind", "") in {"closed", "cancelled", "deadline_exceeded"}:
+                self._closed = True
             raise _translate_native_error(exc) from None
 
     def cancel(self) -> None:
@@ -306,7 +318,11 @@ class Sandbox:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        await self.close()
+        report = await self.close()
+        if not report.closed_cleanly:
+            error = SandboxError("sandbox close is incomplete; host work still owns resources", kind="incomplete_close")
+            error.report = report
+            raise error
 
     def __repr__(self) -> str:
         state = "closed" if self._closed else "open"
@@ -339,6 +355,7 @@ class Engine:
         max_modules: int | None = None,
         max_module_bytes: int | None = None,
         max_graph_bytes: int | None = None,
+        host_capabilities: tuple[str, ...] | list[str] = (),
     ) -> None:
         try:
             self._native = _native.NativeEngine(
@@ -351,6 +368,7 @@ class Engine:
                 max_modules=max_modules,
                 max_module_bytes=max_module_bytes,
                 max_graph_bytes=max_graph_bytes,
+                host_capabilities=list(host_capabilities),
             )
         except _native.NativeError as exc:
             raise _translate_native_error(exc) from None
@@ -358,7 +376,7 @@ class Engine:
     def prepare(self, source: str, entrypoint: str = "main.js") -> PreparedPlugin:
         """Validates and freezes a single-module JavaScript plugin.
 
-        Only JavaScript ESM (``.js``/``.mjs``) is accepted by the facade.
+        JavaScript ESM and TypeScript (``.ts``/``.mts``) use the core offline parser/transpiler.
         This synchronous operation releases the GIL while Rust validates the
         graph.
         """
@@ -375,6 +393,7 @@ class Engine:
         *,
         default_timeout_ms: int | None = None,
         memory_limit_bytes: int | None = None,
+        host_grants: dict[str, str] | None = None,
     ) -> Sandbox:
         """Creates a sandbox with an independent isolate and module instances."""
 
@@ -385,9 +404,39 @@ class Engine:
                 prepared._native,
                 default_timeout_ms=default_timeout_ms,
                 memory_limit_bytes=memory_limit_bytes,
+                host_grants=list((host_grants or {}).items()),
             )
         )
         return Sandbox(native)
+
+    def register_host(self, name: str, callback: Any, *, input_limit: int = 1048576, output_limit: int = 1048576) -> None:
+        """Register an async callback on the current running asyncio loop.
+
+        The callback receives trusted context and JSON text, and returns JSON
+        text. Registration does not grant any sandbox permission to call it.
+        """
+        asyncio.get_running_loop()
+        if not inspect.iscoroutinefunction(callback):
+            raise TypeError("host callback must be an async function")
+
+        async def invoke(context: InvocationContext, input_json: str) -> str:
+            task = asyncio.create_task(callback(context, input_json))
+            try:
+                while True:
+                    done, _ = await asyncio.wait({task}, timeout=0.005)
+                    if done:
+                        return task.result()
+                    if context.cancelled or context.remaining_ms is None:
+                        task.cancel()
+                        await task
+            finally:
+                if not task.done():
+                    task.cancel()
+
+        try:
+            self._native.register_host(name, invoke, input_limit, output_limit)
+        except _native.NativeError as exc:
+            raise _translate_native_error(exc) from None
 
     async def shutdown(self) -> ShutdownReport:
         """Closes every live sandbox owned by this engine."""
@@ -406,7 +455,11 @@ class Engine:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        await self.shutdown()
+        report = await self.shutdown()
+        if not report.clean:
+            error = SandboxError("engine shutdown is incomplete; host work still owns resources", kind="incomplete_close")
+            error.report = report
+            raise error
 
     def __repr__(self) -> str:
         return (

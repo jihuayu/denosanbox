@@ -31,3 +31,18 @@ wheel-distribution matrix. No wheel was uploaded or published.
 Async host callback/GIL/interpreter-shutdown parity is unimplemented and remains
 a release gate for issue #14. No callback test result or guest PID verification
 is claimed by this validation.
+
+## Callback and shared fixture validation
+
+Against committed Rust core d4855fe, the updated production wheel was rebuilt
+and installed. The complete Python suite passed **28 tests in 0.96 s**, including
+four host callback cases (asyncio-thread/GIL dispatch with host PID and trusted
+scope, cancellation, sanitized failure, and interpreter exit after explicit
+close), six direct real-runtime cases, four shared behavior fixtures, and
+fourteen deterministic contract cases. No production test was skipped.
+
+The earlier callback release-gate note above records the initial subset. Async
+host registration and dispatch are now implemented, with explicit engine
+ceilings and per-sandbox grants. Native and wrapper cancellation preserve
+ownership; incomplete close reports are surfaced by async context managers.
+The new callback tests run against the actual extension, not a mock callback.

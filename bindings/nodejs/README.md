@@ -5,13 +5,13 @@ It does not start Deno, a subprocess, or a sidecar. The addon is trusted host
 code; guest native addons remain unavailable.
 
 This package is private while its release gate is incomplete. The loader
-explicitly rejects combinations outside Linux x86_64 / Node 24. A successful
+explicitly rejects combinations outside Linux x86_64 / Node 24.22.1. A successful
 local load is evidence for that exact build, not a guarantee for every Node 24
 patch release, libc, linker, or operating system.
 
 ## Build and test
 
-Install Rust, a C/C++ linker, Python 3 (for build metadata), and Node 24. From a
+Install Rust, a C/C++ linker, Python 3 (for build metadata), and Node 24.22.1. From a
 clean checkout:
 
 ```sh
@@ -70,11 +70,8 @@ support solely from the preliminary C shim.
 
 ## Remaining release requirements
 
-Async host callbacks, callback ownership/re-entry tests, shared isolation fixture
-parity, packaged native-artifact installation, and a release build matrix still
-need to pass before this can be published as the completed Node binding.
-Current `Engine.prepare` accepts one JavaScript module. Additional modules and
-TypeScript options will follow the Rust facade's audited support. No automatic
+Async host callbacks use bounded N-API threadsafe dispatch and return Promises. Shared behavior fixtures and explicit process shutdown run against the native addon. Broader platform/Node version support and registry publication remain outside the tested matrix.
+Current `Engine.prepare` accepts one JavaScript or TypeScript module; TypeScript uses the Rust offline transpiler. Additional-module construction is not exposed yet. No automatic
 fallback is provided for unsupported APIs, platforms, or failed native loading.
 
 The same-process threat model applies: native faults and process OOM can affect
@@ -92,3 +89,34 @@ clippy with `-D warnings` passed. `npm pack --dry-run` confirmed that the native
 artifact, declarations, loader, README, and license are included. The local
 debug artifact was about 175 MB unpacked; release artifacts and install tests
 are still a release requirement. Nothing was published to npm.
+
+## Scoped async host callbacks
+
+```js
+const engine = new Engine({hostCapabilities: ['orders.read']});
+engine.registerHost('orders.read', async (context, input) => {
+  // context.scope is host-provided; input is untrusted guest data.
+  return {scope: context.scope, pid: process.pid};
+});
+const plugin = engine.prepare("export async function run(input) { return await sandbox.host.call('orders.read', input); }");
+const sandbox = await engine.create(plugin, {hostGrants: {'orders.read': 'tenant-a'}});
+try { console.log(await sandbox.call('run', {scope: 'untrusted'})); }
+finally { await sandbox.close(); await engine.shutdown(); }
+```
+
+Trusted callback context has `sandboxId`, `scope`, dispatch-time `remainingMs`,
+and an `AbortSignal`. Callback input is a separate JSON value. Cancellation,
+close, and deadlines abort the signal; callbacks must cooperate and check it.
+Non-cooperative work remains owned/accounted by core and close may return false.
+`Symbol.asyncDispose` throws `incomplete_close` rather than discarding a false
+cleanup report. Timeouts do not roll back committed side effects. Callbacks
+execute on the Node event loop, so avoid synchronous blocking work. N-API
+callback queues are bounded to 32 entries. Callback failures are sanitized.
+
+The completed local callback gate passed **10 native tests** with zero skips,
+including the four shared behavior fixtures and process exit after explicit
+callback close. An actual `npm pack` archive was installed into a separate local
+package directory, then loaded and exercised with an async host PID callback;
+that installed-package smoke test passed. No package was published. The loader
+and package engine field intentionally accept only Node **24.22.1** until more
+combinations are verified.

@@ -5,12 +5,14 @@
 //! is the `denosanbox` package, which wraps these classes to translate errors
 //! and to provide deterministic close/context-manager behaviour.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use denosanbox::{
-    BackendKind, CloseReport, Engine, EngineConfig, EngineLimits, Error, InvocationOptions,
-    PluginSource, PreparedPlugin, SandboxHandle, SandboxOptions, ShutdownReport,
+    policy, BackendKind, CloseReport, Engine, EngineConfig, EngineLimits, Error, HostGrant,
+    InvocationContext, InvocationOptions, PluginSource, Policy, PreparedPlugin, RegisteredCallback,
+    SandboxHandle, SandboxOptions, ShutdownReport,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -56,10 +58,45 @@ fn parse_backend(backend: &str) -> PyResult<BackendKind> {
     }
 }
 
+struct PythonCallback {
+    callback: Py<PyAny>,
+    locals: pyo3_async_runtimes::TaskLocals,
+}
+
+/// Trusted invocation metadata. It is created by Rust, never guest JSON.
+#[pyclass(module = "denosanbox._native", name = "InvocationContext")]
+struct PyInvocationContext {
+    inner: InvocationContext,
+}
+
+#[pymethods]
+impl PyInvocationContext {
+    #[getter]
+    fn sandbox_id(&self) -> String {
+        self.inner.sandbox_id().to_string()
+    }
+    #[getter]
+    fn scope(&self) -> String {
+        self.inner.scope().to_owned()
+    }
+    #[getter]
+    fn cancelled(&self) -> bool {
+        self.inner.cancellation().is_cancelled()
+    }
+    #[getter]
+    fn remaining_ms(&self) -> Option<u64> {
+        self.inner
+            .deadline()
+            .remaining()
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+    }
+}
+
 /// Owned engine handle.
 #[pyclass(module = "denosanbox._native", name = "NativeEngine")]
 struct NativeEngine {
     inner: Engine,
+    callbacks: Mutex<BTreeMap<String, RegisteredCallback>>,
 }
 
 #[pymethods]
@@ -75,7 +112,8 @@ impl NativeEngine {
         max_invocation_timeout_ms = None,
         max_modules = None,
         max_module_bytes = None,
-        max_graph_bytes = None
+        max_graph_bytes = None,
+        host_capabilities = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -88,6 +126,7 @@ impl NativeEngine {
         max_modules: Option<usize>,
         max_module_bytes: Option<usize>,
         max_graph_bytes: Option<usize>,
+        host_capabilities: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let backend = parse_backend(backend)?;
         let mut limits = EngineLimits::default();
@@ -115,9 +154,21 @@ impl NativeEngine {
         if let Some(value) = max_graph_bytes {
             limits.max_graph_bytes = value;
         }
-        let engine =
-            Engine::new(EngineConfig::new(backend).with_limits(limits)).map_err(error_to_py)?;
-        Ok(Self { inner: engine })
+        let mut ceiling = Policy::default();
+        for name in host_capabilities.unwrap_or_default() {
+            ceiling = ceiling.allow_capability(&name).map_err(|_| {
+                native_error(
+                    "invalid_configuration",
+                    "invalid host capability name".into(),
+                )
+            })?;
+        }
+        let engine = Engine::with_policy(EngineConfig::new(backend).with_limits(limits), ceiling)
+            .map_err(error_to_py)?;
+        Ok(Self {
+            inner: engine,
+            callbacks: Mutex::new(BTreeMap::new()),
+        })
     }
 
     /// Validates and freezes a plugin source graph while the GIL is released.
@@ -142,7 +193,8 @@ impl NativeEngine {
         prepared,
         *,
         default_timeout_ms = None,
-        memory_limit_bytes = None
+        memory_limit_bytes = None,
+        host_grants = None
     ))]
     fn create<'py>(
         &self,
@@ -150,13 +202,36 @@ impl NativeEngine {
         prepared: PyRef<'_, NativePreparedPlugin>,
         default_timeout_ms: Option<u64>,
         memory_limit_bytes: Option<usize>,
+        host_grants: Option<Vec<(String, String)>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let engine = self.inner.clone();
         let plugin = prepared.inner.clone();
         let max_message_bytes = engine.limits().max_message_bytes;
+        let mut requested = Policy::default();
+        let mut grants = Vec::new();
+        {
+            let registered = self
+                .callbacks
+                .lock()
+                .map_err(|_| native_error("internal", "callback registry unavailable".into()))?;
+            for (name, scope) in host_grants.unwrap_or_default() {
+                let callback = registered
+                    .get(&name)
+                    .ok_or_else(|| {
+                        native_error("invalid_configuration", "unknown host callback".into())
+                    })?
+                    .clone();
+                requested = requested.allow_capability(&name).map_err(|_| {
+                    native_error("invalid_configuration", "invalid capability name".into())
+                })?;
+                grants.push(HostGrant { callback, scope });
+            }
+        }
         let options = SandboxOptions {
             default_invocation_timeout: default_timeout_ms.map(Duration::from_millis),
             memory_limit_bytes,
+            policy: requested,
+            host_grants: grants,
             ..SandboxOptions::default()
         };
 
@@ -183,6 +258,73 @@ impl NativeEngine {
                 )
             })
         })
+    }
+
+    /// Capture the running Python loop; callback bodies execute on that loop.
+    #[pyo3(signature = (name, callback, input_limit = 1048576, output_limit = 1048576))]
+    fn register_host(
+        &self,
+        py: Python<'_>,
+        name: String,
+        callback: Py<PyAny>,
+        input_limit: usize,
+        output_limit: usize,
+    ) -> PyResult<()> {
+        if !callback.bind(py).is_callable() {
+            return Err(native_error(
+                "invalid_configuration",
+                "host callback must be callable".into(),
+            ));
+        }
+        let handler = Arc::new(PythonCallback {
+            callback,
+            locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
+        });
+        let registered = self
+            .inner
+            .register_host_async(&name, input_limit, output_limit, move |context, input| {
+                let handler = handler.clone();
+                async move {
+                    context.check_live()?;
+                    let future = Python::with_gil(|py| {
+                        let context_object = Py::new(
+                            py,
+                            PyInvocationContext {
+                                inner: context.clone(),
+                            },
+                        )?;
+                        let input = std::str::from_utf8(&input).map_err(|_| {
+                            pyo3::exceptions::PyValueError::new_err("invalid callback JSON")
+                        })?;
+                        let awaitable = handler.callback.bind(py).call1((context_object, input))?;
+                        pyo3_async_runtimes::into_future_with_locals(&handler.locals, awaitable)
+                    })
+                    .map_err(|_| {
+                        policy::Error::invalid_argument("Python callback could not be scheduled")
+                    })?;
+                    let result = future
+                        .await
+                        .map_err(|_| policy::Error::invalid_argument("Python callback failed"))?;
+                    context.check_live()?;
+                    Python::with_gil(|py| {
+                        let output: String = result.extract(py).map_err(|_| {
+                            policy::Error::invalid_argument("Python callback must return JSON text")
+                        })?;
+                        if output.len() > output_limit {
+                            return Err(policy::Error::limit_exceeded(
+                                "Python callback output exceeds limit",
+                            ));
+                        }
+                        Ok(output.into_bytes())
+                    })
+                }
+            })
+            .map_err(error_to_py)?;
+        self.callbacks
+            .lock()
+            .map_err(|_| native_error("internal", "callback registry unavailable".into()))?
+            .insert(name, registered);
+        Ok(())
     }
 
     /// Closes every sandbox owned by this engine.
@@ -433,6 +575,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("NativeError", py.get_type::<NativeError>())?;
+    m.add_class::<PyInvocationContext>()?;
     m.add_class::<NativeEngine>()?;
     m.add_class::<NativePreparedPlugin>()?;
     m.add_class::<NativeSandbox>()?;

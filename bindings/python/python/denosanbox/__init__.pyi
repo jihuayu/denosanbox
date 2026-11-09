@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Any, Final, Callable, Awaitable
 
 __version__: Final[str]
 
@@ -27,6 +27,13 @@ class ExecutionError(SandboxError): ...
 class BackendError(SandboxError): ...
 class InvalidConfigurationError(SandboxError): ...
 class InternalError(SandboxError): ...
+class PolicyError(SandboxError): ...
+
+class InvocationContext:
+    sandbox_id: str
+    scope: str
+    cancelled: bool
+    remaining_ms: int | None
 
 class CloseReport:
     closed_cleanly: bool
@@ -76,6 +83,7 @@ class Engine:
         max_modules: int | None = None,
         max_module_bytes: int | None = None,
         max_graph_bytes: int | None = None,
+        host_capabilities: list[str] | tuple[str, ...] = (),
     ) -> None: ...
     def prepare(self, source: str, entrypoint: str = "main.js") -> PreparedPlugin: ...
     async def create(
@@ -84,7 +92,9 @@ class Engine:
         *,
         default_timeout_ms: int | None = None,
         memory_limit_bytes: int | None = None,
+        host_grants: dict[str, str] | None = None,
     ) -> Sandbox: ...
+    def register_host(self, name: str, callback: Callable[[InvocationContext, str], Awaitable[str]], *, input_limit: int = 1048576, output_limit: int = 1048576) -> None: ...
     async def shutdown(self) -> ShutdownReport: ...
     @property
     def backend(self) -> str: ...

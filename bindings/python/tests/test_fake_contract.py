@@ -126,7 +126,7 @@ async def test_invalid_timeout_maps_to_invalid_configuration() -> None:
 async def test_prepare_errors_are_translated() -> None:
     engine = Engine("fake")
     with pytest.raises(UnsupportedLanguageError) as caught:
-        engine.prepare("export {};", "main.ts")
+        engine.prepare("export {};", "main.tsx")
     assert caught.value.kind == "unsupported_language"
 
     with pytest.raises(InvalidPluginError):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Any, Final, Callable, Awaitable
 
 __version__: Final[str]
 
@@ -21,6 +21,7 @@ class NativeEngine:
         max_modules: int | None = None,
         max_module_bytes: int | None = None,
         max_graph_bytes: int | None = None,
+        host_capabilities: list[str] | None = None,
     ) -> None: ...
     def prepare(
         self, source: str, entrypoint: str = "main.js"
@@ -31,7 +32,9 @@ class NativeEngine:
         *,
         default_timeout_ms: int | None = None,
         memory_limit_bytes: int | None = None,
+        host_grants: list[tuple[str, str]] | None = None,
     ) -> Any: ...
+    def register_host(self, name: str, callback: Any, input_limit: int = 1048576, output_limit: int = 1048576) -> None: ...
     def shutdown(self) -> Any: ...
     @property
     def backend(self) -> str: ...
@@ -55,6 +58,12 @@ class NativeSandbox:
     ) -> Any: ...
     def cancel(self) -> None: ...
     def close(self) -> Any: ...
+
+class InvocationContext:
+    sandbox_id: str
+    scope: str
+    cancelled: bool
+    remaining_ms: int | None
 
 class CloseReport:
     closed_cleanly: bool

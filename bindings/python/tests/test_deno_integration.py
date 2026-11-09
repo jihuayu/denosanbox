@@ -147,3 +147,10 @@ async def test_cancelled_creation_releases_initializing_sandbox() -> None:
         await asyncio.sleep(0.01)
     assert engine.active_sandboxes == 0
     assert (await engine.shutdown()).clean
+
+
+async def test_single_module_typescript_is_prepared_offline() -> None:
+    async with Engine() as engine:
+        plugin = engine.prepare("export function run(input: number): number { return input + 1; }", "main.ts")
+        async with await engine.create(plugin) as sandbox:
+            assert await sandbox.call("run", "41") == "42"

@@ -4,12 +4,11 @@ Native async Python bindings for the `denosanbox` Rust facade. The extension
 module is `denosanbox._native`; the supported public API is the `denosanbox`
 package.
 
-> **Status: experimental, incomplete subset.** This is not a complete release.
-> Python host callback registration is **not implemented**, because the current
-> Rust facade does not expose a callback registration API. Do not infer or add
-> one from this binding. Release acceptance for callbacks (async callback
-> invocation, GIL handling and object lifetime tests, issue #14) remains open
-> until that Rust API exists and is tested end-to-end.
+Async host callbacks run on their captured asyncio loop through PyO3. A host
+must declare capability names at Engine construction, register callbacks, then
+explicitly grant each sandbox a trusted business scope. Default construction
+grants no host capabilities. This binding is independently versioned 0.1.0
+and uses the matching Rust facade; no wheels have been published.
 
 ## Supported platform
 
@@ -17,7 +16,7 @@ Initially tested only on:
 
 - Linux x86_64
 - CPython 3.12
-- Rust toolchain supported by the core facade (Rust 1.85+)
+- Rust toolchain pinned by the core repository
 
 No other platforms or Python versions are claimed. No wheels are published and
 no wheel platform/ABI support is claimed by this repository. Build from source
@@ -42,17 +41,17 @@ against the matching core checkout.
   string) plus a human-readable `message`.
 
 There is no sidecar and no subprocess: the JavaScript runtime executes inside
-the Python host process. The current bare deno_core profile does not expose `Deno.pid`. A guest-to-host callback PID assertion remains part of the unfinished callback release gate.
+the Python host process. The bare deno_core profile does not expose `Deno.pid`; the real async callback tests verify Python host PID and event-loop thread identity.
 
 ## Not implemented
 
-- Python callbacks into JavaScript or JavaScript callbacks into Python. The
-  facade has no registration method, so none is invented here.
 - Multi-module graph construction from Python. `prepare(source, entrypoint)`
   creates a one-module graph; the Rust `PluginSource` still supports multiple
   modules for other bindings.
-- TypeScript/JSX transpilation, permission policy helpers and a stable wheel
-  distribution.
+- JSX and broad permission-policy helpers. Single-module TypeScript (`.ts` /
+  `.mts`) uses the core offline transpiler; a multi-module Python builder is
+  not exposed yet.
+- A published wheel distribution and platforms beyond the tested matrix.
 
 ## Build and install from source
 
@@ -110,6 +109,38 @@ facade's `serde_json::Value` contract without exposing Rust serialization
 types. `timeout_ms` overrides the engine/sandbox default for one call; the core
 enforces a deadline and terminates runaway V8 execution.
 
+## Async host callbacks
+
+Register callbacks while the owning asyncio loop is running. Callbacks receive
+trusted metadata separately from guest JSON and return JSON text:
+
+```python
+async with denosanbox.Engine(host_capabilities=["orders.read"]) as engine:
+    async def read_order(context, input_json):
+        await asyncio.sleep(0.001)
+        return json.dumps({"scope": context.scope, "pid": __import__("os").getpid()})
+
+    engine.register_host("orders.read", read_order)
+    plugin = engine.prepare("export async function run(input) { return await sandbox.host.call('orders.read', input); }")
+    async with await engine.create(plugin, host_grants={"orders.read": "tenant-a"}) as sandbox:
+        result = json.loads(await sandbox.call("run", '{"scope":"untrusted"}'))
+        assert result["scope"] == "tenant-a"
+```
+
+`InvocationContext` exposes `sandbox_id`, `scope`, `remaining_ms`, and
+`cancelled`. Guest-supplied IDs never replace these values. The callback body
+runs on the registration loop and holds the GIL only while executing Python;
+awaiting Rust execution does not block that loop. Registration alone gives no
+sandbox a grant. Input/output byte limits are checked by Rust.
+
+Callback cancellation is cooperative. The wrapper requests coroutine
+cancellation when its sandbox closes or deadline expires; code that suppresses
+`asyncio.CancelledError` may continue. Core retains its ownership/accounting and
+reports incomplete cleanup until it finishes. Callback failures expose a
+sanitized error rather than Python exception text. Timeouts do not roll back
+already committed side effects. Close sandboxes and shut down engines before
+stopping their callback event loops or finalizing the Python interpreter.
+
 ## Cancellation and close semantics
 
 - Cancellation is **terminal** for a sandbox. After `cancel()` or a deadline,
@@ -124,7 +155,9 @@ enforces a deadline and terminates runaway V8 execution.
   handle, whose Rust `Drop` requests close. This avoids a permanently orphaned
   sandbox; it does not promise that cancellation returns synchronously.
 - Async context managers (`async with Engine(...)`, `async with await
-  engine.create(...)`) close/shutdown on exit. Synchronous context managers are
+  engine.create(...)`) close/shutdown on exit. If core reports incomplete
+  cleanup they raise `SandboxError(kind="incomplete_close")` with `report`,
+  rather than discarding that diagnostic. Synchronous context managers are
   intentionally not provided because close/shutdown are async.
 
 ## Error kinds
@@ -134,7 +167,7 @@ enforces a deadline and terminates runaway V8 execution.
 `runtime_unavailable`, `unsupported_feature`, `unsupported_language`,
 `invalid_plugin`, `module_not_found`, `module_denied`, `limit_exceeded`,
 `queue_full`, `closed`, `cancelled`, `deadline_exceeded`, `execution`,
-`backend`, `invalid_configuration`, `internal`.
+`backend`, `invalid_configuration`, `internal`, `policy`.
 
 Unknown future kinds fall back to `SandboxError` while preserving `kind` and
 `code`, so the binding remains forward-compatible.
@@ -147,3 +180,8 @@ Unknown future kinds fall back to `SandboxError` while preserving `kind` and
   isolates, JSON round-trips, cancellation during creation, an infinite loop terminated by
   a deadline, cancellation on Python task cancellation, and deterministic
   close reports. These tests require the Deno backend and fail if it is unavailable.
+
+`tests/test_host_callbacks.py` covers async loop/GIL dispatch, same-PID calls,
+trusted scope, ungranted denial, callback cancellation, sanitized failures, and
+explicit close before interpreter shutdown. Shared behavior fixtures also run
+against Rust, Node, and the Go/C adapter.

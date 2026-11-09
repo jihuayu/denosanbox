@@ -201,6 +201,16 @@ impl ResourceRegistry {
             .ok_or_else(|| Error::stale_handle("unknown resource handle"))
     }
 
+    /// Remove generation bookkeeping after the host destroys an owner. Live
+    /// handles must already have been closed. Slots are never reused.
+    pub fn forget_owner(&mut self, owner: SandboxId) -> Result<()> {
+        if self.slots.values().any(|resource| resource.owner == owner) {
+            return Err(Error::denied("owner still has live handles"));
+        }
+        self.generations.remove(&owner);
+        Ok(())
+    }
+
     /// Close every handle for `owner` and invalidate its generation.
     pub fn close_all(&mut self, owner: SandboxId) -> usize {
         let before = self.slots.len();

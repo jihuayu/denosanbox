@@ -316,6 +316,16 @@ impl HostRegistry {
         self.grants.retain(|(owner, _), _| *owner != sandbox);
         before - self.grants.len()
     }
+    /// Trusted lifecycle cleanup after the final owning execution context is
+    /// destroyed and all native work has released its ownership. Do not call
+    /// this merely because a close was requested.
+    pub fn forget_sandbox(&mut self, sandbox: SandboxId) {
+        self.grants.retain(|(owner, _), _| *owner != sandbox);
+        self.closed.remove(&sandbox);
+    }
+    pub fn retired_owners(&self) -> usize {
+        self.closed.len()
+    }
     pub fn begin(
         &self,
         ctx: &InvocationContext,

@@ -186,6 +186,7 @@ impl HostContext {
             for grant in indexed.values() {
                 if let Err(error) = hosts.grant(id, &grant.callback, &grant.scope) {
                     hosts.close_sandbox(id);
+                    hosts.forget_sandbox(id);
                     return Err(policy_error(error));
                 }
             }
@@ -817,6 +818,11 @@ impl HostContext {
 impl Drop for HostContext {
     fn drop(&mut self) {
         self.cancel();
+        // Every native resource worker holds an Arc<Self>, so this is later
+        // than its real completion, including non-cooperative host/DNS work.
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.forget_sandbox(self.id);
+        }
     }
 }
 
@@ -1199,5 +1205,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(context.outstanding(), 0);
+    }
+    #[test]
+    fn completed_contexts_do_not_accumulate_retired_registry_owners() {
+        let registry = Arc::new(Mutex::new(HostRegistry::default()));
+        for _ in 0..100 {
+            let context = HostContext::new(Policy::default(), registry.clone(), vec![]).unwrap();
+            context.cancel();
+            assert_eq!(registry.lock().unwrap().retired_owners(), 1);
+            drop(context);
+            assert_eq!(registry.lock().unwrap().retired_owners(), 0);
+        }
     }
 }

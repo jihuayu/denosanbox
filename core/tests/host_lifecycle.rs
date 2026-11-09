@@ -2,9 +2,13 @@
 //! These tests observe deterministic drop sentinels owned by the captures;
 //! none measures RSS or GC timing, and none leaves a thread blocked.
 use denosanbox::*;
+#[cfg(feature = "deno")]
 use serde_json::Value;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "deno")]
+use std::sync::Mutex;
+#[cfg(feature = "deno")]
 use std::time::{Duration, Instant};
 
 fn fake_engine() -> Engine {
@@ -21,6 +25,7 @@ impl Drop for Tracked {
 }
 
 /// Waits bounded; panics rather than hang if the condition never holds.
+#[cfg(feature = "deno")]
 fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + limit;
     while !condition() {
@@ -213,24 +218,15 @@ async fn registration_after_shutdown_is_closed_and_never_runs() {
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
 }
 
-/// A synchronous callback still running when the engine shuts down keeps its
-/// capture until it really returns; shutdown must complete without waiting
-/// for it, and must still release the other drained handler captures it owns.
-/// `HostContext` is bound to the registry it is given, so the engine exercised
-/// here is bound to the registry that drives its callback; shutdown's
-/// release-before-wait behaviour does not depend on registry ownership.
+/// Exercise the actual Engine registry with a live Deno invocation. The gate
+/// always ends on timeout or sender drop, including when an assertion panics.
+#[cfg(feature = "deno")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_callback_retains_capture_until_real_completion() {
-    let started = Arc::new((Mutex::new(false), Condvar::new()));
-    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let policy = Policy::default().allow_capability("slow").unwrap();
+    let engine = Engine::with_policy(EngineConfig::default(), policy.clone()).unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
     let idle_drops = Arc::new(AtomicUsize::new(0));
-
-    let policy = Policy::default().allow_capability("slow").unwrap();
-    let hosts = Arc::new(Mutex::new(HostRegistry::default()));
-    let engine = fake_engine();
-    // An idle registration the engine must release on shutdown even while the
-    // gated callback is still running.
     let idle = Tracked(idle_drops.clone());
     engine
         .register_host("idle", 64, 64, move |_: &InvocationContext, _: &[u8]| {
@@ -238,77 +234,70 @@ async fn running_callback_retains_capture_until_real_completion() {
             Ok(b"null".to_vec())
         })
         .unwrap();
-    let started_cb = started.clone();
-    let release_cb = release.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
     let tracked = Tracked(drops.clone());
-    let callback = hosts
-        .lock()
-        .unwrap()
-        .register("slow", 64, 64, move |_: &InvocationContext, _: &[u8]| {
-            let _captured = &tracked;
-            let (lock, wake) = &*started_cb;
-            *lock.lock().unwrap_or_else(|err| err.into_inner()) = true;
-            wake.notify_all();
-            // Non-cooperative until the test releases it.
-            let (lock, wake) = &*release_cb;
-            let mut released = lock.lock().unwrap_or_else(|err| err.into_inner());
-            while !*released {
-                released = wake.wait(released).unwrap_or_else(|err| err.into_inner());
-            }
+    let callback = engine
+        .register_host("slow", 64, 64, move |_: &InvocationContext, _: &[u8]| {
+            let _ = &tracked;
+            let _ = started_tx.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3));
             Ok(b"null".to_vec())
         })
         .unwrap();
-    let context = denosanbox_core::HostContext::new(
-        policy,
-        hosts.clone(),
-        vec![HostGrant {
-            callback,
-            scope: "tenant".into(),
-        }],
-    )
-    .unwrap();
-    let invocation = {
-        let context = context.clone();
-        tokio::spawn(async move { context.call("slow".to_string(), Value::Null).await })
-    };
-    wait_flag(&started.0, &started.1, "callback start");
-
-    // Shutdown completes without waiting for the running callback and drops
-    // the drained captures it owns; a repeated shutdown is also safe.
-    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
-        .await
-        .expect("shutdown must not wait for non-cooperative host work")
+    let plugin = engine
+        .prepare(PluginSource::single(
+            "main.js",
+            "export async function run(){return await sandbox.host.call('slow',null);}",
+        ))
         .unwrap();
-    assert_eq!(idle_drops.load(Ordering::SeqCst), 1);
-    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+    let sandbox = engine
+        .create(
+            plugin,
+            SandboxOptions {
+                policy,
+                host_grants: vec![HostGrant {
+                    callback,
+                    scope: "tenant".into(),
+                }],
+                ..Default::default()
+            },
+        )
         .await
-        .expect("repeated shutdown must not wait either")
         .unwrap();
-
-    // The in-flight dispatch owns its own handler for the whole run.
-    let retired = hosts.lock().unwrap().retire_callbacks();
-    assert_eq!(retired.len(), 1);
-    drop(retired);
-    assert_eq!(
-        drops.load(Ordering::SeqCst),
-        0,
-        "a running dispatch keeps the callback capture until it returns"
-    );
-
-    // Bounded cleanup: release the callback, then observe real completion.
-    *release.0.lock().unwrap_or_else(|err| err.into_inner()) = true;
-    release.1.notify_all();
-    let outcome = tokio::time::timeout(Duration::from_secs(5), invocation)
-        .await
-        .expect("invocation must settle once the callback returns")
-        .unwrap();
-    assert!(outcome.is_err(), "a closed sandbox must not report success");
-    wait_until("capture release", Duration::from_secs(5), || {
-        drops.load(Ordering::SeqCst) == 1
+    let caller = sandbox.clone();
+    let invocation = tokio::spawn(async move {
+        caller
+            .call("run", Value::Null, InvocationOptions::default())
+            .await
     });
-    wait_until(
-        "sandbox bookkeeping released",
-        Duration::from_secs(5),
-        || hosts.lock().unwrap().retired_owners() == 0,
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(2), engine.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    let observed = (
+        report.clean,
+        idle_drops.load(Ordering::SeqCst),
+        drops.load(Ordering::SeqCst),
+        engine.active_sandboxes(),
     );
+    // Release before assertions, even if a captured observation is wrong.
+    let _ = release_tx.send(());
+    let outcome = tokio::time::timeout(Duration::from_secs(3), invocation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed, (false, 1, 0, 1));
+    assert!(outcome.is_err());
+    wait_until(
+        "capture and admission release",
+        Duration::from_secs(2),
+        || drops.load(Ordering::SeqCst) == 1 && engine.active_sandboxes() == 0,
+    );
+    drop(sandbox);
 }

@@ -106,6 +106,9 @@ impl Engine {
         callback: impl denosanbox_core::policy::Callback + 'static,
     ) -> Result<RegisteredCallback> {
         let mut hosts = self.inner.hosts.lock().unwrap();
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Closed);
+        }
         hosts
             .register(name, input_limit, output_limit, callback)
             .map_err(map_policy)
@@ -569,8 +572,9 @@ impl Engine {
     /// Registered host callback handlers are detached from the registry and
     /// their captures dropped here, outside all registry and worker locks and
     /// before waiting on any sandbox. A callback invocation that already
-    /// started keeps its own handler until it really returns; that is not
-    /// cancelled by this method. Idempotent and safe to call concurrently.
+    /// started keeps its own handler until it really returns. Sandbox
+    /// cancellation still propagates; retirement never frees running callback
+    /// captures prematurely. Idempotent and safe to call concurrently.
     ///
     /// Joining happens on native reaper threads, never on the async executor.
     pub async fn shutdown(&self) -> Result<ShutdownReport> {
@@ -591,6 +595,17 @@ impl Engine {
         for state in &states {
             state.request_close();
         }
+
+        // Snapshot and cancel workers before releasing captures: a callback
+        // may own the last external sandbox handle. Keep those states alive
+        // until their shutdown reports have been collected.
+        let retired = {
+            let mut hosts = self.inner.hosts.lock().expect("host registry poisoned");
+            hosts.retire_callbacks()
+        };
+        // User captures may reenter Engine methods from Drop. Never run their
+        // destructors under a registry/worker lock or retain them across await.
+        drop(retired);
 
         let mut report = ShutdownReport::default();
         for state in &states {

@@ -628,8 +628,11 @@ mod tests {
             );
         }
         // The default profile injects no reserved module at all.
-        let prepared = prepare(PluginSource::single("main.js", "export const n = 1;"), &limits())
-            .unwrap();
+        let prepared = prepare(
+            PluginSource::single("main.js", "export const n = 1;"),
+            &limits(),
+        )
+        .unwrap();
         assert_eq!(prepared.profile(), CompatibilityProfile::JavaScriptOnly);
         assert_eq!(prepared.entrypoint(), "main.js");
         assert!(prepared.source(WORKER_THREADS_BUILTIN).is_none());
@@ -686,9 +689,10 @@ mod tests {
             );
 
             let mut other = PluginSource::single("main.js", "export const n = 1;");
-            other
-                .modules
-                .insert("__builtin__/evil.js".to_string(), "export const x = 1;".to_string());
+            other.modules.insert(
+                "__builtin__/evil.js".to_string(),
+                "export const x = 1;".to_string(),
+            );
             let rejected = prepare_with_profile(other, &limits(), profile).unwrap_err();
             assert!(matches!(rejected, Error::ModuleDenied { .. }));
 
@@ -722,8 +726,12 @@ mod tests {
             "injected builtin must count against max_modules, got {over:?}"
         );
         // The same graph fits without the injected builtin.
-        assert!(prepare_with_profile(source.clone(), &two_modules, CompatibilityProfile::JavaScriptOnly)
-            .is_ok());
+        assert!(prepare_with_profile(
+            source.clone(),
+            &two_modules,
+            CompatibilityProfile::JavaScriptOnly
+        )
+        .is_ok());
 
         // Builtin bytes count against the graph budget too.
         let guest_bytes: usize = source.modules.values().map(String::len).sum();
@@ -734,8 +742,10 @@ mod tests {
             matches!(&over, Error::LimitExceeded { limit, .. } if limit == "max_graph_bytes"),
             "injected builtin must count against max_graph_bytes, got {over:?}"
         );
-        assert!(prepare_with_profile(source.clone(), &tight, CompatibilityProfile::JavaScriptOnly)
-            .is_ok());
+        assert!(
+            prepare_with_profile(source.clone(), &tight, CompatibilityProfile::JavaScriptOnly)
+                .is_ok()
+        );
 
         // Builtin bytes count against the per-module budget too.
         let mut tiny_module = limits();
@@ -750,22 +760,21 @@ mod tests {
         // Accounting is surfaced in the graph totals.
         let ok = prepare_with_profile(source, &limits(), pure()).unwrap();
         assert_eq!(ok.module_count(), 3);
-        assert_eq!(
-            ok.total_bytes(),
-            guest_bytes + WORKER_THREADS_SOURCE.len()
-        );
+        assert_eq!(ok.total_bytes(), guest_bytes + WORKER_THREADS_SOURCE.len());
     }
 
     #[test]
     fn othernativebuiltinbothdeny() {
         for specifier in ["node:fs", "fs", "node:child_process", "node:vm", "node:ffi"] {
             for profile in [CompatibilityProfile::JavaScriptOnly, pure()] {
-                let source = format!(
-                    "import * as m from '{specifier}'; export const run = () => m;"
-                );
-                let denied =
-                    prepare_with_profile(PluginSource::single("main.js", source), &limits(), profile)
-                        .unwrap_err();
+                let source =
+                    format!("import * as m from '{specifier}'; export const run = () => m;");
+                let denied = prepare_with_profile(
+                    PluginSource::single("main.js", source),
+                    &limits(),
+                    profile,
+                )
+                .unwrap_err();
                 assert!(
                     matches!(denied, Error::ModuleDenied { .. }),
                     "profile {profile:?} must deny {specifier}, got {denied:?}"

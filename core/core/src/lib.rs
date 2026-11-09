@@ -7,6 +7,7 @@ mod backend;
 mod config;
 mod error;
 mod fake;
+mod host;
 mod plugin;
 
 pub use backend::{
@@ -27,3 +28,15 @@ pub const API_VERSION: &str = "0.1.0";
 
 /// Offline host-side module and package preparation.
 pub use denosanbox_modules as modules;
+
+pub use denosanbox_policy as policy;
+pub use denosanbox_policy::{
+    HostRegistry, InvocationContext, Policy, RegisteredCallback, SandboxId,
+};
+pub use host::{HostContext, HostGrant};
+
+mod host_audit;
+mod host_schema;
+pub use host::{CapabilitySchemas, HostConfig};
+pub use host_audit::{AuditEvent, AuditOutcome, HostAudit};
+pub use host_schema::{JsonSchema, SchemaError, SchemaLimits};

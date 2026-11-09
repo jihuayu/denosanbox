@@ -677,7 +677,9 @@ name = "denosanbox-core"
 version = "0.1.0"
 dependencies = [
  "denosanbox-modules",
+ "denosanbox-policy",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

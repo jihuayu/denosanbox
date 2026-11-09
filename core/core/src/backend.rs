@@ -80,7 +80,12 @@ pub trait DriverFactory: Send + Sync {
     fn kind(&self) -> BackendKind;
 
     /// Creates an initializer for one independent runtime.
-    fn create(&self, plugin: PreparedPlugin, options: &SandboxOptions) -> Result<CreatedDriver>;
+    fn create(
+        &self,
+        plugin: PreparedPlugin,
+        options: &SandboxOptions,
+        context: Arc<crate::HostContext>,
+    ) -> Result<CreatedDriver>;
 }
 
 /// A factory for a backend that was not compiled into this build.
@@ -100,7 +105,12 @@ impl DriverFactory for UnavailableFactory {
         self.backend
     }
 
-    fn create(&self, _plugin: PreparedPlugin, _options: &SandboxOptions) -> Result<CreatedDriver> {
+    fn create(
+        &self,
+        _plugin: PreparedPlugin,
+        _options: &SandboxOptions,
+        _context: Arc<crate::HostContext>,
+    ) -> Result<CreatedDriver> {
         Err(Error::RuntimeUnavailable {
             backend: self.backend.as_str().to_string(),
         })

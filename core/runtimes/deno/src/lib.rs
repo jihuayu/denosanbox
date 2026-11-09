@@ -1,5 +1,6 @@
 //! Thread-affine in-process deno_core/V8 backend. No guest operating-system ops.
 use deno_core::error::ModuleLoaderError;
+use deno_core::OpState;
 use deno_core::{
     v8, JsRuntime, ModuleId, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse,
     ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType,
@@ -10,6 +11,7 @@ use denosanbox_core::{
     Invocation, PreparedPlugin, Result, SandboxOptions,
 };
 use serde_json::Value;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -17,8 +19,10 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime};
 
-#[derive(Default)]
 struct Control {
+    host: Arc<denosanbox_core::HostContext>,
+    running: AtomicBool,
+    interrupted: AtomicBool,
     cancelled: AtomicBool,
     timed_out: AtomicBool,
     isolate: Mutex<Option<v8::IsolateHandle>>,
@@ -43,7 +47,11 @@ impl Control {
 }
 impl DriverControl for Control {
     fn cancel(&self) {
+        if self.running.load(Ordering::Acquire) {
+            self.interrupted.store(true, Ordering::Release);
+        }
         self.cancelled.store(true, Ordering::Release);
+        self.host.cancel();
         self.terminate();
     }
     fn is_cancelled(&self) -> bool {
@@ -51,11 +59,14 @@ impl DriverControl for Control {
     }
 }
 struct Watchdog {
+    control: Arc<Control>,
     done: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Watchdog {
     fn new(control: Arc<Control>, timeout: Duration) -> Result<Self> {
+        control.running.store(true, Ordering::Release);
+        let watch_control = control.clone();
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("denosanbox-watchdog".into())
@@ -65,6 +76,7 @@ impl Watchdog {
                     Err(mpsc::RecvTimeoutError::Timeout)
                 ) {
                     control.timed_out.store(true, Ordering::Release);
+                    control.host.cancel();
                     control.terminate();
                 }
             })
@@ -72,6 +84,7 @@ impl Watchdog {
                 message: e.to_string(),
             })?;
         Ok(Self {
+            control: watch_control,
             done: Some(tx),
             thread: Some(thread),
         })
@@ -80,6 +93,7 @@ impl Watchdog {
 impl Drop for Watchdog {
     fn drop(&mut self) {
         self.done.take();
+        self.control.running.store(false, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -97,8 +111,20 @@ impl DriverFactory for DenoFactory {
     fn kind(&self) -> BackendKind {
         BackendKind::Deno
     }
-    fn create(&self, plugin: PreparedPlugin, options: &SandboxOptions) -> Result<CreatedDriver> {
-        let control = Arc::new(Control::default());
+    fn create(
+        &self,
+        plugin: PreparedPlugin,
+        options: &SandboxOptions,
+        context: Arc<denosanbox_core::HostContext>,
+    ) -> Result<CreatedDriver> {
+        let control = Arc::new(Control {
+            host: context.clone(),
+            running: AtomicBool::new(false),
+            interrupted: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
+            isolate: Mutex::new(None),
+        });
         let thread_control = control.clone();
         let options = options.clone();
         Ok(CreatedDriver {
@@ -112,6 +138,7 @@ impl DriverFactory for DenoFactory {
                     })?;
                 let mut runtime = JsRuntime::new(RuntimeOptions {
                     module_loader: Some(Rc::new(GraphLoader(plugin.clone()))),
+                    extensions: vec![sandbox_ops::init(context, thread_control.clone())],
                     create_params: options
                         .memory_limit_bytes
                         .map(|bytes| v8::CreateParams::default().heap_limits(0, bytes)),
@@ -128,6 +155,17 @@ impl DriverFactory for DenoFactory {
                     .execute_script(
                         "sandbox-bootstrap.js",
                         r#"
+                (()=>{
+                  const ops=Deno.core.ops;
+                  const resource=(name,...args)=>ops.op_sandbox_resource(name,args);
+                  const api=Object.freeze({
+                    fs:Object.freeze({readTextFile:async(path)=>resource('read',path),writeTextFile:async(path,data)=>resource('write',path,data)}),
+                    env:Object.freeze({get:(name)=>resource('env_get',name),set:(name,value)=>resource('env_set',name,value)}),
+                    host:Object.freeze({call:(name,input)=>ops.op_sandbox_host(name,input)}),
+                    cwd:()=>resource('cwd'),chdir:(path)=>resource('chdir',path),exit:()=>resource('exit')
+                  });
+                  Object.defineProperty(globalThis,'sandbox',{value:api,writable:false,configurable:false});
+                })();
                 delete globalThis.Deno;
                 delete globalThis.__bootstrap;
                 delete globalThis.SharedArrayBuffer;
@@ -255,6 +293,8 @@ impl Driver for DenoDriver {
         Ok(())
     }
     fn invoke(&mut self, invocation: Invocation) -> Result<Value> {
+        // Deno may eagerly poll an async op while invoking the JS export.
+        let _runtime_guard = self.executor.enter();
         if self.control.is_cancelled() {
             return Err(self.control.error("execution terminated"));
         }
@@ -322,14 +362,102 @@ impl Driver for DenoDriver {
         Ok(output)
     }
     fn close(self: Box<Self>) -> Result<CloseReport> {
-        let report = CloseReport {
+        let mut report = CloseReport {
             invocations_completed: self.completed,
             invocations_cancelled: 0,
-            forced_termination: self.control.is_cancelled(),
+            forced_termination: self.control.interrupted.load(Ordering::Acquire)
+                || self.control.timed_out.load(Ordering::Acquire),
             closed_cleanly: true,
+            pending_host_operations: self.control.host.outstanding(),
         };
+        report.closed_cleanly = report.pending_host_operations == 0;
         *self.control.isolate.lock().unwrap() = None;
         drop(self);
         Ok(report)
     }
 }
+#[deno_core::op2]
+#[serde]
+fn op_sandbox_resource(
+    state: &mut OpState,
+    #[string] action: String,
+    #[serde] input: serde_json::Value,
+) -> std::result::Result<serde_json::Value, ModuleLoaderError> {
+    let context = state.borrow::<Arc<denosanbox_core::HostContext>>().clone();
+    let operation = || -> Result<Value> {
+        if serde_json::to_vec(&input)
+            .map_err(|e| Error::Execution {
+                message: e.to_string(),
+            })?
+            .len()
+            > 1024 * 1024
+        {
+            return Err(Error::LimitExceeded {
+                limit: "resource_message_bytes".into(),
+                detail: "resource request exceeds 1MiB".into(),
+            });
+        }
+        let arg = |index: usize| {
+            input
+                .get(index)
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Execution {
+                    message: "expected string argument".into(),
+                })
+        };
+        match action.as_str() {
+            "read" => {
+                let bytes = context.read(arg(0)?)?;
+                Ok(Value::String(String::from_utf8(bytes).map_err(|_| {
+                    Error::Execution {
+                        message: "file is not UTF-8".into(),
+                    }
+                })?))
+            }
+            "write" => {
+                context.write(arg(0)?, arg(1)?.as_bytes())?;
+                Ok(Value::Null)
+            }
+            "env_get" => Ok(context
+                .env_get(arg(0)?)?
+                .map(Value::String)
+                .unwrap_or(Value::Null)),
+            "env_set" => {
+                context.env_set(arg(0)?, arg(1)?)?;
+                Ok(Value::Null)
+            }
+            "cwd" => Ok(Value::String(context.cwd()?)),
+            "chdir" => {
+                context.set_cwd(arg(0)?)?;
+                Ok(Value::Null)
+            }
+            "exit" => {
+                state.borrow::<Arc<Control>>().cancel();
+                Err(Error::Cancelled)
+            }
+            _ => Err(Error::UnsupportedFeature { feature: action }),
+        }
+    };
+    operation().map_err(|e| ModuleLoaderError::generic(e.to_string()))
+}
+#[deno_core::op2]
+#[serde]
+async fn op_sandbox_host(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[serde] input: serde_json::Value,
+) -> std::result::Result<serde_json::Value, ModuleLoaderError> {
+    let context = state
+        .borrow()
+        .borrow::<Arc<denosanbox_core::HostContext>>()
+        .clone();
+    context
+        .call(name, input)
+        .await
+        .map_err(|e| ModuleLoaderError::generic(e.to_string()))
+}
+deno_core::extension!(sandbox_ops,
+    ops=[op_sandbox_resource,op_sandbox_host],
+    options={context:Arc<denosanbox_core::HostContext>,control:Arc<Control>},
+    state=|state,options|{state.put(options.context);state.put(options.control);}
+);

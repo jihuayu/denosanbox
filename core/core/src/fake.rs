@@ -48,7 +48,12 @@ impl DriverFactory for FakeFactory {
         BackendKind::Fake
     }
 
-    fn create(&self, plugin: PreparedPlugin, _options: &SandboxOptions) -> Result<CreatedDriver> {
+    fn create(
+        &self,
+        plugin: PreparedPlugin,
+        _options: &SandboxOptions,
+        _context: Arc<crate::HostContext>,
+    ) -> Result<CreatedDriver> {
         let control = Arc::new(FakeControl::default());
         let driver_control: Arc<dyn DriverControl> = control.clone();
         let init_control = control;
@@ -160,6 +165,7 @@ impl Driver for FakeDriver {
             invocations_cancelled: self.cancelled,
             forced_termination: self.control.is_cancelled(),
             closed_cleanly: true,
+            pending_host_operations: 0,
         })
     }
 }

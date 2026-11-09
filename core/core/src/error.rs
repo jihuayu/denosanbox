@@ -60,6 +60,8 @@ pub enum Error {
     },
     /// The sandbox or engine has already been closed.
     Closed,
+    /// An operation was denied by the trusted policy.
+    Policy { kind: String, message: String },
     /// The invocation was cancelled by `SandboxHandle::cancel` or engine close.
     Cancelled,
     /// An absolute invocation deadline elapsed.
@@ -99,6 +101,7 @@ impl Error {
             Self::LimitExceeded { .. } => "limit_exceeded",
             Self::QueueFull { .. } => "queue_full",
             Self::Closed => "closed",
+            Self::Policy { .. } => "policy",
             Self::Cancelled => "cancelled",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Execution { .. } => "execution",
@@ -148,6 +151,7 @@ impl fmt::Display for Error {
                 write!(f, "sandbox call queue is full (capacity {capacity})")
             }
             Self::Closed => write!(f, "sandbox or engine is closed"),
+            Self::Policy { kind, message } => write!(f, "{kind}: {message}"),
             Self::Cancelled => write!(f, "invocation cancelled"),
             Self::DeadlineExceeded => write!(f, "invocation deadline exceeded"),
             Self::Execution { message } => write!(f, "guest execution failed: {message}"),

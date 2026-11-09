@@ -154,7 +154,11 @@ pub struct SandboxOptions {
     /// Optional memory limit hint forwarded to the backend.
     pub memory_limit_bytes: Option<usize>,
     /// Opaque host policy decisions; never interpreted as allow-all defaults.
-    pub policy: std::collections::BTreeMap<String, String>,
+    pub policy: crate::Policy,
+    /// Fixed ceiling for child permission delegation.
+    pub delegation: crate::Policy,
+    /// Explicit scoped callbacks available to this sandbox.
+    pub host_grants: Vec<crate::HostGrant>,
 }
 
 impl SandboxOptions {
@@ -191,6 +195,8 @@ pub struct CloseReport {
     pub forced_termination: bool,
     /// Whether the worker thread joined cleanly.
     pub closed_cleanly: bool,
+    /// Native callback operations still holding ownership after close.
+    pub pending_host_operations: usize,
 }
 
 /// Report returned by `Engine::shutdown`.

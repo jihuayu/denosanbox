@@ -18,3 +18,15 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Offline host-side module and package preparation.
 pub use denosanbox_core::modules;
+
+pub use denosanbox_core::{
+    policy, HostGrant, HostRegistry, InvocationContext, Policy, RegisteredCallback, SandboxId,
+};
+
+mod workers;
+pub use workers::{WorkerHandle, WorkerOptions};
+
+pub use denosanbox_core::{
+    AuditEvent, AuditOutcome, CapabilitySchemas, HostAudit, HostConfig, JsonSchema, SchemaError,
+    SchemaLimits,
+};

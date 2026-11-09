@@ -5,8 +5,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use denosanbox_core::{
     BackendKind, CloseReport, CreatedDriver, Driver, DriverControl, DriverFactory, EngineConfig,
-    EngineLimits, Error, FakeFactory, Invocation, InvocationOptions, PluginSource, PreparedPlugin,
-    Result, SandboxOptions, ShutdownReport,
+    EngineLimits, Error, FakeFactory, HostContext, HostRegistry, Invocation, InvocationContext,
+    InvocationOptions, PluginSource, Policy, PreparedPlugin, RegisteredCallback, Result,
+    SandboxOptions, ShutdownReport,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -26,6 +27,9 @@ struct EngineInner {
     active: AtomicUsize,
     shutting_down: AtomicBool,
     workers: Mutex<Vec<Weak<WorkerState>>>,
+    hosts: Arc<Mutex<HostRegistry>>,
+    ceiling: Policy,
+    host_config: denosanbox_core::HostConfig,
 }
 
 impl std::fmt::Debug for Engine {
@@ -49,6 +53,10 @@ impl std::fmt::Debug for SandboxHandle {
 impl Engine {
     /// Creates an engine from validated configuration.
     pub fn new(config: EngineConfig) -> Result<Self> {
+        Self::with_policy(config, Policy::default())
+    }
+    /// Construct with a fixed host authorization ceiling.
+    pub fn with_policy(config: EngineConfig, ceiling: Policy) -> Result<Self> {
         config.validate()?;
         let factory: Arc<dyn DriverFactory> = match config.backend {
             BackendKind::Fake => Arc::new(FakeFactory::new()),
@@ -72,10 +80,48 @@ impl Engine {
                 active: AtomicUsize::new(0),
                 shutting_down: AtomicBool::new(false),
                 workers: Mutex::new(Vec::new()),
+                hosts: Arc::new(Mutex::new(HostRegistry::default())),
+                ceiling,
+                host_config: denosanbox_core::HostConfig::default(),
             }),
         })
     }
 
+    /// Register a scoped synchronous host callback. It runs outside the isolate thread.
+    pub fn register_host(
+        &self,
+        name: &str,
+        input_limit: usize,
+        output_limit: usize,
+        callback: impl denosanbox_core::policy::Callback + 'static,
+    ) -> Result<RegisteredCallback> {
+        self.inner
+            .hosts
+            .lock()
+            .unwrap()
+            .register(name, input_limit, output_limit, callback)
+            .map_err(map_policy)
+    }
+    /// Register an asynchronous host callback without holding the registry lock.
+    pub fn register_host_async<F, Fut>(
+        &self,
+        name: &str,
+        input_limit: usize,
+        output_limit: usize,
+        callback: F,
+    ) -> Result<RegisteredCallback>
+    where
+        F: Fn(InvocationContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut:
+            std::future::Future<Output = denosanbox_core::policy::Result<Vec<u8>>> + Send + 'static,
+    {
+        self.inner
+            .hosts
+            .lock()
+            .unwrap()
+            .register_async(name, input_limit, output_limit, callback)
+            .map_err(map_policy)
+    }
     /// Backend selected for this engine.
     pub fn backend(&self) -> BackendKind {
         self.inner.factory.kind()
@@ -105,12 +151,80 @@ impl Engine {
         plugin: PreparedPlugin,
         options: SandboxOptions,
     ) -> Result<SandboxHandle> {
+        self.create_inner(plugin, options, None).await
+    }
+    /// Create a registered child using the parent's fixed authorization ceiling.
+    pub async fn create_child(
+        &self,
+        parent: &SandboxHandle,
+        plugin: PreparedPlugin,
+        mut options: SandboxOptions,
+    ) -> Result<SandboxHandle> {
+        if parent.state.closed_for_calls.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        if !parent
+            .state
+            .engine
+            .upgrade()
+            .is_some_and(|engine| Arc::ptr_eq(&engine, &self.inner))
+        {
+            return Err(Error::Policy {
+                kind: "Denied".into(),
+                message: "parent belongs to another Engine".into(),
+            });
+        }
+        if parent.depth() >= 4 {
+            return Err(Error::LimitExceeded {
+                limit: "worker_depth".into(),
+                detail: "maximum Worker depth is four".into(),
+            });
+        }
+        for (name, source) in plugin.iter_modules() {
+            if parent.state.prepared.source(name) != Some(source) {
+                return Err(Error::ModuleDenied {
+                    specifier: name.into(),
+                    reason: "child source is outside parent package view".into(),
+                });
+            }
+        }
+        options.policy = Policy::child(
+            &self.inner.ceiling,
+            &parent.state.host.policy(),
+            &parent.state.delegation,
+            &options.policy,
+        )
+        .map_err(map_policy)?;
+        for grant in &options.host_grants {
+            if !parent.state.host_grants.contains(grant) {
+                return Err(Error::Policy {
+                    kind: "Denied".into(),
+                    message: "child callback scope exceeds parent grant".into(),
+                });
+            }
+        }
+        self.create_inner(plugin, options, Some(parent)).await
+    }
+    async fn create_inner(
+        &self,
+        plugin: PreparedPlugin,
+        mut options: SandboxOptions,
+        parent: Option<&SandboxHandle>,
+    ) -> Result<SandboxHandle> {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(Error::Closed);
         }
         let default_timeout = options
             .default_invocation_timeout
             .unwrap_or(self.inner.config.limits.default_invocation_timeout);
+        let default_timeout = default_timeout.min(options.policy.limits().deadline());
+        let expires = (Instant::now() + default_timeout).min(
+            parent
+                .map(|p| p.state.expires)
+                .unwrap_or(Instant::now() + default_timeout),
+        );
+        let default_timeout = expires.saturating_duration_since(Instant::now());
+        options.default_invocation_timeout = Some(default_timeout);
         if default_timeout < MIN_CALL_TIMEOUT {
             return Err(Error::InvalidConfiguration {
                 reason: "sandbox default timeout must be at least 1ms".to_string(),
@@ -133,8 +247,47 @@ impl Engine {
             }
         }
 
-        let guard = ActiveGuard::reserve(self.inner.clone())?;
-        let CreatedDriver { init, control } = self.inner.factory.create(plugin, &options)?;
+        options.policy = self
+            .inner
+            .ceiling
+            .narrow(&options.policy)
+            .map_err(map_policy)?;
+        options.memory_limit_bytes = Some(
+            options
+                .memory_limit_bytes
+                .unwrap_or(options.policy.limits().heap_target_bytes())
+                .min(options.policy.limits().heap_target_bytes()),
+        );
+        let subtree_budget = parent
+            .map(|p| {
+                p.state
+                    .subtree_budget
+                    .child(options.policy.limits().max_sandboxes() as u64)
+            })
+            .unwrap_or_else(|| {
+                denosanbox_core::policy::Budget::new(options.policy.limits().max_sandboxes() as u64)
+            });
+        let tree_lease = subtree_budget
+            .reserve(1)
+            .map_err(|_| Error::LimitExceeded {
+                limit: "subtree_sandboxes".into(),
+                detail: "ancestor sandbox count exhausted".into(),
+            })?;
+        let mut guard = ActiveGuard::reserve(self.inner.clone())?;
+        guard.tree_lease = Some(tree_lease);
+        let host_config = parent
+            .map(|p| p.state.host.host_config())
+            .unwrap_or_else(|| self.inner.host_config.clone());
+        let host = HostContext::new_with_config(
+            options.policy.clone(),
+            self.inner.hosts.clone(),
+            options.host_grants.clone(),
+            host_config,
+        )?;
+        host.begin_invocation(default_timeout)?;
+        let prepared = plugin.clone();
+        let CreatedDriver { init, control } =
+            self.inner.factory.create(plugin, &options, host.clone())?;
 
         let capacity = self.inner.config.limits.max_pending_invocations;
         let (sender, receiver) = mpsc::channel(capacity);
@@ -142,6 +295,15 @@ impl Engine {
         let state = Arc::new(WorkerState {
             sender,
             control,
+            host,
+            prepared,
+            delegation: options.delegation,
+            host_grants: options.host_grants,
+            engine: Arc::downgrade(&self.inner),
+            children: Mutex::new(Vec::new()),
+            depth: parent.map(|p| p.depth() + 1).unwrap_or(0),
+            expires,
+            subtree_budget,
             close_requested: AtomicBool::new(false),
             closed_for_calls: AtomicBool::new(false),
             in_flight: AtomicBool::new(false),
@@ -155,6 +317,14 @@ impl Engine {
             handles: AtomicUsize::new(1),
         });
 
+        if let Some(parent) = parent {
+            let mut children = parent.state.children.lock().unwrap();
+            if parent.state.closed_for_calls.load(Ordering::Acquire) {
+                return Err(Error::Closed);
+            }
+            children.retain(|child| child.strong_count() > 0);
+            children.push(Arc::downgrade(&state));
+        }
         let thread_state = state.clone();
         let join = std::thread::Builder::new()
             .name("denosanbox-worker".to_string())
@@ -166,7 +336,11 @@ impl Engine {
 
         {
             let mut workers = self.inner.workers.lock().expect("worker registry poisoned");
-            workers.retain(|worker| worker.strong_count() > 0);
+            workers.retain(|worker| {
+                worker
+                    .upgrade()
+                    .is_some_and(|state| !state.joined.load(Ordering::Acquire))
+            });
             workers.push(Arc::downgrade(&state));
         }
         let mut startup_guard = StartupGuard(Some(state.clone()));
@@ -195,7 +369,9 @@ impl Engine {
                 }
             },
         }
-        if self.inner.shutting_down.load(Ordering::SeqCst) {
+        if self.inner.shutting_down.load(Ordering::SeqCst)
+            || state.closed_for_calls.load(Ordering::Acquire)
+        {
             state.request_close();
             let _ = state.close_report().await;
             return Err(Error::Closed);
@@ -251,6 +427,22 @@ pub struct SandboxHandle {
 }
 
 impl SandboxHandle {
+    /// Immutable prepared graph used to create this sandbox.
+    pub fn prepared_plugin(&self) -> PreparedPlugin {
+        self.state.prepared.clone()
+    }
+    /// Zero for roots; each registered child increments the depth.
+    pub fn depth(&self) -> usize {
+        self.state.depth
+    }
+    /// Host-minted identity. Guest input never controls this value.
+    pub fn id(&self) -> denosanbox_core::SandboxId {
+        self.state.host.id()
+    }
+    /// Narrow subsequent policy checks; expansion is rejected.
+    pub fn narrow_policy(&self, policy: &Policy) -> Result<()> {
+        self.state.host.narrow_policy(policy)
+    }
     /// Calls a named ESM export with a JSON input value.
     pub async fn call(
         &self,
@@ -283,11 +475,19 @@ impl SandboxHandle {
                 ),
             });
         }
-        let relative_deadline = now + requested_timeout;
+        let relative_deadline =
+            now.checked_add(requested_timeout)
+                .ok_or_else(|| Error::InvalidConfiguration {
+                    reason: "invocation timeout overflows monotonic clock".into(),
+                })?;
         let deadline = match options.deadline {
             Some(absolute) => {
                 let absolute_instant = match absolute.duration_since(SystemTime::now()) {
-                    Ok(remaining) => Instant::now() + remaining,
+                    Ok(remaining) => Instant::now().checked_add(remaining).ok_or_else(|| {
+                        Error::InvalidConfiguration {
+                            reason: "invocation deadline overflows monotonic clock".into(),
+                        }
+                    })?,
                     Err(_) => {
                         return Err(Error::DeadlineExceeded);
                     }
@@ -296,6 +496,7 @@ impl SandboxHandle {
             }
             None => relative_deadline,
         };
+        let deadline = deadline.min(self.state.expires);
         if deadline <= Instant::now() {
             return Err(Error::DeadlineExceeded);
         }
@@ -391,17 +592,40 @@ impl Drop for WorkerLifetime {
         }
         drop(report);
         self.0.closed_for_calls.store(true, Ordering::Release);
-        self.0
+        if let Some(guard) = self
+            .0
             .active
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .take();
+            .take()
+        {
+            if self.0.host.outstanding() == 0 {
+                drop(guard);
+            } else {
+                let lease = Arc::new(Mutex::new(Some(guard)));
+                let retained = lease.clone();
+                let host = self.0.host.clone();
+                if std::thread::Builder::new()
+                    .name("denosanbox-accounting".into())
+                    .spawn(move || {
+                        while host.outstanding() != 0 {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        retained.lock().unwrap().take();
+                    })
+                    .is_err()
+                {
+                    std::mem::forget(lease);
+                }
+            }
+        }
         self.0.finished.notify_waiters();
     }
 }
 
 struct ActiveGuard {
     engine: Arc<EngineInner>,
+    tree_lease: Option<denosanbox_core::policy::Lease>,
 }
 
 impl ActiveGuard {
@@ -420,7 +644,10 @@ impl ActiveGuard {
                 .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return Ok(Self { engine });
+                return Ok(Self {
+                    engine,
+                    tree_lease: None,
+                });
             }
         }
     }
@@ -445,6 +672,15 @@ struct CallJob {
 struct WorkerState {
     sender: mpsc::Sender<WorkerMsg>,
     control: Arc<dyn DriverControl>,
+    host: Arc<HostContext>,
+    prepared: PreparedPlugin,
+    delegation: Policy,
+    host_grants: Vec<denosanbox_core::HostGrant>,
+    engine: Weak<EngineInner>,
+    children: Mutex<Vec<Weak<WorkerState>>>,
+    depth: usize,
+    expires: Instant,
+    subtree_budget: Arc<denosanbox_core::policy::Budget>,
     close_requested: AtomicBool,
     closed_for_calls: AtomicBool,
     in_flight: AtomicBool,
@@ -463,51 +699,81 @@ impl WorkerState {
         if !self.close_requested.swap(true, Ordering::SeqCst) {
             self.closed_for_calls.store(true, Ordering::SeqCst);
             self.control.cancel();
+            self.host.cancel();
+            for child in self
+                .children
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(Weak::upgrade)
+            {
+                child.request_close();
+            }
             let _ = self.sender.try_send(WorkerMsg::Close);
         }
     }
 
-    async fn close_report(&self) -> CloseReport {
-        let handle = self.join.lock().expect("join mutex poisoned").take();
-        if let Some(handle) = handle {
-            let joined = self.joined.clone();
-            let finished = self.finished.clone();
-            // Native reaping cannot pin the async host runtime's blocking pool.
-            let _ = std::thread::Builder::new()
-                .name("denosanbox-reaper".into())
-                .spawn(move || {
-                    let _ = handle.join();
-                    joined.store(true, Ordering::Release);
-                    finished.notify_waiters();
+    fn close_report(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CloseReport> + Send + '_>> {
+        Box::pin(async move {
+            let handle = self.join.lock().expect("join mutex poisoned").take();
+            if let Some(handle) = handle {
+                let joined = self.joined.clone();
+                let finished = self.finished.clone();
+                // Native reaping cannot pin the async host runtime's blocking pool.
+                let _ = std::thread::Builder::new()
+                    .name("denosanbox-reaper".into())
+                    .spawn(move || {
+                        let _ = handle.join();
+                        joined.store(true, Ordering::Release);
+                        finished.notify_waiters();
+                    });
+            }
+            let expires = tokio::time::Instant::now() + JOIN_GRACE;
+            loop {
+                let notified = self.finished.notified();
+                if self.joined.load(Ordering::Acquire) {
+                    break;
+                }
+                if tokio::time::timeout_at(expires, notified).await.is_err() {
+                    break;
+                }
+            }
+            let joined = self.joined.load(Ordering::Acquire);
+            let mut report = self
+                .report
+                .lock()
+                .expect("report mutex poisoned")
+                .clone()
+                .unwrap_or_else(|| CloseReport {
+                    invocations_completed: self.completed.load(Ordering::SeqCst),
+                    invocations_cancelled: self.cancelled.load(Ordering::SeqCst),
+                    forced_termination: self.control.is_cancelled(),
+                    closed_cleanly: false,
+                    pending_host_operations: self.host.outstanding(),
                 });
-        }
-        let expires = tokio::time::Instant::now() + JOIN_GRACE;
-        loop {
-            let notified = self.finished.notified();
-            if self.joined.load(Ordering::Acquire) {
-                break;
+            if !joined {
+                report.closed_cleanly = false;
+                report.forced_termination = true;
             }
-            if tokio::time::timeout_at(expires, notified).await.is_err() {
-                break;
+            report.pending_host_operations = self.host.outstanding();
+            let children: Vec<_> = self
+                .children
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect();
+            for child in children {
+                child.request_close();
+                let closed = child.close_report().await;
+                report.closed_cleanly &= closed.closed_cleanly;
+                report.pending_host_operations += closed.pending_host_operations;
             }
-        }
-        let joined = self.joined.load(Ordering::Acquire);
-        let mut report = self
-            .report
-            .lock()
-            .expect("report mutex poisoned")
-            .clone()
-            .unwrap_or_else(|| CloseReport {
-                invocations_completed: self.completed.load(Ordering::SeqCst),
-                invocations_cancelled: self.cancelled.load(Ordering::SeqCst),
-                forced_termination: self.control.is_cancelled(),
-                closed_cleanly: false,
-            });
-        if !joined {
-            report.closed_cleanly = false;
-            report.forced_termination = true;
-        }
-        report
+            report.closed_cleanly &= report.pending_host_operations == 0;
+            report
+        })
     }
 }
 
@@ -526,7 +792,7 @@ fn worker_loop(
                 closed_cleanly: true,
                 ..CloseReport::default()
             });
-            state.active.lock().unwrap().take();
+
             state.finished.notify_waiters();
             return;
         }
@@ -540,7 +806,7 @@ fn worker_loop(
             ..CloseReport::default()
         });
         *state.report.lock().expect("report mutex poisoned") = Some(report);
-        state.active.lock().unwrap().take();
+
         state.finished.notify_waiters();
         return;
     }
@@ -565,7 +831,15 @@ fn worker_loop(
                 if state.close_requested.load(Ordering::SeqCst) {
                     state.control.cancel();
                 }
-                let result = driver.invoke(job.invocation);
+                let duration = job
+                    .invocation
+                    .deadline
+                    .and_then(|d| d.duration_since(SystemTime::now()).ok())
+                    .unwrap_or(Duration::ZERO);
+                let result = state
+                    .host
+                    .begin_invocation(duration)
+                    .and_then(|_| driver.invoke(job.invocation));
                 state.in_flight.store(false, Ordering::SeqCst);
                 match &result {
                     Ok(_) => {
@@ -596,10 +870,18 @@ fn worker_loop(
         invocations_cancelled: state.cancelled.load(Ordering::SeqCst),
         forced_termination: state.control.is_cancelled(),
         closed_cleanly: false,
+        pending_host_operations: state.host.outstanding(),
     });
     *state.report.lock().expect("report mutex poisoned") = Some(report);
-    state.active.lock().unwrap().take();
+
     state.finished.notify_waiters();
+}
+
+fn map_policy(error: denosanbox_core::policy::Error) -> Error {
+    Error::Policy {
+        kind: format!("{:?}", error.kind()),
+        message: format!("sandbox policy: {:?}", error.kind()),
+    }
 }
 
 fn validate_export_name(export: &str) -> Result<()> {

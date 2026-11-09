@@ -19,6 +19,9 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_LOG_BYTES: usize = 64 * 1024;
 /// Default JS heap target in bytes (64 MiB). A target, not a hard limit.
 pub const DEFAULT_HEAP_TARGET_BYTES: usize = 64 * 1024 * 1024;
+/// Aggregate managed-memory accounting for a sandbox and its descendants.
+/// This includes reserved JS heap targets plus tracked VFS buffers, not process RSS.
+pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// A bundle of numeric runtime limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,6 +32,7 @@ pub struct Limits {
     max_message_bytes: usize,
     max_log_bytes: usize,
     heap_target_bytes: usize,
+    memory_budget_bytes: usize,
 }
 
 impl Default for Limits {
@@ -40,6 +44,7 @@ impl Default for Limits {
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             max_log_bytes: DEFAULT_MAX_LOG_BYTES,
             heap_target_bytes: DEFAULT_HEAP_TARGET_BYTES,
+            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
         }
     }
 }
@@ -74,6 +79,19 @@ impl Limits {
     #[must_use]
     pub fn heap_target_bytes(&self) -> usize {
         self.heap_target_bytes
+    }
+
+    /// Aggregate managed-memory ceiling for this sandbox's entire subtree.
+    #[must_use]
+    pub fn memory_budget_bytes(&self) -> usize {
+        self.memory_budget_bytes
+    }
+    /// Set the subtree managed-memory ceiling, independently of this isolate's
+    /// own JS heap target. Actual reservations still charge every ancestor.
+    #[must_use]
+    pub fn with_memory_budget_bytes(mut self, n: usize) -> Self {
+        self.memory_budget_bytes = n.max(1);
+        self
     }
 
     /// Builder helper.
@@ -124,6 +142,7 @@ impl Limits {
             max_message_bytes: self.max_message_bytes.min(other.max_message_bytes),
             max_log_bytes: self.max_log_bytes.min(other.max_log_bytes),
             heap_target_bytes: self.heap_target_bytes.min(other.heap_target_bytes),
+            memory_budget_bytes: self.memory_budget_bytes.min(other.memory_budget_bytes),
         }
     }
 }
@@ -141,6 +160,7 @@ mod tests {
         assert_eq!(l.max_message_bytes(), 1024 * 1024);
         assert_eq!(l.max_log_bytes(), 64 * 1024);
         assert_eq!(l.heap_target_bytes(), 64 * 1024 * 1024);
+        assert_eq!(l.memory_budget_bytes(), 256 * 1024 * 1024);
     }
 
     #[test]
@@ -154,5 +174,17 @@ mod tests {
         assert_eq!(n.deadline(), Duration::from_secs(5));
         assert_eq!(n.max_message_bytes(), a.max_message_bytes());
         assert_eq!(n.narrow(a), n);
+    }
+    #[test]
+    fn subtree_memory_is_distinct_from_own_heap_and_cannot_widen() {
+        let defaults = Limits::default();
+        let parent = defaults.with_memory_budget_bytes(128 * 1024 * 1024);
+        assert_eq!(parent.heap_target_bytes(), 64 * 1024 * 1024);
+        assert_eq!(parent.memory_budget_bytes(), 128 * 1024 * 1024);
+        assert_eq!(parent.narrow(defaults), parent);
+        assert_eq!(defaults.narrow(parent), parent);
+        let parent_policy = crate::Policy::default().with_limits(parent);
+        assert!(parent_policy.is_subset_of(&crate::Policy::default()));
+        assert!(!crate::Policy::default().is_subset_of(&parent_policy));
     }
 }

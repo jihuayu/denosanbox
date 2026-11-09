@@ -37,3 +37,12 @@ They omit arguments, results, environment values, business scope and callback
 error text. Unregistered guest names become the fixed `<ungranted>` tag. Audit
 storage has a fixed record cap and never calls an application logging hook from
 the supervisor path.
+
+`Limits::heap_target_bytes` is the current isolate's own JS heap target (64 MiB
+by default). `Limits::memory_budget_bytes` independently limits accounting for
+its entire subtree (256 MiB by default). The engine reserves each isolate's heap
+target from that subtree pool before allocating V8; managed VFS allocations use
+the same pool. Children charge every ancestor. Four 64 MiB heap reservations
+exhaust a 256 MiB pool, so external buffers require additional headroom and can
+produce typed capacity rejection. These are controlled/reserved allocations,
+not a process-RSS guarantee or a measured capacity claim.

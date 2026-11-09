@@ -201,7 +201,7 @@ impl HostContext {
             .child(limits.queue_depth().min(32) as u64);
         let memory_budget = config
             .memory_budget
-            .child(limits.heap_target_bytes() as u64);
+            .child(limits.memory_budget_bytes() as u64);
         Ok(Arc::new(Self {
             id,
             view: Mutex::new(ResourceView::new(id, policy, view_limits)),
@@ -1216,5 +1216,40 @@ mod tests {
             drop(context);
             assert_eq!(registry.lock().unwrap().retired_owners(), 0);
         }
+    }
+    #[test]
+    fn own_heap_reservations_share_distinct_subtree_memory_pool() {
+        const MIB: u64 = 1024 * 1024;
+        let registry = Arc::new(Mutex::new(HostRegistry::default()));
+        let config = HostConfig::default();
+        let global = config.memory_budget.clone();
+        let parent =
+            HostContext::new_with_config(Policy::default(), registry.clone(), vec![], config)
+                .unwrap();
+        // These are accounting reservations made by the engine before V8
+        // allocation; this test makes no claim about actual measured RSS.
+        let own = parent.memory_budget().reserve(64 * MIB).unwrap();
+        let mut children = Vec::new();
+        let mut reservations = Vec::new();
+        for _ in 0..3 {
+            let child = HostContext::new_with_config(
+                Policy::default(),
+                registry.clone(),
+                vec![],
+                parent.host_config(),
+            )
+            .unwrap();
+            reservations.push(child.memory_budget().reserve(64 * MIB).unwrap());
+            children.push(child);
+        }
+        assert_eq!(global.used(), 256 * MIB);
+        assert!(parent.memory_budget().reserve(1).is_err());
+        reservations.pop();
+        assert_eq!(global.used(), 192 * MIB);
+        drop(reservations);
+        drop(children);
+        assert_eq!(global.used(), 64 * MIB);
+        drop(own);
+        assert_eq!(global.used(), 0);
     }
 }

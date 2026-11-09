@@ -149,7 +149,8 @@ impl Engine {
             cancelled: AtomicU64::new(0),
             join: Mutex::new(None),
             report: Mutex::new(None),
-            finished: tokio::sync::Notify::new(),
+            finished: Arc::new(tokio::sync::Notify::new()),
+            joined: Arc::new(AtomicBool::new(false)),
             active: Mutex::new(Some(guard)),
             handles: AtomicUsize::new(1),
         });
@@ -163,11 +164,12 @@ impl Engine {
             })?;
         *state.join.lock().expect("join mutex poisoned") = Some(join);
 
-        self.inner
-            .workers
-            .lock()
-            .expect("worker registry poisoned")
-            .push(Arc::downgrade(&state));
+        {
+            let mut workers = self.inner.workers.lock().expect("worker registry poisoned");
+            workers.retain(|worker| worker.strong_count() > 0);
+            workers.push(Arc::downgrade(&state));
+        }
+        let mut startup_guard = StartupGuard(Some(state.clone()));
 
         let startup_deadline = tokio::time::Instant::now() + default_timeout;
         let startup_result = tokio::time::timeout_at(startup_deadline, start_rx).await;
@@ -198,6 +200,7 @@ impl Engine {
             let _ = state.close_report().await;
             return Err(Error::Closed);
         }
+        startup_guard.0.take();
         Ok(SandboxHandle {
             state,
             limits: self.inner.config.limits.clone(),
@@ -207,7 +210,7 @@ impl Engine {
 
     /// Closes every sandbox owned by this engine.
     ///
-    /// Joining happens in `spawn_blocking`, never on the async executor.
+    /// Joining happens on native reaper threads, never on the async executor.
     pub async fn shutdown(&self) -> Result<ShutdownReport> {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
 
@@ -367,6 +370,36 @@ impl Drop for SandboxHandle {
     }
 }
 
+struct StartupGuard(Option<Arc<WorkerState>>);
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.take() {
+            state.request_close();
+        }
+    }
+}
+
+struct WorkerLifetime(Arc<WorkerState>);
+impl Drop for WorkerLifetime {
+    fn drop(&mut self) {
+        let mut report = self.0.report.lock().unwrap_or_else(|err| err.into_inner());
+        if report.is_none() {
+            *report = Some(CloseReport {
+                closed_cleanly: false,
+                ..CloseReport::default()
+            });
+        }
+        drop(report);
+        self.0.closed_for_calls.store(true, Ordering::Release);
+        self.0
+            .active
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        self.0.finished.notify_waiters();
+    }
+}
+
 struct ActiveGuard {
     engine: Arc<EngineInner>,
 }
@@ -419,7 +452,8 @@ struct WorkerState {
     cancelled: AtomicU64,
     join: Mutex<Option<JoinHandle<()>>>,
     report: Mutex<Option<CloseReport>>,
-    finished: tokio::sync::Notify,
+    finished: Arc<tokio::sync::Notify>,
+    joined: Arc<AtomicBool>,
     active: Mutex<Option<ActiveGuard>>,
     handles: AtomicUsize,
 }
@@ -435,27 +469,29 @@ impl WorkerState {
 
     async fn close_report(&self) -> CloseReport {
         let handle = self.join.lock().expect("join mutex poisoned").take();
-        let mut joined = true;
         if let Some(handle) = handle {
-            let join = tokio::task::spawn_blocking(move || {
-                let _ = handle.join();
-            });
-            match tokio::time::timeout(JOIN_GRACE, join).await {
-                Ok(_) => {}
-                Err(_) => joined = false,
+            let joined = self.joined.clone();
+            let finished = self.finished.clone();
+            // Native reaping cannot pin the async host runtime's blocking pool.
+            let _ = std::thread::Builder::new()
+                .name("denosanbox-reaper".into())
+                .spawn(move || {
+                    let _ = handle.join();
+                    joined.store(true, Ordering::Release);
+                    finished.notify_waiters();
+                });
+        }
+        let expires = tokio::time::Instant::now() + JOIN_GRACE;
+        loop {
+            let notified = self.finished.notified();
+            if self.joined.load(Ordering::Acquire) {
+                break;
+            }
+            if tokio::time::timeout_at(expires, notified).await.is_err() {
+                break;
             }
         }
-        if joined {
-            // The worker publishes the report before exiting. Wait briefly if the
-            // join completed through another concurrent close call.
-            for _ in 0..50 {
-                if self.report.lock().expect("report mutex poisoned").is_some() {
-                    break;
-                }
-                let _ =
-                    tokio::time::timeout(Duration::from_millis(2), self.finished.notified()).await;
-            }
-        }
+        let joined = self.joined.load(Ordering::Acquire);
         let mut report = self
             .report
             .lock()
@@ -481,6 +517,7 @@ fn worker_loop(
     state: Arc<WorkerState>,
     startup: oneshot::Sender<Result<()>>,
 ) {
+    let _lifetime = WorkerLifetime(state.clone());
     let mut driver = match init() {
         Ok(driver) => driver,
         Err(err) => {

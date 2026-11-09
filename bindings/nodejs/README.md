@@ -88,7 +88,13 @@ freezes a host-supplied graph; static imports, re-exports, computed dynamic
 imports and a guest `new Worker('./worker.js', {type: 'module'})` graph
 resolve only inside it. `profile` is explicit: `'javascript-only'` (default) or
 `'pure-js-npm'` (host-prepared vendored package graph plus the trusted
-`worker_threads` alias). No profile grants VFS/env/network/callback access.
+`worker_threads` alias). The validated profile is stored on the
+`PreparedPlugin` and passed through `create` to the facade
+`Engine::prepare_with_profile`; an unknown profile name is rejected and is
+never silently downgraded to `javascript-only`. No profile grants
+VFS/env/network/callback access. The tests create the `pure-js-npm` sandbox and
+call an exported function that uses an imported `worker_threads` alias, and
+confirm the default `javascript-only` graph still denies that alias.
 
 `new Engine(options)` also exposes the facade hard limits (`EngineLimits`),
 enforced on every `create`, including a `PreparedPlugin` prepared by a

@@ -38,7 +38,7 @@ test('prepareModules runs static, dynamic and TypeScript module graphs', async (
   } finally { assert.equal(await engine.shutdown(), true); }
 });
 
-test('prepareModules reports typed graph errors instead of rewriting the graph', () => {
+test('prepareModules reports typed graph errors instead of rewriting the graph', async () => {
   const engine = new Engine();
   try {
     assert.throws(() => engine.prepareModules({'main.js': "import './missing.js';"}, 'main.js'),
@@ -52,11 +52,16 @@ test('prepareModules reports typed graph errors instead of rewriting the graph',
     assert.throws(() => engine.prepareModules({'main.js': 'export {};'}, 'main.js', 'everything'),
       e => e instanceof RangeError && /invalid_configuration/.test(e.message));
     // The trusted worker_threads alias exists only under pure-js-npm.
-    assert.throws(
-      () => engine.prepareModules({'main.js': "import {Worker} from 'node:worker_threads'; export {Worker};"}, 'main.js'),
+    const aliasGraph = {'main.js': "import {Worker} from 'node:worker_threads'; export function kind(){ return typeof Worker; }"};
+    assert.throws(() => engine.prepareModules(aliasGraph, 'main.js'),
       e => e instanceof SandboxError && e.kind === 'module_denied');
-    const pure = engine.prepareModules({'main.js': "import {Worker} from 'node:worker_threads'; export function kind(){ return typeof Worker; }"}, 'main.js', 'pure-js-npm');
+    const pure = engine.prepareModules(aliasGraph, 'main.js', 'pure-js-npm');
     assert.equal(pure.profile, 'pure-js-npm');
+    // The chosen profile must survive prepare -> create: the sandbox really runs
+    // with the alias enabled and can call the imported function.
+    const sandbox = await engine.create(pure);
+    assert.equal(await sandbox.call('kind', null), 'function');
+    await sandbox.close();
   } finally { engine.shutdown(); }
 });
 

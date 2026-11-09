@@ -71,7 +71,8 @@ class PreparedPlugin {
   constructor(source, entrypoint, profile, paths) {
     this.#paths = Object.freeze(paths);
     this.#profile = profile;
-    prepared.set(this, { source, entrypoint });
+    // The frozen graph and its validated profile travel together.
+    prepared.set(this, { source, entrypoint, profile });
     Object.freeze(this);
   }
   get entrypoint() { return prepared.get(this).entrypoint; }
@@ -126,8 +127,9 @@ class Engine {
       throw new RangeError(`invalid_configuration: unknown profile '${profile}'; expected 'javascript-only' or 'pure-js-npm'`);
     }
     const selected = profile ?? 'javascript-only';
-    const paths = sync(() => this.#native.prepareModules(JSON.stringify(graph), entrypoint, selected));
-    return new PreparedPlugin(JSON.stringify(graph), entrypoint, selected, paths);
+    const modulesJson = JSON.stringify(graph);
+    const paths = sync(() => this.#native.prepareModules(modulesJson, entrypoint, selected));
+    return new PreparedPlugin(modulesJson, entrypoint, selected, paths);
   }
   async create(plugin, options = {}) {
     const value = prepared.get(plugin);
@@ -142,8 +144,10 @@ class Engine {
     try {
       handle = await asyncCall(() => this.#native.createModules(
         // Pass every argument explicitly: N-API optional-arg folding would
-        // otherwise shift a trailing object into the previous slot.
-        value.source, value.entrypoint, JSON.stringify(grants), nativeOptions,
+        // otherwise shift a trailing object into the previous slot. The
+        // validated profile from the immutable PreparedPlugin is carried
+        // through so a `pure-js-npm` graph never runs as `javascript-only`.
+        value.source, value.entrypoint, value.profile, JSON.stringify(grants), nativeOptions,
       ));
     } catch (error) {
       if (error instanceof SandboxError && error.kind === 'invalid_configuration' && /unknown host callback/.test(error.message)) {

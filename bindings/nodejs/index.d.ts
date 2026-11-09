@@ -110,6 +110,9 @@ export class Engine {
   /**
    * Multi-module graph. `modules` maps root-relative `.js`/`.mjs`/`.ts`/`.mts`
    * paths to source; imports and guest workers resolve only inside the map.
+   * The validated `profile` (default `'javascript-only'`) is stored on the
+   * returned PreparedPlugin and used verbatim by `create`; unknown names throw
+   * `RangeError('invalid_configuration: ...')` and are never downgraded.
    */
   prepareModules(modules: Record<string, string>, entrypoint?: string, profile?: CompatibilityProfile): PreparedPlugin;
   create(plugin: PreparedPlugin, options?: SandboxCreateOptions): Promise<Sandbox>;

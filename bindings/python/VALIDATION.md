@@ -57,6 +57,9 @@ Changes in this pass (all under `bindings/python/`, `bindings/nodejs/`,
   host-supplied graph and an explicit profile
   (`javascript-only` | `pure-js-npm`) to the real facade
   `Engine::prepare_with_profile(PluginSource, modules::CompatibilityProfile)`.
+  In Node the validated profile travels with the immutable `PreparedPlugin`
+  into `NativeEngine.create_modules(graph, entrypoint, profile, ...)`; unknown
+  profile names are rejected, never downgraded.
   There is no compatibility fallback and no automatic JavaScript-only
   downgrade. `prepare()` is unchanged.
 - `EngineOptions`/`SandboxOptions` (Python) and `EngineOptions`/create options

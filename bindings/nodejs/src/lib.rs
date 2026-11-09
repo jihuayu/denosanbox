@@ -161,6 +161,18 @@ impl From<&EngineLimits> for NativeEngineLimits {
     }
 }
 
+/// Maps the caller's explicit profile. Missing means `javascript-only`;
+/// anything else unknown is rejected rather than downgraded.
+fn parse_profile(profile: Option<&str>) -> Result<CompatibilityProfile> {
+    match profile {
+        None | Some("javascript-only") => Ok(CompatibilityProfile::JavaScriptOnly),
+        Some("pure-js-npm") => Ok(CompatibilityProfile::PureJsNpm),
+        Some(other) => Err(invalid(format!(
+            "unknown profile '{other}'; expected 'javascript-only' or 'pure-js-npm'"
+        ))),
+    }
+}
+
 fn positive(name: &str, value: Option<i64>) -> Result<Option<usize>> {
     match value {
         None => Ok(None),
@@ -193,7 +205,7 @@ impl NativeEngine {
             max_log_bytes: None,
             max_active_sandboxes: None,
             max_pending_invocations: None,
-            engine_max_message_bytes: None,
+            engine_message_bytes: None,
             default_invocation_timeout_ms: None,
             max_invocation_timeout_ms: None,
             max_modules: None,
@@ -361,15 +373,7 @@ impl NativeEngine {
         }
         let modules: BTreeMap<String, String> = serde_json::from_str(&modules_json)
             .map_err(|err| invalid(format!("modulesJSON must be an object of strings: {err}")))?;
-        let profile = match profile.as_deref() {
-            None | Some("javascript-only") => CompatibilityProfile::JavaScriptOnly,
-            Some("pure-js-npm") => CompatibilityProfile::PureJsNpm,
-            Some(other) => {
-                return Err(invalid(format!(
-                    "unknown profile '{other}'; expected 'javascript-only' or 'pure-js-npm'"
-                )))
-            }
-        };
+        let profile = parse_profile(profile.as_deref())?;
         let source = PluginSource {
             entrypoint,
             modules: modules.into_iter().collect(),
@@ -398,14 +402,19 @@ impl NativeEngine {
         .await
     }
 
+    /// Creates from a frozen multi-module graph under the caller's explicit,
+    /// validated profile. Unknown profile strings are rejected here — never
+    /// silently downgraded to `javascript-only`.
     #[napi]
     pub async fn create_modules(
         &self,
         modules_json: String,
         entrypoint: String,
+        profile: String,
         grants_json: String,
         options: Option<NativeSandboxOptions>,
     ) -> Result<NativeSandbox> {
+        let profile = parse_profile(Some(&profile))?;
         if modules_json.len() > 32 * 1024 * 1024 {
             return Err(invalid(
                 "modulesJSON exceeds the 32 MiB engine graph limit".into(),
@@ -418,7 +427,7 @@ impl NativeEngine {
                 entrypoint,
                 modules: modules.into_iter().collect(),
             },
-            CompatibilityProfile::JavaScriptOnly,
+            profile,
             grants_json,
             options,
         )

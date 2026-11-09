@@ -1,4 +1,5 @@
 //! Thread-affine in-process deno_core/V8 backend. No guest operating-system ops.
+mod buffers;
 use deno_core::error::ModuleLoaderError;
 use deno_core::OpState;
 use deno_core::{
@@ -23,6 +24,8 @@ struct Control {
     host: Arc<denosanbox_core::HostContext>,
     running: AtomicBool,
     interrupted: AtomicBool,
+    heap_exceeded: AtomicBool,
+    log_bytes: std::sync::atomic::AtomicUsize,
     cancelled: AtomicBool,
     timed_out: AtomicBool,
     isolate: Mutex<Option<v8::IsolateHandle>>,
@@ -34,7 +37,12 @@ impl Control {
         }
     }
     fn error(&self, fallback: impl ToString) -> Error {
-        if self.timed_out.load(Ordering::Acquire) {
+        if self.heap_exceeded.load(Ordering::Acquire) {
+            Error::LimitExceeded {
+                limit: "js_heap_target".into(),
+                detail: "JavaScript heap target exceeded".into(),
+            }
+        } else if self.timed_out.load(Ordering::Acquire) {
             Error::DeadlineExceeded
         } else if self.cancelled.load(Ordering::Acquire) {
             Error::Cancelled
@@ -66,6 +74,7 @@ struct Watchdog {
 impl Watchdog {
     fn new(control: Arc<Control>, timeout: Duration) -> Result<Self> {
         control.running.store(true, Ordering::Release);
+        control.log_bytes.store(0, Ordering::Release);
         let watch_control = control.clone();
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -121,6 +130,8 @@ impl DriverFactory for DenoFactory {
             host: context.clone(),
             running: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
+            heap_exceeded: AtomicBool::new(false),
+            log_bytes: std::sync::atomic::AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
             timed_out: AtomicBool::new(false),
             isolate: Mutex::new(None),
@@ -138,11 +149,20 @@ impl DriverFactory for DenoFactory {
                     })?;
                 let mut runtime = JsRuntime::new(RuntimeOptions {
                     module_loader: Some(Rc::new(GraphLoader(plugin.clone()))),
-                    extensions: vec![sandbox_ops::init(context, thread_control.clone())],
-                    create_params: options
-                        .memory_limit_bytes
-                        .map(|bytes| v8::CreateParams::default().heap_limits(0, bytes)),
+                    extensions: vec![sandbox_ops::init(context.clone(), thread_control.clone())],
+                    create_params: options.memory_limit_bytes.map(|bytes| {
+                        v8::CreateParams::default()
+                            .heap_limits(0, bytes.saturating_sub(4 * 1024 * 1024))
+                            .array_buffer_allocator(buffers::allocator(context.memory_budget()))
+                    }),
                     ..Default::default()
+                });
+                let heap_control = thread_control.clone();
+                runtime.add_near_heap_limit_callback(move |current, initial| {
+                    heap_control.heap_exceeded.store(true, Ordering::Release);
+                    heap_control.host.cancel();
+                    heap_control.terminate();
+                    current.max(initial.saturating_add(4 * 1024 * 1024))
                 });
                 *thread_control.isolate.lock().unwrap() =
                     Some(runtime.v8_isolate().thread_safe_handle());
@@ -157,20 +177,40 @@ impl DriverFactory for DenoFactory {
                         r#"
                 (()=>{
                   const ops=Deno.core.ops;
-                  const resource=(name,...args)=>ops.op_sandbox_resource(name,args);
+                  const stringify=JSON.stringify;
+                  const encode=(value)=>{const text=stringify(value);if(typeof text!=='string'||text.length>1048576)throw new RangeError('message limit exceeded');return text;};
+                  const resource=(name,...args)=>ops.op_sandbox_resource(name,encode(args));
                   const api=Object.freeze({
-                    fs:Object.freeze({readTextFile:async(path)=>resource('read',path),writeTextFile:async(path,data)=>resource('write',path,data)}),
+                    fs:Object.freeze({readTextFile:(path)=>ops.op_sandbox_resource_async('read',encode([path])),writeTextFile:(path,data)=>ops.op_sandbox_resource_async('write',encode([path,data]))}),
                     env:Object.freeze({get:(name)=>resource('env_get',name),set:(name,value)=>resource('env_set',name,value)}),
-                    host:Object.freeze({call:(name,input)=>ops.op_sandbox_host(name,input)}),
-                    cwd:()=>resource('cwd'),chdir:(path)=>resource('chdir',path),exit:()=>resource('exit')
+                    host:Object.freeze({protocolVersion:1,call:(name,input)=>ops.op_sandbox_host(name,encode(input))}),
+                    cwd:()=>resource('cwd'),chdir:(path)=>ops.op_sandbox_resource_async('chdir',encode([path])),exit:()=>resource('exit')
                   });
                   Object.defineProperty(globalThis,'sandbox',{value:api,writable:false,configurable:false});
                 })();
-                delete globalThis.Deno;
+                (()=>{
+                  const op=Deno.core.ops.op_sandbox_fetch;const stringify=JSON.stringify;
+                  const fetch=async(url,init={})=>{
+                    if(typeof url!=='string')throw new TypeError('fetch supports a URL string');
+                    const text=init.body===undefined?'':String(init.body);
+                    if(text.length>1048576)throw new RangeError('request body exceeds limit');
+                    const encoded=unescape(encodeURIComponent(text));const body=Array.from(encoded,c=>c.charCodeAt(0));
+                    const input=stringify({url,method:init.method||'GET',headers:init.headers||{},body});
+                    if(input.length>1048576)throw new RangeError('request exceeds limit');
+                    const response=await op(input);const bytes=Uint8Array.from(response.body);
+                    const decode=()=>decodeURIComponent(escape(Array.from(bytes,c=>String.fromCharCode(c)).join('')));
+                    return Object.freeze({status:response.status,ok:response.status>=200&&response.status<300,url:response.url,
+                      headers:Object.freeze({get:(name)=>response.headers[String(name).toLowerCase()]??null}),
+                      text:async()=>decode(),json:async()=>JSON.parse(decode()),arrayBuffer:async()=>bytes.buffer});
+                  };
+                  Object.defineProperty(globalThis,'fetch',{value:fetch,writable:false,configurable:false});
+                })();
                 delete globalThis.__bootstrap;
+                (()=>{const stringify=String;const log=Deno.core.ops.op_sandbox_log;const emit=(...args)=>{const text=args.map(arg=>stringify(arg)).join(' ');if(text.length>65536)throw new RangeError('log limit exceeded');log(text);};Object.defineProperty(globalThis,'console',{value:Object.freeze({log:emit,info:emit,warn:emit,error:emit,debug:emit}),writable:false,configurable:false});})();
                 delete globalThis.SharedArrayBuffer;
                 delete globalThis.Atomics;
                 delete globalThis.WebAssembly;
+                delete globalThis.Deno;
             "#,
                     )
                     .map_err(|e| thread_control.error(e))?;
@@ -356,7 +396,16 @@ impl Driver for DenoDriver {
         let output = {
             deno_core::scope!(scope, &mut self.runtime);
             let value = v8::Local::new(scope, value);
-            deno_core::serde_v8::from_v8(scope, value).map_err(|e| self.control.error(e))?
+            let json = v8::json::stringify(scope, value)
+                .ok_or_else(|| self.control.error("result is not JSON serializable"))?;
+            if json.utf8_length(scope) > 1024 * 1024 {
+                return Err(Error::LimitExceeded {
+                    limit: "max_message_bytes".into(),
+                    detail: "result exceeds 1MiB".into(),
+                });
+            }
+            serde_json::from_str(&json.to_rust_string_lossy(scope))
+                .map_err(|e| self.control.error(e))?
         };
         self.completed += 1;
         Ok(output)
@@ -376,88 +425,165 @@ impl Driver for DenoDriver {
         Ok(report)
     }
 }
+fn decode_message(input: &str) -> std::result::Result<Value, ModuleLoaderError> {
+    if input.len() > 1024 * 1024 {
+        return Err(ModuleLoaderError::generic(
+            "serialized message exceeds 1MiB",
+        ));
+    }
+    serde_json::from_str(input).map_err(|_| ModuleLoaderError::generic("invalid JSON message"))
+}
+fn guest_error(error: impl ToString) -> ModuleLoaderError {
+    ModuleLoaderError::generic(error.to_string())
+}
 #[deno_core::op2]
 #[serde]
 fn op_sandbox_resource(
     state: &mut OpState,
     #[string] action: String,
-    #[serde] input: serde_json::Value,
+    #[string] input: String,
 ) -> std::result::Result<serde_json::Value, ModuleLoaderError> {
+    let input = decode_message(&input)?;
     let context = state.borrow::<Arc<denosanbox_core::HostContext>>().clone();
-    let operation = || -> Result<Value> {
-        if serde_json::to_vec(&input)
-            .map_err(|e| Error::Execution {
-                message: e.to_string(),
-            })?
-            .len()
-            > 1024 * 1024
-        {
-            return Err(Error::LimitExceeded {
-                limit: "resource_message_bytes".into(),
-                detail: "resource request exceeds 1MiB".into(),
-            });
-        }
-        let arg = |index: usize| {
-            input
-                .get(index)
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::Execution {
-                    message: "expected string argument".into(),
-                })
-        };
-        match action.as_str() {
-            "read" => {
-                let bytes = context.read(arg(0)?)?;
-                Ok(Value::String(String::from_utf8(bytes).map_err(|_| {
-                    Error::Execution {
-                        message: "file is not UTF-8".into(),
-                    }
-                })?))
-            }
-            "write" => {
-                context.write(arg(0)?, arg(1)?.as_bytes())?;
-                Ok(Value::Null)
-            }
-            "env_get" => Ok(context
-                .env_get(arg(0)?)?
-                .map(Value::String)
-                .unwrap_or(Value::Null)),
-            "env_set" => {
-                context.env_set(arg(0)?, arg(1)?)?;
-                Ok(Value::Null)
-            }
-            "cwd" => Ok(Value::String(context.cwd()?)),
-            "chdir" => {
-                context.set_cwd(arg(0)?)?;
-                Ok(Value::Null)
-            }
-            "exit" => {
-                state.borrow::<Arc<Control>>().cancel();
-                Err(Error::Cancelled)
-            }
-            _ => Err(Error::UnsupportedFeature { feature: action }),
-        }
+    let arg = |index: usize| {
+        input
+            .get(index)
+            .and_then(Value::as_str)
+            .ok_or_else(|| ModuleLoaderError::generic("expected string argument"))
     };
-    operation().map_err(|e| ModuleLoaderError::generic(e.to_string()))
+    match action.as_str() {
+        "env_get" => Ok(context
+            .env_get(arg(0)?)
+            .map_err(guest_error)?
+            .map(Value::String)
+            .unwrap_or(Value::Null)),
+        "env_set" => {
+            context.env_set(arg(0)?, arg(1)?).map_err(guest_error)?;
+            Ok(Value::Null)
+        }
+        "cwd" => Ok(Value::String(context.cwd().map_err(guest_error)?)),
+        "exit" => {
+            state.borrow::<Arc<Control>>().cancel();
+            Err(ModuleLoaderError::generic("sandbox exited"))
+        }
+        _ => Err(ModuleLoaderError::generic("unsupported resource action")),
+    }
+}
+#[deno_core::op2]
+#[serde]
+async fn op_sandbox_resource_async(
+    state: Rc<RefCell<OpState>>,
+    #[string] action: String,
+    #[string] input: String,
+) -> std::result::Result<serde_json::Value, ModuleLoaderError> {
+    let input = decode_message(&input)?;
+    let context = state
+        .borrow()
+        .borrow::<Arc<denosanbox_core::HostContext>>()
+        .clone();
+    let arg = |index: usize| {
+        input
+            .get(index)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| ModuleLoaderError::generic("expected string argument"))
+    };
+    match action.as_str() {
+        "read" => {
+            let bytes = context.read_async(arg(0)?).await.map_err(guest_error)?;
+            Ok(Value::String(String::from_utf8(bytes).map_err(|_| {
+                ModuleLoaderError::generic("file is not UTF-8")
+            })?))
+        }
+        "write" => {
+            context
+                .write_async(arg(0)?, arg(1)?.into_bytes())
+                .await
+                .map_err(guest_error)?;
+            Ok(Value::Null)
+        }
+        "chdir" => {
+            context.set_cwd_async(arg(0)?).await.map_err(guest_error)?;
+            Ok(Value::Null)
+        }
+        _ => Err(ModuleLoaderError::generic("unsupported resource action")),
+    }
 }
 #[deno_core::op2]
 #[serde]
 async fn op_sandbox_host(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
-    #[serde] input: serde_json::Value,
+    #[string] input: String,
 ) -> std::result::Result<serde_json::Value, ModuleLoaderError> {
+    let input = decode_message(&input)?;
     let context = state
         .borrow()
         .borrow::<Arc<denosanbox_core::HostContext>>()
         .clone();
     context
-        .call(name, input)
+        .call_versioned(1, name, input)
         .await
-        .map_err(|e| ModuleLoaderError::generic(e.to_string()))
+        .map_err(guest_error)
+}
+#[deno_core::op2]
+#[serde]
+async fn op_sandbox_worker(
+    state: Rc<RefCell<OpState>>,
+    #[string] action: String,
+    #[string] input: String,
+) -> std::result::Result<serde_json::Value, ModuleLoaderError> {
+    let input = decode_message(&input)?;
+    let context = state
+        .borrow()
+        .borrow::<Arc<denosanbox_core::HostContext>>()
+        .clone();
+    context
+        .worker_operation(action, input)
+        .await
+        .map_err(guest_error)
+}
+#[deno_core::op2]
+#[serde]
+async fn op_sandbox_fetch(
+    state: Rc<RefCell<OpState>>,
+    #[string] input: String,
+) -> std::result::Result<serde_json::Value, ModuleLoaderError> {
+    let input = decode_message(&input)?;
+    let request = serde_json::from_value(input)
+        .map_err(|_| ModuleLoaderError::generic("invalid HTTP request"))?;
+    let context = state
+        .borrow()
+        .borrow::<Arc<denosanbox_core::HostContext>>()
+        .clone();
+    serde_json::to_value(context.http_request(request).await.map_err(guest_error)?)
+        .map_err(guest_error)
+}
+#[deno_core::op2(fast)]
+fn op_sandbox_log(
+    state: &mut OpState,
+    #[string] text: String,
+) -> std::result::Result<(), ModuleLoaderError> {
+    let control = state.borrow::<Arc<Control>>();
+    let mut used = control.log_bytes.load(Ordering::Acquire);
+    loop {
+        let next = used
+            .checked_add(text.len())
+            .filter(|n| *n <= 65536)
+            .ok_or_else(|| ModuleLoaderError::generic("per-invocation log limit exceeded"))?;
+        match control.log_bytes.compare_exchange_weak(
+            used,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(actual) => used = actual,
+        }
+    }
 }
 deno_core::extension!(sandbox_ops,
-    ops=[op_sandbox_resource,op_sandbox_host],
+    ops=[op_sandbox_resource,op_sandbox_resource_async,op_sandbox_host,op_sandbox_worker,op_sandbox_fetch,op_sandbox_log],
     options={context:Arc<denosanbox_core::HostContext>,control:Arc<Control>},
     state=|state,options|{state.put(options.context);state.put(options.control);}
 );

@@ -258,6 +258,14 @@ impl Engine {
                 .unwrap_or(options.policy.limits().heap_target_bytes())
                 .min(options.policy.limits().heap_target_bytes()),
         );
+        if self.inner.config.backend == BackendKind::Deno
+            && options.memory_limit_bytes.unwrap_or(0) < 8 * 1024 * 1024
+        {
+            return Err(Error::LimitExceeded {
+                limit: "heap_target".into(),
+                detail: "Deno requires at least 8MiB including termination reserve".into(),
+            });
+        }
         let subtree_budget = parent
             .map(|p| {
                 p.state
@@ -284,6 +292,20 @@ impl Engine {
             options.host_grants.clone(),
             host_config,
         )?;
+        if self.inner.config.backend == BackendKind::Deno {
+            guard.heap_lease = Some(
+                host.memory_budget()
+                    .reserve(options.memory_limit_bytes.unwrap_or(0) as u64)
+                    .map_err(|_| Error::LimitExceeded {
+                        limit: "subtree_memory_bytes".into(),
+                        detail: "ancestor memory reservation exhausted".into(),
+                    })?,
+            );
+        }
+        if let Some(parent) = parent {
+            host.inherit_mounts_from(&parent.state.host)?;
+        }
+        host.set_worker_depth(parent.map(|p| p.depth() + 1).unwrap_or(0));
         host.begin_invocation(default_timeout)?;
         let prepared = plugin.clone();
         let CreatedDriver { init, control } =
@@ -427,6 +449,15 @@ pub struct SandboxHandle {
 }
 
 impl SandboxHandle {
+    /// Attach a trusted, nofollow host directory to this sandbox's logical view.
+    pub fn mount_directory(
+        &self,
+        prefix: &str,
+        path: &std::path::Path,
+        access: denosanbox_core::MountAccess,
+    ) -> Result<()> {
+        self.state.host.mount_directory(prefix, path, access)
+    }
     /// Immutable prepared graph used to create this sandbox.
     pub fn prepared_plugin(&self) -> PreparedPlugin {
         self.state.prepared.clone()
@@ -501,6 +532,15 @@ impl SandboxHandle {
             return Err(Error::DeadlineExceeded);
         }
 
+        let input_lease = self
+            .state
+            .host
+            .memory_budget()
+            .reserve(self.limits.max_message_bytes as u64)
+            .map_err(|_| Error::LimitExceeded {
+                limit: "queued_message_bytes".into(),
+                detail: "ancestor message budget exhausted".into(),
+            })?;
         let (reply_tx, reply_rx) = oneshot::channel();
         let invocation = Invocation {
             export: export.to_string(),
@@ -511,6 +551,7 @@ impl SandboxHandle {
         match self.state.sender.try_send(WorkerMsg::Call(CallJob {
             invocation,
             reply: reply_tx,
+            _input_lease: input_lease,
         })) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -626,6 +667,7 @@ impl Drop for WorkerLifetime {
 struct ActiveGuard {
     engine: Arc<EngineInner>,
     tree_lease: Option<denosanbox_core::policy::Lease>,
+    heap_lease: Option<denosanbox_core::policy::Lease>,
 }
 
 impl ActiveGuard {
@@ -647,6 +689,7 @@ impl ActiveGuard {
                 return Ok(Self {
                     engine,
                     tree_lease: None,
+                    heap_lease: None,
                 });
             }
         }
@@ -667,6 +710,7 @@ enum WorkerMsg {
 struct CallJob {
     invocation: Invocation,
     reply: oneshot::Sender<Result<Value>>,
+    _input_lease: denosanbox_core::policy::Lease,
 }
 
 struct WorkerState {
@@ -906,18 +950,27 @@ fn validate_export_name(export: &str) -> Result<()> {
 }
 
 fn check_message_size(value: &Value, max: usize) -> Result<()> {
-    let size = serde_json::to_vec(value)
-        .map_err(|err| Error::Internal {
-            message: format!("failed to serialize message: {err}"),
-        })?
-        .len();
-    if size > max {
-        return Err(Error::LimitExceeded {
-            limit: "max_message_bytes".to_string(),
-            detail: format!("message is {size} bytes but the limit is {max}"),
-        });
+    struct Limited {
+        written: usize,
+        max: usize,
     }
-    Ok(())
+    impl std::io::Write for Limited {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.written = self.written.saturating_add(bytes.len());
+            if self.written > self.max {
+                return Err(std::io::Error::other("message limit exceeded"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Limited { written: 0, max };
+    serde_json::to_writer(&mut counter, value).map_err(|_| Error::LimitExceeded {
+        limit: "max_message_bytes".into(),
+        detail: "serialized message exceeds byte limit".into(),
+    })
 }
 
 #[cfg(test)]

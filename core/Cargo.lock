@@ -676,7 +676,9 @@ dependencies = [
 name = "denosanbox-core"
 version = "0.1.0"
 dependencies = [
+ "denosanbox-connectors",
  "denosanbox-modules",
+ "denosanbox-mounts",
  "denosanbox-policy",
  "serde_json",
  "tokio",

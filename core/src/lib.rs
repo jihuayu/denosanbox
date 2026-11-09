@@ -30,3 +30,5 @@ pub use denosanbox_core::{
     AuditEvent, AuditOutcome, CapabilitySchemas, HostAudit, HostConfig, JsonSchema, SchemaError,
     SchemaLimits,
 };
+
+pub use denosanbox_core::MountAccess;

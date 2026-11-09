@@ -40,3 +40,6 @@ mod host_schema;
 pub use host::{CapabilitySchemas, HostConfig};
 pub use host_audit::{AuditEvent, AuditOutcome, HostAudit};
 pub use host_schema::{JsonSchema, SchemaError, SchemaLimits};
+
+pub use denosanbox_mounts::MountAccess;
+pub use host::{WorkerFuture, WorkerHandler};

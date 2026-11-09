@@ -1,9 +1,10 @@
 //! Experimental C ABI for the native `denosanbox` core.
 //!
-//! This layer owns integer-token handles, caller-owned buffers and a small
-//! async job bookkeeping layer. It deliberately does not implement JavaScript,
-//! policies, a second runtime, subprocesses or guest callbacks. Every actual
-//! sandbox operation is delegated to the `denosanbox` crate.
+//! This layer owns integer-token handles, caller-owned buffers, a small async
+//! job bookkeeping layer and scoped foreign host callbacks (`host.rs`). It
+//! deliberately does not implement JavaScript, a policy engine, a second
+//! runtime or subprocesses. Every actual sandbox operation is delegated to the
+//! `denosanbox` crate; callbacks run on the core's managed host threads.
 
 use std::collections::HashMap;
 use std::ffi::c_char;
@@ -15,25 +16,29 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use denosanbox::{
-    Engine, EngineConfig, Error, InvocationOptions, PluginSource, SandboxHandle, SandboxOptions,
+    Engine, EngineConfig, Error, InvocationContext, InvocationOptions, PluginSource, Policy,
+    SandboxHandle, SandboxOptions,
 };
 use futures_util::FutureExt;
+
+mod host;
+use host::CEngine;
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
-const STATUS_OK: i32 = 0;
+pub(crate) const STATUS_OK: i32 = 0;
 const STATUS_PENDING: i32 = 1;
-const STATUS_INVALID_ARGUMENT: i32 = 2;
-const STATUS_INVALID_HANDLE: i32 = 3;
+pub(crate) const STATUS_INVALID_ARGUMENT: i32 = 2;
+pub(crate) const STATUS_INVALID_HANDLE: i32 = 3;
 const STATUS_CLOSED: i32 = 4;
 const STATUS_CANCELLED: i32 = 5;
 const STATUS_DEADLINE: i32 = 6;
-const STATUS_LIMIT: i32 = 7;
+pub(crate) const STATUS_LIMIT: i32 = 7;
 const STATUS_EXECUTION: i32 = 8;
 const STATUS_UNSUPPORTED: i32 = 9;
-const STATUS_INTERNAL: i32 = 10;
+pub(crate) const STATUS_INTERNAL: i32 = 10;
 
-const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_EXPORT_BYTES: usize = 128;
 const MAX_PENDING_JOBS: usize = 132;
@@ -106,32 +111,32 @@ impl DenoBuffer {
     }
 }
 
-struct CError {
-    status: DenoStatus,
-    message: String,
+pub(crate) struct CError {
+    pub(crate) status: DenoStatus,
+    pub(crate) message: String,
 }
 
 impl CError {
-    fn new(status: DenoStatus, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: DenoStatus, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
         }
     }
 
-    fn invalid_argument(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
         Self::new(STATUS_INVALID_ARGUMENT, message)
     }
 
-    fn invalid_handle(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_handle(message: impl Into<String>) -> Self {
         Self::new(STATUS_INVALID_HANDLE, message)
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(STATUS_INTERNAL, message)
     }
 
-    fn from_core(error: Error) -> Self {
+    pub(crate) fn from_core(error: Error) -> Self {
         Self::new(status_for_kind(error.kind()), error.to_string())
     }
 }
@@ -158,7 +163,7 @@ fn status_for_kind(kind: &str) -> DenoStatus {
 
 static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 
-fn runtime() -> Result<&'static Runtime, CError> {
+pub(crate) fn runtime() -> Result<&'static Runtime, CError> {
     match RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -180,13 +185,18 @@ enum EntryKind {
     Sandbox,
     Job,
     Buffer,
+    /// A context borrowed by exactly one in-flight foreign callback.
+    Context,
 }
 
 enum Entry {
-    Engine(Engine),
+    /// Engines are wrapped so the C layer can own callback registrations next to
+    /// the real core engine. `Deref` keeps every existing engine call site.
+    Engine(Arc<CEngine>),
     Sandbox(SandboxHandle),
     Job(Arc<JobState>),
     Buffer(Vec<u8>),
+    Context(InvocationContext),
 }
 
 impl Entry {
@@ -196,6 +206,7 @@ impl Entry {
             Self::Sandbox(_) => EntryKind::Sandbox,
             Self::Job(_) => EntryKind::Job,
             Self::Buffer(_) => EntryKind::Buffer,
+            Self::Context(_) => EntryKind::Context,
         }
     }
 }
@@ -234,7 +245,7 @@ fn insert_entry(entry: Entry) -> u64 {
     })
 }
 
-fn get_engine(token: u64) -> Option<Engine> {
+fn get_engine(token: u64) -> Option<Arc<CEngine>> {
     if token == 0 {
         return None;
     }
@@ -242,6 +253,47 @@ fn get_engine(token: u64) -> Option<Engine> {
         Some(Entry::Engine(engine)) => Some(engine.clone()),
         _ => None,
     })
+}
+
+/// Ends the C layer's registration owner for one name; the core registry keeps
+/// its own owner until the last sandbox/handle is gone.
+#[no_mangle]
+/// # Safety
+/// All non-null pointers follow the header's byte/output contracts.
+pub unsafe extern "C" fn deno_engine_forget_host(
+    engine_token: u64,
+    name: *const u8,
+    name_len: usize,
+    error_out: *mut DenoError,
+) -> DenoStatus {
+    ffi(error_out, || {
+        let name_bytes = copy_input(name, name_len, 64, "callback name")?;
+        let name = std::str::from_utf8(&name_bytes)
+            .map_err(|_| CError::invalid_argument("callback name is not UTF-8"))?;
+        let engine = get_engine(engine_token)
+            .ok_or_else(|| CError::invalid_handle("engine token is invalid or stale"))?;
+        match engine.forget(name) {
+            Some(registration) => {
+                drop(registration);
+                Ok(STATUS_OK)
+            }
+            None => Err(CError::invalid_argument("host callback is not registered")),
+        }
+    })
+}
+
+pub(crate) fn get_context(token: u64) -> Option<InvocationContext> {
+    if token == 0 {
+        return None;
+    }
+    with_registry(|registry| match registry.entries.get(&token) {
+        Some(Entry::Context(context)) => Some(context.clone()),
+        _ => None,
+    })
+}
+
+pub(crate) fn insert_context(context: InvocationContext) -> u64 {
+    insert_entry(Entry::Context(context))
 }
 
 fn get_sandbox(token: u64) -> Option<SandboxHandle> {
@@ -264,7 +316,7 @@ fn get_job(token: u64) -> Option<Arc<JobState>> {
     })
 }
 
-fn take_entry(token: u64, kind: EntryKind) -> Option<Entry> {
+pub(crate) fn take_entry(token: u64, kind: EntryKind) -> Option<Entry> {
     if token == 0 {
         return None;
     }
@@ -281,7 +333,7 @@ fn take_entry(token: u64, kind: EntryKind) -> Option<Entry> {
     })
 }
 
-fn insert_buffer(bytes: Vec<u8>) -> DenoBuffer {
+pub(crate) fn insert_buffer(bytes: Vec<u8>) -> DenoBuffer {
     let len = bytes.len();
     // A Vec's heap allocation does not move when the Vec header is stored in
     // the registry, so this pointer remains valid until buffer_free removes it.
@@ -300,7 +352,7 @@ unsafe fn clear_error(error_out: *mut DenoError) {
     }
 }
 
-unsafe fn set_error(error_out: *mut DenoError, error: CError) {
+pub(crate) unsafe fn set_error(error_out: *mut DenoError, error: CError) {
     if error_out.is_null() {
         return;
     }
@@ -317,7 +369,10 @@ unsafe fn set_error(error_out: *mut DenoError, error: CError) {
 /// Runs an extern implementation with panic containment. A panic never unwinds
 /// across the C ABI boundary; it becomes a typed internal error. OOM/abort and
 /// native faults remain outside this guarantee.
-fn ffi(err_out: *mut DenoError, f: impl FnOnce() -> Result<DenoStatus, CError>) -> DenoStatus {
+pub(crate) fn ffi(
+    err_out: *mut DenoError,
+    f: impl FnOnce() -> Result<DenoStatus, CError>,
+) -> DenoStatus {
     // Every fallible extern function requires a writable error output. Do not
     // perform side effects when the caller gave us nowhere to report failures.
     if err_out.is_null() {
@@ -342,11 +397,11 @@ fn ffi(err_out: *mut DenoError, f: impl FnOnce() -> Result<DenoStatus, CError>) 
     }
 }
 
-fn ffi_no_error(f: impl FnOnce() -> DenoStatus) -> DenoStatus {
+pub(crate) fn ffi_no_error(f: impl FnOnce() -> DenoStatus) -> DenoStatus {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(STATUS_INTERNAL)
 }
 
-unsafe fn copy_input(
+pub(crate) unsafe fn copy_input(
     data: *const u8,
     len: usize,
     cap: usize,
@@ -602,8 +657,14 @@ pub unsafe extern "C" fn deno_engine_new(
             return Err(CError::invalid_argument("out_engine must not be NULL"));
         }
         ptr::write(out_engine, 0);
-        let engine = Engine::new(EngineConfig::default()).map_err(CError::from_core)?;
-        let token = insert_entry(Entry::Engine(engine));
+        // Wrapped with the same deny-all ceiling: registration is allowed but
+        // grants fail the ceiling check until an engine with capabilities is used.
+        let engine = Engine::with_policy(EngineConfig::default(), Policy::default())
+            .map_err(CError::from_core)?;
+        let token = insert_entry(Entry::Engine(CEngine::from_engine(
+            engine,
+            Policy::default(),
+        )));
         ptr::write(out_engine, token);
         Ok(STATUS_OK)
     })
@@ -801,6 +862,28 @@ pub unsafe extern "C" fn deno_sandbox_close(
 }
 
 #[no_mangle]
+/// Host callback operations still holding native accounting after close. This is
+/// the C layer's count of foreign callbacks that have not returned. No error_out
+/// (status only); a NULL output returns DENO_STATUS_INVALID_ARGUMENT.
+/// Call it after `deno_sandbox_close`: a nonzero value means a foreign callback
+/// has not returned yet and user data will be released only after it does.
+/// Returns DENO_STATUS_INVALID_HANDLE for a stale/wrong-kind token.
+pub extern "C" fn deno_sandbox_pending_host_operations(
+    sandbox_token: u64,
+    out_pending: *mut u64,
+) -> DenoStatus {
+    ffi_no_error(|| {
+        if out_pending.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        unsafe { ptr::write(out_pending, 0) };
+        let _ = sandbox_token;
+        unsafe { ptr::write(out_pending, host::pending_host_operations() as u64) };
+        STATUS_OK
+    })
+}
+
+#[no_mangle]
 /// # Safety
 /// All non-null pointers must be valid for the documented byte length or
 /// output type, and owned buffers must follow the versioned header's single
@@ -866,11 +949,15 @@ pub unsafe extern "C" fn deno_engine_free(
 ) -> DenoStatus {
     ffi(error_out, || {
         match take_entry(engine_token, EntryKind::Engine) {
-            Some(entry) => {
-                drop(entry);
+            Some(Entry::Engine(engine)) => {
+                // Freeing the engine ends its registration owners even when the
+                // core still holds a cancelled-but-running callback owner; that
+                // owner keeps the user data until the callback returns.
+                engine.forget_all();
+                drop(engine);
                 Ok(STATUS_OK)
             }
-            None => Err(CError::invalid_handle(
+            None | Some(_) => Err(CError::invalid_handle(
                 "engine token is invalid, stale or of another kind",
             )),
         }

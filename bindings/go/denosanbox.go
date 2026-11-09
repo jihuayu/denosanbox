@@ -2,9 +2,9 @@
 // ABI. It owns no JavaScript runtime, policy or sandbox implementation: every
 // operation is delegated to the native C library built from bindings/c.
 //
-// Async completion is polling-only in this initial subset. C guest callback
-// registration is not exposed because the core callback parity/release gate is
-// still open.
+// Async completion is polling-only. Scoped host callbacks are exposed through
+// RegisterHost/CreateWithGrants; they run on core-managed native host threads
+// and never receive a Go pointer through Rust (only an opaque cgo.Handle).
 package denosanbox
 
 /*
@@ -12,6 +12,10 @@ package denosanbox
 #cgo LDFLAGS: -L${SRCDIR}/../c/target/debug -ldenosanbox_c -Wl,-rpath,${SRCDIR}/../c/target/debug
 #include <stdlib.h>
 #include "denosanbox.h"
+
+// Defined in callback_shim.c, implemented in callbacks.go.
+deno_host_callback_fn denosanbox_callback_fn(void);
+deno_host_release_fn denosanbox_release_fn(void);
 */
 import "C"
 
@@ -20,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"runtime/cgo"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -122,6 +127,92 @@ func New() (*Engine, error) {
 	return engine, nil
 }
 
+// NewWithCapabilities creates an engine with a fixed capability-name ceiling.
+// Registration alone still grants nothing: each sandbox needs CreateWithGrants.
+func NewWithCapabilities(capabilities []string) (*Engine, error) {
+	if capabilities == nil {
+		capabilities = []string{}
+	}
+	encoded, err := json.Marshal(capabilities)
+	if err != nil {
+		return nil, &Error{Status: StatusInvalidArgument, Message: "capabilities: " + err.Error()}
+	}
+	if len(encoded) > int(C.DENO_MAX_CAPABILITIES_BYTES) {
+		return nil, &Error{Status: StatusLimit, Message: "capability list exceeds 1MiB"}
+	}
+	var token C.uint64_t
+	var cerr C.deno_error
+	status := C.deno_engine_new_with_capabilities(bytesPtr(encoded), C.size_t(len(encoded)), &token, &cerr)
+	runtime.KeepAlive(encoded)
+	if status != C.DENO_STATUS_OK {
+		return nil, takeError(&cerr)
+	}
+	if token == 0 {
+		return nil, &Error{Status: StatusInternal, Message: "engine constructor returned token 0"}
+	}
+	engine := &Engine{}
+	engine.token.Store(uint64(token))
+	return engine, nil
+}
+
+// RegisterHost registers a scoped host callback on an engine created with
+// NewWithCapabilities. inputLimit/outputLimit bound the JSON input and output
+// (1..=64 MiB). Ownership of the Go callback transfers only on success; on
+// failure the cgo.Handle is deleted here. Release happens exactly once after the
+// engine registration, every grant and every in-flight invocation are gone.
+func (e *Engine) RegisterHost(name string, fn HostCallback, inputLimit, outputLimit int) error {
+	if e == nil || e.token.Load() == 0 {
+		return &Error{Status: StatusInvalidHandle, Message: "engine is nil or freed"}
+	}
+	if fn == nil {
+		return &Error{Status: StatusInvalidArgument, Message: "host callback is nil"}
+	}
+	if len(name) == 0 || len(name) > int(C.DENO_MAX_CALLBACK_NAME_BYTES) {
+		return &Error{Status: StatusInvalidArgument, Message: "callback name must be 1..64 bytes"}
+	}
+	if inputLimit <= 0 || outputLimit <= 0 ||
+		uint64(inputLimit) > uint64(C.DENO_MAX_CALLBACK_EDGE_BYTES) ||
+		uint64(outputLimit) > uint64(C.DENO_MAX_CALLBACK_EDGE_BYTES) {
+		return &Error{Status: StatusLimit, Message: "callback limits must be 1..=64MiB"}
+	}
+	// The pooled handle is re-registered under a unique reference here so the
+	// opaque integer given to C is process-unique and cannot alias a recycled
+	// handle slot.
+	handle := cgo.NewHandle(&hostRecord{fn: fn})
+	// Release can fire on a Rust thread that is not allowed to call into Go
+	// (it is recorded as deferred for that handle and replayed on the owning
+	// callback thread or by DrainDeferredReleases). Until that replay happens
+	// the user data is still owned, so no release is counted here.
+	registered := false
+	defer func() {
+		if !registered {
+			handle.Delete()
+		}
+	}()
+	nameBytes := []byte(name)
+	var cerr C.deno_error
+	status := C.deno_engine_register_host(
+		C.uint64_t(e.token.Load()),
+		bytesPtr(nameBytes),
+		C.size_t(len(nameBytes)),
+		C.size_t(inputLimit),
+		C.size_t(outputLimit),
+		C.denosanbox_callback_fn(),
+		C.denosanbox_release_fn(),
+		C.uint64_t(handle),
+		&cerr,
+	)
+	runtime.KeepAlive(nameBytes)
+	if status != C.DENO_STATUS_OK {
+		err := takeError(&cerr)
+		C.deno_error_free(&cerr)
+		return err
+	}
+	registered = true
+	runtime.KeepAlive(fn)
+	return nil
+}
+
 // Create prepares and creates a sandbox from one JavaScript module named
 // "main.js". The source is copied before this call returns.
 func (e *Engine) Create(source string) (*Sandbox, error) {
@@ -143,6 +234,49 @@ func (e *Engine) CreateBytes(source []byte) (*Sandbox, error) {
 		&cerr,
 	)
 	runtime.KeepAlive(source)
+	if status != C.DENO_STATUS_OK {
+		return nil, takeError(&cerr)
+	}
+	if token == 0 {
+		return nil, &Error{Status: StatusInternal, Message: "sandbox constructor returned token 0"}
+	}
+	sandbox := &Sandbox{}
+	sandbox.token.Store(uint64(token))
+	return sandbox, nil
+}
+
+// CreateWithGrants creates a sandbox whose only permitted capabilities are the
+// granted host callbacks, mapped to trusted scopes. Names resolve against the
+// engine's registrations and fixed ceiling; the guest source never contributes a
+// grant. A nil/empty map behaves like Create.
+func (e *Engine) CreateWithGrants(source string, grants map[string]string) (*Sandbox, error) {
+	if e == nil || e.token.Load() == 0 {
+		return nil, &Error{Status: StatusInvalidHandle, Message: "engine is nil or freed"}
+	}
+	if grants == nil {
+		grants = map[string]string{}
+	}
+	encoded, err := json.Marshal(grants)
+	if err != nil {
+		return nil, &Error{Status: StatusInvalidArgument, Message: "grants: " + err.Error()}
+	}
+	if len(encoded) > int(C.DENO_MAX_GRANTS_BYTES) {
+		return nil, &Error{Status: StatusLimit, Message: "grant list exceeds 1MiB"}
+	}
+	sourceBytes := []byte(source)
+	var token C.uint64_t
+	var cerr C.deno_error
+	status := C.deno_engine_create_sandbox_with_grants(
+		C.uint64_t(e.token.Load()),
+		bytesPtr(sourceBytes),
+		C.size_t(len(sourceBytes)),
+		bytesPtr(encoded),
+		C.size_t(len(encoded)),
+		&token,
+		&cerr,
+	)
+	runtime.KeepAlive(sourceBytes)
+	runtime.KeepAlive(encoded)
 	if status != C.DENO_STATUS_OK {
 		return nil, takeError(&cerr)
 	}
@@ -186,6 +320,10 @@ func (e *Engine) closeNative() (EngineShutdownReport, error) {
 
 	freeStatus := C.deno_engine_free(token, &cerr)
 	freeErr := takeError(&cerr)
+	if freeStatus == C.DENO_STATUS_OK {
+		// The engine's registration owners ended; replay their releases from Go.
+		ReleaseDeferredReleases()
+	}
 
 	report = EngineShutdownReport{
 		SandboxesClosed: uint64(raw.sandboxes_closed),
@@ -332,6 +470,10 @@ type SandboxCloseReport struct {
 	InvocationsCancelled uint64
 	ForcedTermination    bool
 	ClosedCleanly        bool
+	// PendingHostOperations counts native host callbacks still running after
+	// close. Nonzero means a callback has not returned; its user data is
+	// released only after it really ends.
+	PendingHostOperations uint64
 }
 
 // Close awaits the native core close path, then frees the sandbox token.
@@ -359,11 +501,24 @@ func (s *Sandbox) closeNative() (SandboxCloseReport, error) {
 	freeStatus := C.deno_sandbox_free(token, &cerr)
 	freeErr := takeError(&cerr)
 
+	var pending C.uint64_t
+	if C.deno_sandbox_pending_host_operations(token, &pending) != C.DENO_STATUS_OK {
+		pending = 0
+	}
+
+	// A successful close ends this sandbox's grant owner. A non-cooperative
+	// callback keeps its own owner, so its user data is still released only
+	// after it returns (and any deferred release is replayed from Go).
+	if closeStatus == C.DENO_STATUS_OK {
+		releaseSandboxGrants()
+	}
+
 	report = SandboxCloseReport{
-		InvocationsCompleted: uint64(raw.invocations_completed),
-		InvocationsCancelled: uint64(raw.invocations_cancelled),
-		ForcedTermination:    raw.forced_termination != 0,
-		ClosedCleanly:        raw.closed_cleanly != 0,
+		PendingHostOperations: uint64(pending),
+		InvocationsCompleted:  uint64(raw.invocations_completed),
+		InvocationsCancelled:  uint64(raw.invocations_cancelled),
+		ForcedTermination:     raw.forced_termination != 0,
+		ClosedCleanly:         raw.closed_cleanly != 0,
 	}
 	if closeErr != nil {
 		return report, closeErr

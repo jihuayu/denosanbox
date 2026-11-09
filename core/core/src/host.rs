@@ -256,6 +256,24 @@ impl HostContext {
         Ok(lock(&self.view)?.cwd().as_str().to_string())
     }
 
+    pub fn protocol_version(&self) -> u16 {
+        denosanbox_policy::PROTOCOL_VERSION
+    }
+    /// Explicit negotiation boundary for native guest ops and external bindings.
+    pub async fn call_versioned(
+        self: &Arc<Self>,
+        version: u16,
+        name: String,
+        input: Value,
+    ) -> Result<Value> {
+        if version != self.protocol_version() {
+            return Err(Error::Policy {
+                kind: "Protocol".into(),
+                message: "unsupported host capability protocol version".into(),
+            });
+        }
+        self.call(name, input).await
+    }
     pub async fn call(self: &Arc<Self>, name: String, input: Value) -> Result<Value> {
         let audit_name = self
             .grants

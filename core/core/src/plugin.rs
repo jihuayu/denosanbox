@@ -5,6 +5,59 @@ use std::sync::Arc;
 
 use crate::config::EngineLimits;
 use crate::Error;
+use denosanbox_modules::CompatibilityProfile;
+
+/// Reserved namespace for trusted, host-injected builtin modules.
+///
+/// Guest-supplied sources may never occupy this namespace; only the host
+/// injects modules here, and only for the profiles that authorize them.
+pub const RESERVED_BUILTIN_DIR: &str = "__builtin__";
+
+/// Reserved module path backing the `node:worker_threads` / `worker_threads`
+/// aliases.
+pub const WORKER_THREADS_BUILTIN: &str = "__builtin__/worker_threads.js";
+
+/// Trusted source of the reserved `worker_threads` builtin.
+///
+/// The loader treats the presence of this exact module in the private graph as
+/// the authorization for the `worker_threads` aliases; the implementation
+/// objects themselves are installed by the runtime on the sandbox global.
+pub const WORKER_THREADS_SOURCE: &str = concat!(
+    "export const Worker=globalThis.__denosanboxNodeWorker;\n",
+    "export const parentPort=globalThis.__denosanboxParentPort;\n",
+    "export const isMainThread=globalThis.__denosanboxIsMainThread;\n",
+    "export const workerData=undefined;\n",
+    "export const threadId=isMainThread?0:1;\n",
+);
+
+/// Returns whether `path` lives in the reserved `__builtin__/` namespace.
+pub fn is_reserved_builtin_path(path: &str) -> bool {
+    path == RESERVED_BUILTIN_DIR
+        || (path.len() > RESERVED_BUILTIN_DIR.len()
+            && path.starts_with(RESERVED_BUILTIN_DIR)
+            && path.as_bytes()[RESERVED_BUILTIN_DIR.len()] == b'/')
+}
+
+/// Maps a Node-compatible alias to its reserved builtin module path.
+///
+/// Only `worker_threads` (with or without the `node:` prefix) is aliased and
+/// only for profiles that inject the reserved module; every other Node builtin,
+/// bare specifier and URL stays denied.
+pub fn builtin_alias_target(specifier: &str) -> Option<&'static str> {
+    match specifier {
+        "node:worker_threads" | "worker_threads" => Some(WORKER_THREADS_BUILTIN),
+        _ => None,
+    }
+}
+
+/// Trusted builtin modules injected for a profile.
+fn injected_builtins(profile: CompatibilityProfile) -> &'static [(&'static str, &'static str)] {
+    if profile.allows_package_graph() {
+        &[(WORKER_THREADS_BUILTIN, WORKER_THREADS_SOURCE)]
+    } else {
+        &[]
+    }
+}
 
 /// Immutable sources supplied by the host.
 ///
@@ -42,6 +95,12 @@ impl PluginSource {
         for (path, source) in &package.sources {
             let mounted = format!("{prefix}{path}");
             validate_path(&mounted)?;
+            if is_reserved_builtin_path(&mounted) {
+                return Err(Error::ModuleDenied {
+                    specifier: mounted,
+                    reason: "the __builtin__/ namespace is reserved for trusted modules".into(),
+                });
+            }
             if self.modules.contains_key(&mounted) {
                 return Err(Error::InvalidPlugin {
                     reason: "package module collides with existing graph".into(),
@@ -84,6 +143,7 @@ impl std::fmt::Debug for PreparedPlugin {
             .field("entrypoint", &self.graph.entrypoint)
             .field("module_count", &self.graph.modules.len())
             .field("total_bytes", &self.graph.total_bytes)
+            .field("profile", &self.graph.profile)
             .finish()
     }
 }
@@ -92,6 +152,11 @@ impl PreparedPlugin {
     /// Root-relative entrypoint path.
     pub fn entrypoint(&self) -> &str {
         &self.graph.entrypoint
+    }
+
+    /// Capability profile this graph was prepared under.
+    pub fn profile(&self) -> CompatibilityProfile {
+        self.graph.profile
     }
 
     /// Select a visible entrypoint from this immutable prepared graph.
@@ -108,6 +173,7 @@ impl PreparedPlugin {
                 entrypoint: entrypoint.into(),
                 modules: self.graph.modules.clone(),
                 total_bytes: self.graph.total_bytes,
+                profile: self.graph.profile,
             }),
         })
     }
@@ -127,6 +193,13 @@ impl PreparedPlugin {
         self.graph.modules.get(path).map(|s| s.as_str())
     }
 
+    /// Returns whether the private graph carries the reserved trusted module.
+    pub fn has_reserved_builtin(&self, path: &str) -> bool {
+        is_reserved_builtin_path(path)
+            && self.graph.modules.get(path).map(|s| s.as_str())
+                == Some(builtin_source(path).unwrap_or(""))
+    }
+
     /// Iterates immutable `(path, source)` pairs in deterministic path order.
     pub fn iter_modules(&self) -> impl Iterator<Item = (&str, &str)> {
         self.graph
@@ -136,34 +209,79 @@ impl PreparedPlugin {
     }
 }
 
+/// Trusted source text for a reserved builtin module path.
+pub fn builtin_source(path: &str) -> Option<&'static str> {
+    match path {
+        WORKER_THREADS_BUILTIN => Some(WORKER_THREADS_SOURCE),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedGraph {
     pub(crate) entrypoint: String,
     pub(crate) modules: BTreeMap<String, String>,
     pub(crate) total_bytes: usize,
+    pub(crate) profile: CompatibilityProfile,
 }
 
-/// Validates and freezes a host-supplied source graph.
+/// Validates and freezes a host-supplied source graph with the default
+/// [`CompatibilityProfile::JavaScriptOnly`] profile.
+///
+/// See [`prepare_with_profile`].
+pub fn prepare(source: PluginSource, limits: &EngineLimits) -> Result<PreparedPlugin, Error> {
+    prepare_with_profile(source, limits, CompatibilityProfile::JavaScriptOnly)
+}
+
+/// Validates and freezes a host-supplied source graph under `profile`.
 ///
 /// The prepared graph is the only visibility source used by runtime module
 /// loaders. Literal static imports and literal dynamic imports are checked
 /// eagerly; every later load is rechecked by the backend loader against this
 /// same immutable graph.
-pub fn prepare(source: PluginSource, limits: &EngineLimits) -> Result<PreparedPlugin, Error> {
+///
+/// `CompatibilityProfile::PureJsNpm` additionally injects the trusted
+/// `__builtin__/worker_threads.js` module and authorizes only the
+/// `worker_threads` / `node:worker_threads` aliases to it. Guest sources may
+/// never supply keys under `__builtin__/`, and every other Node builtin, bare
+/// specifier and URL import stays denied in every profile.
+pub fn prepare_with_profile(
+    source: PluginSource,
+    limits: &EngineLimits,
+    profile: CompatibilityProfile,
+) -> Result<PreparedPlugin, Error> {
     limits.validate()?;
     validate_path(&source.entrypoint)?;
+    if is_reserved_builtin_path(&source.entrypoint) {
+        return Err(Error::ModuleDenied {
+            specifier: source.entrypoint,
+            reason: "the __builtin__/ namespace is reserved for trusted modules".to_string(),
+        });
+    }
 
     if source.modules.is_empty() {
         return Err(Error::InvalidPlugin {
             reason: "plugin must contain at least one module".to_string(),
         });
     }
-    if source.modules.len() > limits.max_modules {
+    // Reject guest-supplied raw sources in the reserved namespace before any
+    // trusted module is injected, in every profile.
+    for path in source.modules.keys() {
+        if is_reserved_builtin_path(path) {
+            return Err(Error::ModuleDenied {
+                specifier: path.clone(),
+                reason: "the __builtin__/ namespace is reserved for trusted modules".to_string(),
+            });
+        }
+    }
+
+    let injected = injected_builtins(profile);
+    let module_count = source.modules.len().saturating_add(injected.len());
+    if module_count > limits.max_modules {
         return Err(Error::LimitExceeded {
             limit: "max_modules".to_string(),
             detail: format!(
-                "plugin has {} modules but the limit is {}",
-                source.modules.len(),
+                "plugin has {module_count} modules but the limit is {}",
                 limits.max_modules
             ),
         });
@@ -211,6 +329,24 @@ pub fn prepare(source: PluginSource, limits: &EngineLimits) -> Result<PreparedPl
         }
         modules.insert(path, prepared);
     }
+
+    // Trusted placeholders count against the same module and byte budgets as
+    // guest modules, so a budget cannot be escaped by the injected sources.
+    for (path, text) in injected {
+        if text.len() > limits.max_module_bytes {
+            return Err(Error::LimitExceeded {
+                limit: "max_module_bytes".to_string(),
+                detail: format!(
+                    "builtin module '{path}' is {} bytes but the limit is {}",
+                    text.len(),
+                    limits.max_module_bytes
+                ),
+            });
+        }
+        total_bytes = total_bytes.saturating_add(text.len());
+        modules.insert((*path).to_string(), (*text).to_string());
+    }
+
     if total_bytes > limits.max_graph_bytes {
         return Err(Error::LimitExceeded {
             limit: "max_graph_bytes".to_string(),
@@ -233,7 +369,7 @@ pub fn prepare(source: PluginSource, limits: &EngineLimits) -> Result<PreparedPl
     // dynamic imports, against this immutable map.
     for (path, text) in &modules {
         for specifier in scan_import_specifiers(text) {
-            validate_import(&specifier, path, &modules)?;
+            validate_import(&specifier, path, &modules, profile)?;
         }
     }
 
@@ -242,6 +378,7 @@ pub fn prepare(source: PluginSource, limits: &EngineLimits) -> Result<PreparedPl
             entrypoint: source.entrypoint,
             modules,
             total_bytes,
+            profile,
         }),
     })
 }
@@ -312,6 +449,7 @@ fn validate_import(
     specifier: &str,
     referrer: &str,
     modules: &BTreeMap<String, String>,
+    profile: CompatibilityProfile,
 ) -> Result<(), Error> {
     if specifier.is_empty() {
         return Err(Error::ModuleDenied {
@@ -329,6 +467,26 @@ fn validate_import(
         return Err(Error::ModuleDenied {
             specifier: specifier.to_string(),
             reason: "query strings and fragments are not permitted".to_string(),
+        });
+    }
+    // Node-compatible aliases resolve only to a reserved builtin module that
+    // this profile actually injected into the private graph.
+    if let Some(target) = builtin_alias_target(specifier) {
+        if profile.allows_package_graph() && modules.contains_key(target) {
+            return Ok(());
+        }
+        return Err(Error::ModuleDenied {
+            specifier: specifier.to_string(),
+            reason: format!(
+                "'{specifier}' requires the {profile_str} profile and an injected trusted builtin",
+                profile_str = CompatibilityProfile::PureJsNpm.as_str()
+            ),
+        });
+    }
+    if specifier.starts_with("node:") {
+        return Err(Error::ModuleDenied {
+            specifier: specifier.to_string(),
+            reason: "Node builtin modules are not available in this profile".to_string(),
         });
     }
     if !(specifier.starts_with("./") || specifier.starts_with("../")) {
@@ -388,6 +546,10 @@ mod tests {
 
     fn limits() -> EngineLimits {
         EngineLimits::default()
+    }
+
+    fn pure() -> CompatibilityProfile {
+        CompatibilityProfile::PureJsNpm
     }
 
     #[test]
@@ -451,5 +613,176 @@ mod tests {
         )
         .unwrap();
         assert!(!ts.source("main.ts").unwrap().contains(": number"));
+    }
+
+    #[test]
+    fn defaultdeniesnodealiases() {
+        for specifier in ["node:worker_threads", "worker_threads"] {
+            let source = format!(
+                "import {{ Worker }} from '{specifier}'; export function run() {{ return Worker; }}"
+            );
+            let denied = prepare(PluginSource::single("main.js", source), &limits()).unwrap_err();
+            assert!(
+                matches!(denied, Error::ModuleDenied { .. }),
+                "{specifier} must be denied by default, got {denied:?}"
+            );
+        }
+        // The default profile injects no reserved module at all.
+        let prepared = prepare(PluginSource::single("main.js", "export const n = 1;"), &limits())
+            .unwrap();
+        assert_eq!(prepared.profile(), CompatibilityProfile::JavaScriptOnly);
+        assert_eq!(prepared.entrypoint(), "main.js");
+        assert!(prepared.source(WORKER_THREADS_BUILTIN).is_none());
+        assert_eq!(prepared.module_count(), 1);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn PureJsNpmpermits() {
+        let source = PluginSource::single(
+            "main.js",
+            "import { Worker, isMainThread } from 'node:worker_threads'; \
+             import * as wt from 'worker_threads'; \
+             export function run() { return [Worker, isMainThread, wt.threadId]; }",
+        );
+        let prepared = prepare_with_profile(source, &limits(), pure()).unwrap();
+        assert_eq!(prepared.profile(), pure());
+        assert_eq!(prepared.module_count(), 2);
+        let builtin = prepared
+            .source(WORKER_THREADS_BUILTIN)
+            .expect("reserved worker_threads module must be injected");
+        assert_eq!(builtin, WORKER_THREADS_SOURCE);
+        assert!(builtin.contains("export const Worker=globalThis.__denosanboxNodeWorker;"));
+        assert!(builtin.contains("export const parentPort=globalThis.__denosanboxParentPort;"));
+        assert!(builtin.contains("export const isMainThread=globalThis.__denosanboxIsMainThread;"));
+        assert!(builtin.contains("export const workerData=undefined;"));
+        assert!(builtin.contains("export const threadId=isMainThread?0:1;"));
+        assert!(prepared.has_reserved_builtin(WORKER_THREADS_BUILTIN));
+        // TypeScript and entrypoint preservation still hold with the profile.
+        let ts = prepare_with_profile(
+            PluginSource::single("main.ts", "export const n: number = 1;"),
+            &limits(),
+            pure(),
+        )
+        .unwrap();
+        assert!(!ts.source("main.ts").unwrap().contains(": number"));
+        let alt = ts.with_entrypoint(WORKER_THREADS_BUILTIN).unwrap();
+        assert_eq!(alt.entrypoint(), WORKER_THREADS_BUILTIN);
+        assert_eq!(alt.profile(), pure());
+    }
+
+    #[test]
+    fn reservedrawpathrejects() {
+        for profile in [CompatibilityProfile::JavaScriptOnly, pure()] {
+            let mut source = PluginSource::single("main.js", "export const n = 1;");
+            source.modules.insert(
+                WORKER_THREADS_BUILTIN.to_string(),
+                "export const Worker = () => 'hijacked';".to_string(),
+            );
+            let rejected = prepare_with_profile(source, &limits(), profile).unwrap_err();
+            assert!(
+                matches!(rejected, Error::ModuleDenied { .. }),
+                "profile {profile:?} must reject raw __builtin__ sources, got {rejected:?}"
+            );
+
+            let mut other = PluginSource::single("main.js", "export const n = 1;");
+            other
+                .modules
+                .insert("__builtin__/evil.js".to_string(), "export const x = 1;".to_string());
+            let rejected = prepare_with_profile(other, &limits(), profile).unwrap_err();
+            assert!(matches!(rejected, Error::ModuleDenied { .. }));
+
+            let entry = PluginSource {
+                entrypoint: WORKER_THREADS_BUILTIN.to_string(),
+                modules: BTreeMap::from([(
+                    WORKER_THREADS_BUILTIN.to_string(),
+                    "export const Worker = 1;".to_string(),
+                )]),
+            };
+            let rejected = prepare_with_profile(entry, &limits(), profile).unwrap_err();
+            assert!(matches!(rejected, Error::ModuleDenied { .. }));
+        }
+    }
+
+    #[test]
+    fn modulequotascountbuiltin() {
+        // Two guest modules plus the injected builtin exceed a budget of two.
+        let mut source = PluginSource::single(
+            "main.js",
+            "import { n } from './lib.js'; export const value = n;",
+        );
+        source
+            .modules
+            .insert("lib.js".to_string(), "export const n = 1;".to_string());
+        let mut two_modules = limits();
+        two_modules.max_modules = 2;
+        let over = prepare_with_profile(source.clone(), &two_modules, pure()).unwrap_err();
+        assert!(
+            matches!(&over, Error::LimitExceeded { limit, .. } if limit == "max_modules"),
+            "injected builtin must count against max_modules, got {over:?}"
+        );
+        // The same graph fits without the injected builtin.
+        assert!(prepare_with_profile(source.clone(), &two_modules, CompatibilityProfile::JavaScriptOnly)
+            .is_ok());
+
+        // Builtin bytes count against the graph budget too.
+        let guest_bytes: usize = source.modules.values().map(String::len).sum();
+        let mut tight = limits();
+        tight.max_graph_bytes = guest_bytes + WORKER_THREADS_SOURCE.len() - 1;
+        let over = prepare_with_profile(source.clone(), &tight, pure()).unwrap_err();
+        assert!(
+            matches!(&over, Error::LimitExceeded { limit, .. } if limit == "max_graph_bytes"),
+            "injected builtin must count against max_graph_bytes, got {over:?}"
+        );
+        assert!(prepare_with_profile(source.clone(), &tight, CompatibilityProfile::JavaScriptOnly)
+            .is_ok());
+
+        // Builtin bytes count against the per-module budget too.
+        let mut tiny_module = limits();
+        tiny_module.max_module_bytes = WORKER_THREADS_SOURCE.len() - 1;
+        tiny_module.max_graph_bytes = usize::MAX / 2;
+        let over = prepare_with_profile(source.clone(), &tiny_module, pure()).unwrap_err();
+        assert!(
+            matches!(&over, Error::LimitExceeded { limit, .. } if limit == "max_module_bytes"),
+            "injected builtin must count against max_module_bytes, got {over:?}"
+        );
+
+        // Accounting is surfaced in the graph totals.
+        let ok = prepare_with_profile(source, &limits(), pure()).unwrap();
+        assert_eq!(ok.module_count(), 3);
+        assert_eq!(
+            ok.total_bytes(),
+            guest_bytes + WORKER_THREADS_SOURCE.len()
+        );
+    }
+
+    #[test]
+    fn othernativebuiltinbothdeny() {
+        for specifier in ["node:fs", "fs", "node:child_process", "node:vm", "node:ffi"] {
+            for profile in [CompatibilityProfile::JavaScriptOnly, pure()] {
+                let source = format!(
+                    "import * as m from '{specifier}'; export const run = () => m;"
+                );
+                let denied =
+                    prepare_with_profile(PluginSource::single("main.js", source), &limits(), profile)
+                        .unwrap_err();
+                assert!(
+                    matches!(denied, Error::ModuleDenied { .. }),
+                    "profile {profile:?} must deny {specifier}, got {denied:?}"
+                );
+            }
+        }
+        // URLs and other bare specifiers stay denied even with PureJsNpm.
+        for specifier in [
+            "https://example.com/x.js",
+            "npm:left-pad",
+            "node:worker_threads/inner",
+        ] {
+            let source = format!("import '{specifier}'; export const run = () => 1;");
+            let denied =
+                prepare_with_profile(PluginSource::single("main.js", source), &limits(), pure())
+                    .unwrap_err();
+            assert!(matches!(denied, Error::ModuleDenied { .. }));
+        }
     }
 }

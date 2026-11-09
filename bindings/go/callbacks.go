@@ -3,10 +3,11 @@ package denosanbox
 // Exported cgo trampolines for scoped host callbacks.
 //
 // The C ABI holds only an opaque uintptr_t (a cgo.Handle) as "user data". Each
-// handle owns one *hostRecord. Release deletes that handle exactly once, after
+// handle is recorded in one bounded live-registry entry while its registration
+// exists; release removes that entry and deletes the handle exactly once, after
 // the native owner (engine registration, every sandbox grant and every
 // in-flight invocation) is gone, and therefore only after the Go callback has
-// really returned.
+// really returned. Nothing about a closed registration is retained.
 //
 // Execution model: the Rust core calls the trampoline synchronously on its own
 // managed host thread. The Go callback runs on that same thread; a watcher
@@ -91,128 +92,139 @@ func (h HostContext) Value(key any) any {
 // runs until the Go callback returns.
 const callbackCheckInterval = time.Millisecond
 
-const (
-	recordLive uint32 = iota
-	recordDead
-)
+// The live registration registry. It holds exactly the host records that have
+// been handed to native code and not yet released, so its size is bounded by
+// the number of live registrations, never by the number of closed ones.
+//
+// Registry mutex > record lock is the only allowed lock order.
+var registry = struct {
+	sync.Mutex
+	records map[uintptr]*hostRecord
+}{records: make(map[uintptr]*hostRecord)}
+
+// hookInsertRecord is a test hook (nil in production) run when a record is
+// published, before native code sees the handle.
+var hookInsertRecord func(*hostRecord)
 
 type hostRecord struct {
-	fn    HostCallback
-	state atomic.Uint32 // recordLive -> recordDead
-	// released counts exactly-once release observations (test suite only).
-	released *atomic.Int32
+	fn HostCallback
+	// lock guards released. It is never held across a call into C or Go user
+	// code: once released is set, no lookup can reach this record and native
+	// code has ended its last owner (and with it any in-flight invocation).
+	lock     sync.Mutex
+	released bool
+	// nativeArc pins the record for the duration of an in-flight C-ABI
+	// callback, which only holds the handle integer across the boundary.
+	nativeArc atomic.Int32
+	// onRelease is a test hook fired once, after cgo.Handle.Delete.
+	onRelease func()
 }
 
-// countRelease is a test hook (no-op in production) run after the handle is
-// deleted, i.e. when the user data was really released.
-var countRelease = func(*hostRecord) {}
+// liveRegistrationCount reports the number of live registrations (test hook).
+func liveRegistrationCount() int {
+	registry.Lock()
+	defer registry.Unlock()
+	return len(registry.records)
+}
 
-var (
-	releasedMu      sync.Mutex
-	releasedHandles = map[uintptr]struct{}{}
-)
+// insertRecord publishes a new record under an opaque handle. Called before
+// the registration reaches native code, so native release can never observe an
+// unknown live handle.
+func insertRecord(h uintptr, fn HostCallback) *hostRecord {
+	rec := &hostRecord{fn: fn}
+	if hookInsertRecord != nil {
+		hookInsertRecord(rec)
+	}
+	registry.Lock()
+	registry.records[h] = rec
+	registry.Unlock()
+	return rec
+}
 
-// goContextDepth counts callbacks currently running on Go-entered Rust threads.
-var goContextDepth atomic.Int32
+// dropRecord removes a record that never reached native code (a rejected
+// registration); the caller still owns its user data, so no release happens.
+func dropRecord(h uintptr) {
+	registry.Lock()
+	rec := registry.records[h]
+	delete(registry.records, h)
+	registry.Unlock()
+	if rec != nil {
+		rec.lock.Lock()
+		rec.released = true
+		rec.lock.Unlock()
+	}
+}
 
-// releaseRecord deletes the handle exactly once. Native code fires the foreign
-// release once per owner, but this stays idempotent: cgo.Handle.Value must not
-// be called after Delete (Go panics), so repeated values are answered from
-// releasedHandles without touching cgo state again.
+// lookupRecordPinned resolves a live record and pins it with nativeArc. The
+// pin keeps the record (and its owner) resolvable for the whole C call; it is
+// dropped with unpinRecord once the foreign call returned. A nil record means
+// the handle is absent, i.e. already released or never registered.
+func lookupRecordPinned(h uintptr) (*hostRecord, bool) {
+	registry.Lock()
+	defer registry.Unlock()
+	rec := registry.records[h]
+	if rec == nil {
+		return nil, false
+	}
+	rec.lock.Lock()
+	live := !rec.released
+	rec.lock.Unlock()
+	if !live {
+		// Only reachable while a release holds the record lock; treat the
+		// handle as already released rather than returning a dying record.
+		return nil, false
+	}
+	rec.nativeArc.Add(1)
+	return rec, true
+}
+
+func unpinRecord(rec *hostRecord) {
+	if rec != nil {
+		rec.nativeArc.Add(-1)
+	}
+}
+
+// releaseRecord answers one native release. The registration is removed from
+// the live registry atomically and the cgo handle is deleted exactly once; a
+// handle that is no longer live was already released (or was never handed to
+// native code) and is ignored. If a lookup is in flight the record lock makes
+// this wait for it; native code only calls release after every owner, so no
+// foreign call can be running by then.
 func releaseRecord(h uintptr) {
-	releasedMu.Lock()
-	_, seen := releasedHandles[h]
-	if !seen {
-		releasedHandles[h] = struct{}{}
-	}
-	releasedMu.Unlock()
-	if seen {
+	registry.Lock()
+	rec := registry.records[h]
+	delete(registry.records, h)
+	registry.Unlock()
+	if rec == nil {
 		return
 	}
-	rec, ok := cgo.Handle(h).Value().(*hostRecord)
-	if !ok || rec == nil || !rec.state.CompareAndSwap(recordLive, recordDead) {
+	rec.lock.Lock()
+	if rec.released {
+		rec.lock.Unlock()
 		return
 	}
+	rec.released = true
+	rec.lock.Unlock()
 	cgo.Handle(h).Delete()
-	if rec.released != nil {
-		rec.released.Add(1)
+	if rec.onRelease != nil {
+		rec.onRelease()
 	}
-	countRelease(rec)
-}
-
-var (
-	deferredMu     sync.Mutex
-	deferredFails  = map[uintptr]struct{}{}
-	deferredEvents atomic.Int64
-	releaseDrains  atomic.Int64
-)
-
-// deferRelease records a handle whose release must run from Go. It never calls
-// cgo.Handle.Value: the record is resolved when the deferred release runs.
-func deferRelease(h uintptr) {
-	deferredMu.Lock()
-	defer deferredMu.Unlock()
-	if _, ok := deferredFails[h]; ok {
-		return
-	}
-	deferredFails[h] = struct{}{}
-	deferredEvents.Add(1)
-}
-
-// runDeferred releases every pending handle from a Go goroutine. Each handle is
-// released at most once (native release fires once per owner, and
-// releaseRecord is idempotent for a repeated value).
-func runDeferred() {
-	pending := make([]uintptr, 0, 4)
-	deferredMu.Lock()
-	for h := range deferredFails {
-		delete(deferredFails, h)
-		pending = append(pending, h)
-	}
-	deferredMu.Unlock()
-	for _, h := range pending {
-		releaseRecord(h)
-	}
-}
-
-// ReleaseDeferredReleases runs host-callback releases that became pending on a
-// Rust thread that could not call back into Go (normally after engine close).
-// It executes each deferred release at most once and must be called from a
-// normal Go goroutine. A background reaper does the same automatically.
-func ReleaseDeferredReleases() {
-	releaseDrains.Add(1)
-	runDeferred()
-}
-
-func init() {
-	go func() {
-		ticker := time.NewTicker(5 * time.Millisecond)
-		defer ticker.Stop()
-		var last int64
-		for range ticker.C {
-			if seen := deferredEvents.Load(); seen != last {
-				last = seen
-				runDeferred()
-			}
-		}
-	}()
 }
 
 // GoDenoHostRelease is the C ABI release function; see callback_shim.c.
 //
-// Rust calls it once per owner, usually from a Rust-owned teardown thread that
-// cgo did not enter from Go, where re-entering Go is not allowed. In that case
-// the opaque handle is recorded and replayed from Go instead. Releasing user
-// data therefore never happens before the owner really ended, and never on a
-// foreign thread.
+// Native code calls it exactly once per registration, usually from a
+// Rust-owned teardown thread that did not enter Go. That is an ordinary cgo
+// callback (runtime/cgocall.go): the Go runtime binds an M to the calling C
+// thread for the duration of the call (runtime/proc.go needm/dropm), so the
+// release runs directly here. A panic is contained at this boundary.
 //
 //export GoDenoHostRelease
 func GoDenoHostRelease(h C.uint64_t) {
-	if goContextDepth.Load() > 0 {
-		releaseRecord(uintptr(h))
-		return
-	}
-	deferRelease(uintptr(h))
+	defer func() {
+		_ = recover()
+	}()
+	releaseRecord(uintptr(h))
 }
 
 type contextMetadata struct {
@@ -256,15 +268,14 @@ func GoDenoHostCallback(contextToken C.uint64_t, input *C.uint8_t, inputLen C.si
 	if outResult == nil {
 		return C.DENO_STATUS_INVALID_ARGUMENT
 	}
-	releasedMu.Lock()
-	_, released := releasedHandles[uintptr(h)]
-	releasedMu.Unlock()
-	if released {
+	// The pin keeps the live registration (and its owner) resolvable until
+	// this foreign call returns, even if native teardown runs concurrently.
+	rec, pinned := lookupRecordPinned(uintptr(h))
+	if rec == nil {
 		return C.DENO_STATUS_INVALID_ARGUMENT
 	}
-	rec, ok := cgo.Handle(uintptr(h)).Value().(*hostRecord)
-	if !ok || rec == nil || rec.state.Load() != recordLive {
-		return C.DENO_STATUS_INVALID_ARGUMENT
+	if pinned {
+		defer unpinRecord(rec)
 	}
 
 	meta, ok := nativeContext(contextToken)
@@ -323,7 +334,6 @@ func GoDenoHostCallback(contextToken C.uint64_t, input *C.uint8_t, inputLen C.si
 	}()
 
 	// The user callback runs synchronously on this Rust-owned host thread.
-	goContextDepth.Add(1)
 	var result struct {
 		out json.RawMessage
 		err error
@@ -341,11 +351,6 @@ func GoDenoHostCallback(contextToken C.uint64_t, input *C.uint8_t, inputLen C.si
 	}()
 	close(watcherDone)
 	watcher.Wait()
-	goContextDepth.Add(-1)
-
-	// Releases that were deferred while this thread was inside cgo are replayed
-	// here, on the Go-entered thread.
-	runDeferred()
 
 	if !result.ok || result.err != nil || result.out == nil {
 		return C.DENO_STATUS_EXECUTION
@@ -361,10 +366,4 @@ func GoDenoHostCallback(contextToken C.uint64_t, input *C.uint8_t, inputLen C.si
 	}
 	*outResult = copied
 	return C.DENO_STATUS_OK
-}
-
-// releaseSandboxGrants replays releases for owners that ended with a sandbox
-// close. It is called from Close, i.e. from a normal Go goroutine.
-func releaseSandboxGrants() {
-	ReleaseDeferredReleases()
 }

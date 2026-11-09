@@ -175,17 +175,16 @@ func (e *Engine) RegisterHost(name string, fn HostCallback, inputLimit, outputLi
 		uint64(outputLimit) > uint64(C.DENO_MAX_CALLBACK_EDGE_BYTES) {
 		return &Error{Status: StatusLimit, Message: "callback limits must be 1..=64MiB"}
 	}
-	// The pooled handle is re-registered under a unique reference here so the
-	// opaque integer given to C is process-unique and cannot alias a recycled
-	// handle slot.
+	// The handle is registered in the live registry before native code sees it,
+	// so a native release can never observe an unknown live handle. Only live
+	// registrations are retained; release removes the entry and deletes the
+	// handle exactly once (from the Rust-owned thread that calls Go back).
 	handle := cgo.NewHandle(&hostRecord{fn: fn})
-	// Release can fire on a Rust thread that is not allowed to call into Go
-	// (it is recorded as deferred for that handle and replayed on the owning
-	// callback thread or by DrainDeferredReleases). Until that replay happens
-	// the user data is still owned, so no release is counted here.
+	insertRecord(uintptr(handle), fn)
 	registered := false
 	defer func() {
 		if !registered {
+			dropRecord(uintptr(handle))
 			handle.Delete()
 		}
 	}()
@@ -320,10 +319,6 @@ func (e *Engine) closeNative() (EngineShutdownReport, error) {
 
 	freeStatus := C.deno_engine_free(token, &cerr)
 	freeErr := takeError(&cerr)
-	if freeStatus == C.DENO_STATUS_OK {
-		// The engine's registration owners ended; replay their releases from Go.
-		ReleaseDeferredReleases()
-	}
 
 	report = EngineShutdownReport{
 		SandboxesClosed: uint64(raw.sandboxes_closed),
@@ -506,12 +501,9 @@ func (s *Sandbox) closeNative() (SandboxCloseReport, error) {
 		pending = 0
 	}
 
-	// A successful close ends this sandbox's grant owner. A non-cooperative
-	// callback keeps its own owner, so its user data is still released only
-	// after it returns (and any deferred release is replayed from Go).
-	if closeStatus == C.DENO_STATUS_OK {
-		releaseSandboxGrants()
-	}
+	// A successful close ends this sandbox's grant owners natively; a
+	// non-cooperative callback keeps its own owner, so its user data (and the
+	// Go registration record) is released only after it really returns.
 
 	report = SandboxCloseReport{
 		PendingHostOperations: uint64(pending),

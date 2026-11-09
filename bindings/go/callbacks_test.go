@@ -72,7 +72,7 @@ func TestHostCallbacksOwnershipScopeAndSamePID(t *testing.T) {
 			"input":      json.RawMessage(input),
 		})
 	}
-	echoReleased := releasedCountFor(echo)
+	echoReleased := watchRelease(echo)
 	if err := engine.RegisterHost("echo", echo, 4096, 4096); err != nil {
 		t.Fatalf("RegisterHost: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestHostCallbackLongRunningCancelSignalsContext(t *testing.T) {
 			return json.RawMessage("null"), nil
 		}
 	}
-	slowReleased := releasedCountFor(slow)
+	slowReleased := watchRelease(slow)
 	if err := engine.RegisterHost("slow", slow, 1024, 1024); err != nil {
 		t.Fatalf("RegisterHost: %v", err)
 	}
@@ -303,24 +303,24 @@ func TestHostCallbackNativeDeadlineHonored(t *testing.T) {
 	}
 }
 
-// TestHostCallbackNonCooperativeStaysAccounted covers requirement 2: a
-// non-cooperative callback remains counted by native accounting, close reports
-// clean=0, and user data is released only after the callback really returns.
+// TestHostCallbackNonCooperativeStaysAccounted covers requirement 2: a gated
+// (non-cooperative) callback stays counted by native accounting after the call
+// returns on its native deadline, close reports clean=0, and the native user
+// data is released only after the callback really returns.
 func TestHostCallbackNonCooperativeStaysAccounted(t *testing.T) {
 	engine, err := NewWithCapabilities([]string{"slow"})
 	if err != nil {
 		t.Fatalf("NewWithCapabilities: %v", err)
 	}
+	baseLive := liveRegistrationCount()
 	started := make(chan struct{})
 	gate := make(chan struct{})
-	returned := make(chan struct{})
 	slow := func(ctx HostContext, input json.RawMessage) (json.RawMessage, error) {
 		close(started)
 		<-gate
-		close(returned)
 		return json.RawMessage("null"), nil
 	}
-	slowReleased := releasedCountFor(slow)
+	slowReleased := watchRelease(slow)
 	if err := engine.RegisterHost("slow", slow, 1024, 1024); err != nil {
 		t.Fatalf("RegisterHost: %v", err)
 	}
@@ -328,10 +328,10 @@ func TestHostCallbackNonCooperativeStaysAccounted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateWithGrants: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	callDone := make(chan error, 1)
 	go func() {
-		_, err := sandbox.Call(ctx, "run", json.RawMessage("null"), 30*time.Second)
+		// The native deadline ends the call while the callback is still gated.
+		_, err := sandbox.Call(context.Background(), "run", json.RawMessage("null"), 200*time.Millisecond)
 		callDone <- err
 	}()
 	select {
@@ -339,19 +339,27 @@ func TestHostCallbackNonCooperativeStaysAccounted(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatalf("callback never entered")
 	}
-	cancel()
+	// Wait well past the old 5ms bound before the call ends.
+	time.Sleep(50 * time.Millisecond)
+	// Close from a separate goroutine (as a host would); the Call goroutine is
+	// still polling its job.
+	closed := make(chan struct{})
+	var report SandboxCloseReport
+	var closeErr error
+	go func() {
+		report, closeErr = sandbox.Close()
+		close(closed)
+	}()
 	select {
-	case err := <-callDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("call error = %v, want context.Canceled", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatalf("call did not return after cancel")
+	case <-closed:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("sandbox close did not return")
 	}
-
-	report, err := sandbox.Close()
-	if err != nil {
-		t.Fatalf("sandbox close: %v", err)
+	if closeErr != nil {
+		t.Fatalf("sandbox close: %v", closeErr)
+	}
+	if err := <-callDone; err == nil {
+		t.Fatalf("call succeeded while the callback was still gated")
 	}
 	if report.ClosedCleanly {
 		t.Fatalf("close reported clean while a non-cooperative callback still runs")
@@ -362,33 +370,19 @@ func TestHostCallbackNonCooperativeStaysAccounted(t *testing.T) {
 	if got := released(slowReleased); got != 0 {
 		t.Fatalf("user data released while callback still runs: %d", got)
 	}
+	if got := liveRegistrationCount(); got != baseLive+1 {
+		t.Fatalf("live registrations while callback runs = %d, want %d", got, baseLive+1)
+	}
 
 	close(gate)
-	select {
-	case <-returned:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("callback never returned")
-	}
-	// The owner is released once the native side observes the callback ended
-	// and the deferred release is replayed from Go (the background reaper does
-	// this automatically; call it explicitly to keep the test prompt).
-	waitFor(t, 30*time.Second, func() bool {
-		ReleaseDeferredReleases()
-		if released(slowReleased) == 1 {
-			return true
-		}
-		deferredMu.Lock()
-		n := len(deferredFails)
-		deferredMu.Unlock()
-		t.Logf("pending deferred=%d released-log=%v", n, traceReleased())
-		return false
-	})
+	// Registration still owns the callback after its invocation returns.
+	// Closing the engine releases that final owner after native work drains.
 	if _, err := engine.Close(); err != nil {
 		t.Fatalf("engine close: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond)
-	if got := released(slowReleased); got != 1 {
-		t.Fatalf("release count after engine close = %d, want 1", got)
+	waitFor(t, 2*time.Second, func() bool { return released(slowReleased) == 1 })
+	if got := liveRegistrationCount(); got != baseLive {
+		t.Fatalf("live registrations after teardown = %d, want %d", got, baseLive)
 	}
 }
 
@@ -412,7 +406,7 @@ func TestHostCallbackPanicContained(t *testing.T) {
 	panicky := func(ctx HostContext, input json.RawMessage) (json.RawMessage, error) {
 		panic("secret panic text")
 	}
-	echoReleased = releasedCountFor(panicky)
+	echoReleased = watchRelease(panicky)
 	if err := engine.RegisterHost("echo", panicky, 1024, 1024); err != nil {
 		t.Fatalf("RegisterHost: %v", err)
 	}
@@ -429,5 +423,51 @@ func TestHostCallbackPanicContained(t *testing.T) {
 	}
 	if _, err := sandbox.Close(); err != nil {
 		t.Fatalf("sandbox close: %v", err)
+	}
+}
+
+// TestHostRegistrationRegistryBounded covers requirement 2: repeated
+// register+close cycles return the live-registration count to zero, release the
+// native user data exactly once per registration, and retain no closed handles.
+func TestHostRegistrationRegistryBounded(t *testing.T) {
+	const cycles = 32
+	echo := func(ctx HostContext, input json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage("null"), nil
+	}
+	base := liveRegistrationCount()
+	for i := 0; i < cycles; i++ {
+		counter := watchRelease(echo)
+		engine, err := NewWithCapabilities([]string{"echo"})
+		if err != nil {
+			t.Fatalf("cycle %d NewWithCapabilities: %v", i, err)
+		}
+		if err := engine.RegisterHost("echo", echo, 1024, 1024); err != nil {
+			t.Fatalf("cycle %d RegisterHost: %v", i, err)
+		}
+		if got := liveRegistrationCount(); got != base+1 {
+			t.Fatalf("cycle %d live registrations = %d, want %d", i, got, base+1)
+		}
+		sandbox, err := engine.CreateWithGrants(hostEchoSource, map[string]string{"echo": "tenant-cycle"})
+		if err != nil {
+			t.Fatalf("cycle %d CreateWithGrants: %v", i, err)
+		}
+		if _, err := sandbox.Call(context.Background(), "run", json.RawMessage("null"), 10*time.Second); err != nil {
+			// hostEchoSource returns the callback result; echo returns null and
+			// the guest wraps it, so a successful call is expected.
+			t.Fatalf("cycle %d call: %v", i, err)
+		}
+		if _, err := sandbox.Close(); err != nil {
+			t.Fatalf("cycle %d sandbox close: %v", i, err)
+		}
+		if _, err := engine.Close(); err != nil {
+			t.Fatalf("cycle %d engine close: %v", i, err)
+		}
+		waitFor(t, 2*time.Second, func() bool { return released(counter) == 1 })
+		if got := released(counter); got != 1 {
+			t.Fatalf("cycle %d release count = %d, want exactly 1", i, got)
+		}
+		if got := liveRegistrationCount(); got != base {
+			t.Fatalf("cycle %d live registrations after close = %d, want %d", i, got, base)
+		}
 	}
 }

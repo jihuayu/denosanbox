@@ -123,6 +123,10 @@ const char *deno_status_name(deno_status_t status);
 /*
  * Engine lifecycle. Each successful constructor writes a nonzero owned token.
  * Output tokens are set to zero on failure.
+ * deno_engine_close shuts down the core and retires registered host callbacks.
+ * If no callback invocation is in flight, its release callback may run during
+ * close, before deno_engine_free. An already-dispatched callback keeps its
+ * user_data until it returns. Close leaves the engine token valid for free.
  */
 deno_status_t deno_engine_new(deno_engine_token *out_engine, deno_error *error_out);
 deno_status_t deno_engine_close(deno_engine_token engine,

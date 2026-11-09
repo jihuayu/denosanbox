@@ -36,6 +36,10 @@ engine.shutdown().await?;
 
 ## Bindings
 
+[Host interoperability](docs/host-interop.md) explains the bidirectional APIs,
+callback scheduling, async task ownership, GC boundaries and measured bridge
+performance.
+
 - [Python](bindings/python/README.md): PyO3/maturin, asyncio, explicit close/shutdown.
 - [Node.js](bindings/nodejs/README.md): napi-rs, Promises, explicit native loading and a strict platform/Node gate.
 - [C](bindings/c/README.md): versioned owned-handle ABI (`deno_abi_version()`, see `include/denosanbox.h` for the current value), polling completion and native host callbacks.

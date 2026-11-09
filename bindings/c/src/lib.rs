@@ -255,8 +255,9 @@ fn get_engine(token: u64) -> Option<Arc<CEngine>> {
     })
 }
 
-/// Ends the C layer's registration owner for one name; the core registry keeps
-/// its own owner until the last sandbox/handle is gone.
+/// Removes the C lookup metadata for one callback name. The core registry owns
+/// the handler until engine shutdown; an in-flight dispatch keeps its handler
+/// until the callback returns.
 #[no_mangle]
 /// # Safety
 /// All non-null pointers follow the header's byte/output contracts.
@@ -950,9 +951,9 @@ pub unsafe extern "C" fn deno_engine_free(
     ffi(error_out, || {
         match take_entry(engine_token, EntryKind::Engine) {
             Some(Entry::Engine(engine)) => {
-                // Freeing the engine ends its registration owners even when the
-                // core still holds a cancelled-but-running callback owner; that
-                // owner keeps the user data until the callback returns.
+                // Engine shutdown retires core registration handlers; any
+                // cancelled-but-running dispatch keeps its capture until it
+                // returns. This map contains lookup metadata only.
                 engine.forget_all();
                 drop(engine);
                 Ok(STATUS_OK)

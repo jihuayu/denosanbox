@@ -56,7 +56,9 @@ the Python host process. The bare deno_core profile does not expose `Deno.pid`; 
 ## Not implemented
 
 - JSX/TSX/CommonJS/native addons (rejected by the core with typed errors).
-- Network policy helpers, worker/delegation helpers and host import bridges.
+- Network/worker/delegation helper APIs and the advanced Rust
+  `Engine::with_host_config` controls (capability schemas, audit sink, shared
+  host/memory pools).
 - A published wheel distribution and platforms beyond the tested matrix.
 
 ## Build and install from source
@@ -72,8 +74,8 @@ maturin develop --release
 python -m pytest
 ```
 
-For a contract-only build where the Deno backend source is not available yet,
-build the explicit fake backend. These tests do **not** execute JavaScript:
+For a contract-only build, build the explicit fake backend. These tests do
+**not** execute JavaScript:
 
 ```bash
 maturin develop --no-default-features --features fake
@@ -121,15 +123,18 @@ enforces a deadline and terminates runaway V8 execution.
 `lib/util.ts`, `worker.js`, ...) to host-supplied source text plus an
 `entrypoint` key. Static imports, re-exports, computed dynamic imports and a
 guest `new Worker('./worker.js', {type: 'module'})` graph resolve only
-inside that immutable map; nothing is downloaded. `PreparedPlugin.module_paths`
-lists the frozen paths and `PreparedPlugin.profile` records the profile.
+inside that immutable map; nothing is downloaded. `Engine.create` validates the
+graph against that engine's limits (also for a plugin prepared by another
+engine). `PreparedPlugin.module_paths` lists the frozen paths and
+`PreparedPlugin.profile` records the profile.
 
 `profile` is explicit and never auto-enabled:
 
 - `"javascript-only"` (default): plain ES modules.
 - `"pure-js-npm"`: additionally authorizes a host-prepared vendored package
   graph (`PluginSource.add_package` from Rust) and the trusted
-  `worker_threads` / `node:worker_threads` alias.
+  `node:worker_threads` alias. That alias exists only in this profile; there is
+  no npm installer or runtime package download.
 
 Neither profile grants VFS, environment, network or callback privileges; those
 come from the engine ceiling plus the sandbox request. `prepare_modules` calls
@@ -283,3 +288,8 @@ Unknown future kinds fall back to `SandboxError` while preserving `kind` and
 trusted scope, ungranted denial, callback cancellation, sanitized failures, and
 explicit close before interpreter shutdown. Shared behavior fixtures also run
 against the Rust runner and the native Node package.
+
+The final rerun of this suite at implementation commit `4156653` is pending a
+fixture correction and is not recorded as passing; see
+[VALIDATION.md](VALIDATION.md) for the last verified results and reproducible
+commands.

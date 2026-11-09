@@ -1,19 +1,21 @@
 # denosanbox experimental C ABI
 
-This crate is a direct native adapter over the `denosanbox` Rust facade.
-It does not implement JavaScript, a second runtime, a subprocess/sidecar, guest
-callbacks or a policy engine. Every sandbox operation goes through the real
-Deno-backed core.
+This crate is a direct native adapter over the `denosanbox` Rust facade. It does
+not implement JavaScript, a second runtime, a subprocess/sidecar or a policy
+engine. Every sandbox operation goes through the real embedded Deno/V8 core.
 
 ## Status
 
-- ABI version: **1** (`deno_abi_version()`), independently versioned package
-  `0.1.0`.
+- ABI version: `deno_abi_version()`; read `include/denosanbox.h` for the exact
+  current value and declarations. Package version `0.1.0`, independently
+  versioned.
 - Stable shape for this experimental subset, not a final release surface.
-- Completion is **polling only**. The core callback registration parity work and
-  the release gate are still open, so this binding deliberately exposes no C
-  callback API yet. It does not claim issue-16 completeness.
-- Tested only on **Linux x86_64**. No other platform claim is made.
+- Completion is **polling only** (`deno_job_wait`).
+- Scoped native host callbacks are exposed: engine capability ceiling,
+  registration with bounded input/output, per-sandbox grants, trusted callback
+  context (`deno_context_json`, `deno_context_check`).
+- Tested only on **Linux x86_64** with Rust 1.99.1 / `deno_core 0.413.0`. No
+  other platform claim is made.
 - Recoverable Rust panics are contained with `catch_unwind` at every fallible
   extern boundary. Aborts, OOM and native faults are not contained.
 
@@ -37,8 +39,9 @@ shared target directory.
 
 ## API shape
 
-- Opaque owned `u64` tokens for engine, sandbox, job and buffer values. Tokens
-  are kind-checked and generated from one monotonic, non-reused registry.
+- Opaque owned `u64` tokens for engine, sandbox, job, buffer, context and
+  callback handles. Tokens are kind-checked and generated from one monotonic,
+  non-reused registry.
 - `deno_engine_new`, `deno_engine_create_sandbox` (source cap 8 MiB).
 - `deno_sandbox_call_submit` (export cap 128 bytes, JSON input cap 1 MiB,
   optional timeout) and `deno_job_wait` polling.
@@ -55,9 +58,32 @@ shared target directory.
   pointer validity/readability/writability; native pointer faults are outside
   the ABI's containment guarantee.
 
-See `include/denosanbox.h` for the exact version-1 declarations and lifetime
-rules. The C example is `examples/c/two_sandboxes.c`; edge coverage is
-`examples/c/abi_edge.c`.
+## Host callbacks
+
+- `deno_engine_new_with_capabilities` fixes the engine's capability-name
+  ceiling; `deno_engine_new` remains deny-all.
+- `deno_engine_register_host(engine, name, ..., callback, release, user_data)`
+  registers a callback (bounded input/output, 1..=64 MiB). Registration alone
+  grants nothing; ownership of `user_data` transfers only on
+  `DENO_STATUS_OK`.
+- `deno_engine_create_sandbox_with_grants` grants scopes from trusted host JSON;
+  guest source and guest JSON never contribute a grant.
+- Callbacks run synchronously on a managed native host thread (never the
+  isolate thread, never holding the registry lock), receive the borrowed
+  `input` plus a `deno_context_token` whose trusted metadata comes from the
+  invocation, and return an owned `deno_buffer` produced by `deno_buffer_copy`.
+  Not-OK statuses become one generic typed policy error; foreign error text is
+  never forwarded.
+- `release(user_data)` is called exactly once by native code after the last
+  registration, sandbox grant and in-flight invocation no longer references the
+  callback. There are no deferred tombstones and no global-thread heuristic: a
+  callback that is still running keeps its owner alive, and
+  `deno_sandbox_pending_host_operations` reports work that outlived a close.
+- Context tokens are borrowed; only the native owner releases them.
+
+See `include/denosanbox.h` for the exact declarations and lifetime rules. The C
+examples are `examples/c/two_sandboxes.c`, `examples/c/abi_edge.c` and
+`examples/c/host_callbacks.c`.
 
 ## Example build/run
 
@@ -78,7 +104,8 @@ even after the client cancels/frees its job token; saturation returns the typed
 limit status. Submission deadlines are pinned before scheduling. Completed
 owned result/job handles remain the caller's responsibility to free.
 
-Run C ownership/edge examples, Go context/race tests, and shared behavior parity:
+Run the C ownership/edge/callback examples, Go context/race tests, and shared
+behavior parity:
 
 ```sh
 sh bindings/c/test.sh

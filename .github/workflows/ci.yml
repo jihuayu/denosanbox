@@ -1,5 +1,9 @@
 name: native-library
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
 env:
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -25,11 +29,11 @@ jobs:
       - run: cargo fmt --manifest-path core/Cargo.toml --all --check
       - run: cargo clippy --manifest-path core/Cargo.toml --workspace --all-targets --locked -- -D warnings
       # Real Deno/V8 suites: facade conformance, module profiles, mounts,
-      # connectors/VFS, host bridge, runtime limits, host security, worker and
-      # binding parity fixtures. `runtime_limits` and `host_security` carry no
-      # ignored cases: the narrowed `max_log_bytes` acceptance depends on the
-      # runtime owner's dynamic-context implementation being merged and fails
-      # here (not skipped) until then.
+      # connectors/VFS, host bridge, runtime limits, host security, policy
+      # quotas, managed guest Workers and binding parity fixtures.
+      # `runtime_limits`, `host_security` and `policy_limits` carry no ignored
+      # cases; per-invocation log retention follows the invocation's effective
+      # `max_log_bytes`, including after live policy narrowing.
       - run: cargo test --manifest-path core/Cargo.toml --workspace --all-features --locked
       # Engine-independent contract without V8 (fake backend + policy/modules).
       # Excludes `denosanbox-testkit`: that crate's compile-time fixture is the
@@ -66,10 +70,10 @@ jobs:
       - run: sh bindings/nodejs/build.sh
       - run: node --test bindings/nodejs/tests/*.test.cjs
   c-and-go:
-    # Optional ABI products are still built and linked here so their
-    # compatibility claims are backed by CI. Runs the C/Go owner's locked
-    # script: C ABI examples (cc -std=c11 -Werror), `go test -race`, and the Go
-    # example. No sidecar runtime is involved.
+    # Optional ABI products are built and linked here so their compatibility
+    # claims are backed by CI. Runs the C/Go owner's locked script: the
+    # two-sandbox, ABI edge and host-callback C examples (cc -Wall -Wextra -Werror, gnu11),
+    # `go test -race`, and the Go example. No sidecar runtime is involved.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

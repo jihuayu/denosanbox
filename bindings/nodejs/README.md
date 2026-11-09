@@ -4,10 +4,10 @@ Version 0.1.0 calls the `denosanbox` 0.1.x Rust facade directly through napi-rs.
 It does not start Deno, a subprocess, or a sidecar. The addon is trusted host
 code; guest native addons remain unavailable.
 
-This package is private while its release gate is incomplete. The loader
-explicitly rejects combinations outside Linux x86_64 / Node 24.22.1. A successful
-local load is evidence for that exact build, not a guarantee for every Node 24
-patch release, libc, linker, or operating system.
+This package is private and not published. The loader explicitly rejects
+combinations outside Linux x86_64 / Node 24.22.1. A successful local load is
+evidence for that exact build, not a guarantee for every Node 24 patch release,
+libc, linker, or operating system.
 
 ## Build and test
 
@@ -68,9 +68,9 @@ node -e 'const a=require("./node-gate.node"); console.log(a.evaluate(), a.evalua
 
 That probe checked environment linkage only. The repository's actual napi-rs
 addon gate is `npm run build && npm test`: it exercises two independent engines,
-state separation, Promise calls, Node timers during an infinite guest loop,
-deadlines, cancellation, repeated close, and shutdown order. Never infer addon
-support solely from the preliminary C shim.
+state separation, Promise calls, deadlines, cancellation, managed guest Workers,
+repeated close, and shutdown order. Never infer addon support solely from the
+preliminary C shim.
 
 ## Module graphs, profiles, policy and mounts
 
@@ -86,9 +86,10 @@ plugin.profile;     // 'javascript-only'
 `prepare(source, entrypoint)` remains the one-module shortcut. `prepareModules`
 freezes a host-supplied graph; static imports, re-exports, computed dynamic
 imports and a guest `new Worker('./worker.js', {type: 'module'})` graph
-resolve only inside it. `profile` is explicit: `'javascript-only'` (default) or
-`'pure-js-npm'` (host-prepared vendored package graph plus the trusted
-`worker_threads` alias). The validated profile is stored on the
+resolve only inside it; the graph is validated when `create` runs. `profile` is
+explicit: `'javascript-only'` (default) or `'pure-js-npm'` (host-prepared
+vendored package graph plus the trusted `node:worker_threads` alias; that alias
+exists only in this profile). The validated profile is stored on the
 `PreparedPlugin` and passed through `create` to the facade
 `Engine::prepare_with_profile`; an unknown profile name is rejected and is
 never silently downgraded to `javascript-only`. No profile grants
@@ -133,26 +134,23 @@ export one object when an operation needs several fields:
 come from the host's `hostGrants` object; a forged scope inside guest JSON has
 no effect.
 
-## Remaining release requirements
+## Scope and release requirements
 
-Async host callbacks use bounded N-API threadsafe dispatch and return Promises. Shared behavior fixtures, multi-module/profile/VFS/mount tests and explicit process shutdown run against the native addon. Broader platform/Node version support and registry publication remain outside the tested matrix. No automatic
-fallback is provided for unsupported APIs, platforms, or failed native loading.
+Async host callbacks use bounded N-API threadsafe dispatch and return Promises. Shared behavior fixtures, multi-module/profile/VFS/mount tests, guest Worker tests and explicit process shutdown run against the native addon. Broader platform/Node version support and registry publication remain outside the tested matrix. No automatic fallback is provided for unsupported APIs, platforms, or failed native loading. The advanced Rust `Engine::with_host_config` controls (schemas, audit sink, shared host/memory pools) are not exposed by this binding.
 
 The same-process threat model applies: native faults and process OOM can affect
 the Node host. No per-isolate hard RSS limit or native crash containment is
 claimed. Node's V8 values never cross into the embedded V8 runtime; only JSON
 strings cross the facade.
 
-## Local validation — 2026-11-09
+## Local build
 
-The actual napi-rs addon built and loaded on Linux x86_64, Node v24.22.1
-(V8 13.6.233.17-node.58), Rust 1.99.1, deno_core 0.413.0, napi 3.16.1.
-All three `node --test tests/native.test.cjs` cases passed (0 skipped), and the
-native example completed with two independent guest counters. Cargo fmt and
-clippy with `-D warnings` passed. `npm pack --dry-run` confirmed that the native
-artifact, declarations, loader, README, and license are included. The local
-debug artifact was about 175 MB unpacked; release artifacts and install tests
-are still a release requirement. Nothing was published to npm.
+The actual napi-rs addon builds and loads on Linux x86_64 with Node exactly
+v24.22.1 (V8 13.6.233.17-node.58), Rust 1.99.1, deno_core 0.413.0 and napi
+3.16.1. `npm pack --dry-run` confirms that the native artifact, declarations,
+loader, README and license are included. The local debug artifact is about
+175 MB unpacked; release artifacts remain a release requirement. Nothing is
+published to npm.
 
 ## Scoped async host callbacks
 
@@ -177,13 +175,13 @@ cleanup report. Timeouts do not roll back committed side effects. Callbacks
 execute on the Node event loop, so avoid synchronous blocking work. N-API
 callback queues are bounded to 32 entries. Callback failures are sanitized.
 
-The completed local callback gate passed **10 native tests** with zero skips,
-including the four shared behavior fixtures and process exit after explicit
-callback close. Multi-module/profile/VFS/mount parity tests were added in
+Final validation at implementation commit `4156653` (Linux x86_64, Node
+v24.22.1): all **22** `node --test` cases passed with **no skips**, including the
+shared behavior fixtures, module/profile/VFS/mount parity in
 `tests/modules.test.cjs` (including a bounded 9 MiB `ArrayBuffer` probe against a
-16 MiB heap target / 24 MiB tree budget; no unbounded heap allocation is run);
-see `bindings/python/VALIDATION.md` for status. An actual `npm pack` archive was installed into a separate local
-package directory, then loaded and exercised with an async host PID callback;
-that installed-package smoke test passed. No package was published. The loader
-and package engine field intentionally accept only Node **24.22.1** until more
-combinations are verified.
+16 MiB heap target / 24 MiB tree budget; no unbounded heap allocation is run)
+and the async host callbacks. An actual `npm pack` archive was installed into a
+separate local package directory, then loaded and exercised with an async host
+PID callback; that installed-package smoke test passed. No package was
+published. The loader and package engine field intentionally accept only Node
+**24.22.1** on Linux x86_64 until more combinations are verified.

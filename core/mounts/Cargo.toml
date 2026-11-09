@@ -1,0 +1,17 @@
+[package]
+name = "denosanbox-mounts"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Explicit Linux-only mount table for the denosanbox sandbox VFS"
+publish = false
+
+[dependencies]
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
+libc = "0.2"
+denosanbox-policy = { path = "../policy" }
+
+[lib]
+name = "denosanbox_mounts"
+path = "src/lib.rs"

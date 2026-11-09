@@ -1,0 +1,11 @@
+# Explicit directory capabilities
+
+This crate provides opt-in host-directory mounts on Linux. Sandbox operation needs no mount or writable host directory by default. A trusted host opens a directory once and chooses a virtual prefix and read-only/read-write access. Every read/write also checks the calling sandbox identity and its current virtual-path policy.
+
+Mounts retain directory handles rather than resolving an ambient pathname on each operation. Parent components open one at a time with `open_dir_nofollow`; the final file uses `FollowSymlinks::No`. All symlinks are rejected, including aliases within the mounted directory, so a permitted virtual subtree cannot alias a denied subtree. Prefixes cannot overlap. File operations accept regular files only, use nonblocking opens to reject FIFO/device inputs, and bound source/result byte counts. No operation changes host cwd or environment.
+
+Authority follows the directory object retained at setup. A host rename does not revoke an existing capability. The host remains responsible for contents it deliberately places in a granted directory, including hard links. Filesystem permissions and process-native failures remain host concerns; this is no OS process containment. Read/write calls are synchronous filesystem operations: byte limits do not establish a latency bound on a stalled remote filesystem. The runtime must report incomplete close if host I/O fails to cooperate with cancellation. Writes are not transactional and an I/O error may follow partial mutation.
+
+`close(owner)` releases retained handles idempotently and rejects later operations. `clone_for(child_id)` is trusted-host inheritance of the same directory capabilities, with a new owner identity; callers must supply the child's attenuated policy on each operation and tie descendant cancellation to parent close.
+
+Run `cargo test --manifest-path core/Cargo.toml -p denosanbox-mounts` and `cargo clippy --manifest-path core/Cargo.toml -p denosanbox-mounts --all-targets -- -D warnings`. Tests cover read-only grants, policy narrowing, owner separation, limits, terminal close, internal/external symlinks, directory substitution races and FIFO rejection. Other operating systems return an explicit unsupported error when adding a mount.

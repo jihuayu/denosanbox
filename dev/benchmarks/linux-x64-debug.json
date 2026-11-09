@@ -1,0 +1,29 @@
+{
+  "results": [
+    {
+      "profile": "debug",
+      "platform": "linux",
+      "arch": "x86_64",
+      "iterations": 1000,
+      "prepare_us": 808,
+      "startup_us": 13769,
+      "calls_elapsed_us": 178865,
+      "calls_per_second": 5590.783829905635,
+      "deadline_configured_us": 50000,
+      "deadline_observed_us": 50725,
+      "process_rss_before_kib": 11500,
+      "process_rss_live_kib": 43576,
+      "close_clean": true,
+      "shutdown_clean": true
+    }
+  ],
+  "metadata": {
+    "measured_at": "2026-11-09T12:40:11.150968+00:00",
+    "implementation_sha": "41566532a2f00c3eb94f7fe3fcca481f8b66b352",
+    "code_configuration": "single in-memory module; default EngineConfig; unoptimized debug build with debuginfo; 1000 sequential calls; no explicit warmup; fixed 50 ms infinite-loop deadline probe",
+    "hardware": "AMD EPYC 9V74, four CPU quota cores (cpu.max=400000 100000), 16 GiB memory cgroup limit, shared cloud host",
+    "toolchain": "Rust 1.99.1, deno_core 0.413.0, Linux x86_64",
+    "meaning": "one observed run; not a capacity promise, not a hard per-isolate RSS bound",
+    "note": "CPU and memory figures describe the measurement host, not sandbox capacity; documentation DSH was concurrent, no native validation builds were running"
+  }
+}

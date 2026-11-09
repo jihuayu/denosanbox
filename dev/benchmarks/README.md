@@ -1,0 +1,9 @@
+# Reproduce native embedding measurements
+
+Run `cargo run --manifest-path core/Cargo.toml --example benchmark -- 1000`. For optimized measurements use `--release` and record that profile separately. Each run executes a native Rust host, prepares an in-memory module, creates an embedded Deno/V8 isolate, validates every returned JSON value, interrupts an infinite loop after a configured 50 ms and explicitly joins shutdown. No Deno executable or sidecar is invoked.
+
+The example emits `results[]` (one measured run with its own profile, platform, toolchain-independent counters and process VmRSS) plus `metadata` describing the example program's own configuration. It never reports hardware capacity.
+
+`linux-x64-debug.json` records implementation `4156653` with the defaults documented in the compatibility matrix. It contains one run on 2026-11-09: Linux x86_64, AMD EPYC 9V74, four CPU quota cores (`cpu.max=400000 100000`), 16 GiB memory cgroup limit, Rust 1.99.1, deno_core 0.413.0, **unoptimized debug build with debuginfo**, 1,000 sequential calls, shared cloud host. There was no explicit warmup; the documentation DSH session ran concurrently, with no native validation builds running. The artifact includes its timestamp and implementation SHA. Measure again on deployment hardware before comparing. Those 4-core/16 GiB figures describe the measurement host, not the capacity or limits of the sandbox. VmRSS is total process resident memory before/while the isolate is live, read from `/proc/self/status`; it includes shared/runtime allocations and does not attribute all memory to the sandbox.
+
+Repeat multiple times on deployment hardware and record CPU, quota, toolchain, backend version, build profile, iteration count, warmup and concurrent workload before comparing results. The default script deliberately leaves release compilation and long stress runs to the operator.

@@ -1,0 +1,291 @@
+{
+  "schemaVersion": 1,
+  "kind": "denosanbox.conformance.fixtures",
+  "status": "declarative-only",
+  "description": "Portable, backend-neutral JavaScript ESM behavior fixtures for the in-process Deno sandbox. Sources are real ESM programs; this file records expected semantics but does not execute them. A future core/testkit facade decides how to realize each fixture.",
+  "executionNote": "dev/validate-fixtures.py only validates JSON shape and static source bounds. No fixture source is executed and no runtime behavior is claimed.",
+  "sourceLimits": {
+    "maxSourceBytes": 8192
+  },
+  "cases": [
+    {
+      "id": "isolation-global-state",
+      "name": "Global and prototype mutations stay inside one instance",
+      "category": "state-isolation",
+      "source": "globalThis.__conformanceGlobal = (globalThis.__conformanceGlobal ?? 0) + 1;\nObject.prototype.__conformancePolluted = \"visible-in-instance\";\n\nexport default {\n  globalCount: globalThis.__conformanceGlobal,\n  seenThroughPrototype: ({}).__conformancePolluted,\n};",
+      "requirements": {
+        "features": ["in-process-isolate"],
+        "permissions": [],
+        "network": false,
+        "filesystem": "none",
+        "limits": {
+          "deadlineMs": 1000
+        }
+      },
+      "expected": {
+        "outcome": "success",
+        "procedure": [
+          "Import the module in two fresh sandbox instances.",
+          "Read the default export from each instance.",
+          "Read a plain object's inherited property in each instance."
+        ],
+        "observations": {
+          "firstExport": {
+            "globalCount": 1,
+            "seenThroughPrototype": "visible-in-instance"
+          },
+          "secondExport": {
+            "globalCount": 1,
+            "seenThroughPrototype": "visible-in-instance"
+          }
+        },
+        "assertions": [
+          "Both instances report globalCount 1; neither observes the other instance's mutation.",
+          "The prototype mutation is visible only inside the instance that made it.",
+          "A fresh instance sees an undefined __conformanceGlobal and an undefined __conformancePolluted.",
+          "The host global object and host prototypes are unchanged after both instances close."
+        ]
+      }
+    },
+    {
+      "id": "isolation-module-instance-state",
+      "name": "Module-level state is not shared across instances",
+      "category": "state-isolation",
+      "source": "let evaluations = 0;\nconst state = { count: 0 };\n\nevaluations += 1;\n\nexport default {\n  evaluations,\n  bump() {\n    state.count += 1;\n    return state.count;\n  },\n  snapshot() {\n    return { evaluations, count: state.count };\n  },\n};",
+      "requirements": {
+        "features": ["in-process-isolate", "esm-module-evaluation"],
+        "permissions": [],
+        "network": false,
+        "filesystem": "none",
+        "limits": {
+          "deadlineMs": 1000
+        }
+      },
+      "expected": {
+        "outcome": "success",
+        "procedure": [
+          "Import the module in two fresh sandbox instances.",
+          "Call bump() twice on each instance's default export.",
+          "Read snapshot() from each instance."
+        ],
+        "observations": {
+          "bumpResults": [1, 2],
+          "snapshot": {
+            "evaluations": 1,
+            "count": 2
+          }
+        },
+        "assertions": [
+          "Each instance evaluates the module exactly once.",
+          "Calling bump() in one instance never changes the other instance's count.",
+          "Re-importing within one instance reuses that instance's module cache; a separate instance gets a separate cache.",
+          "No module namespace object or mutable export is shared across instance boundaries."
+        ]
+      }
+    },
+    {
+      "id": "import-denial-static",
+      "name": "Static imports outside the allowed module graph are denied before evaluation",
+      "category": "module-import",
+      "source": "import fs from \"node:fs\";\nimport secret from \"../../../../etc/passwd\";\n\nexport default {\n  fsType: typeof fs,\n  secretType: typeof secret,\n};",
+      "requirements": {
+        "features": ["in-process-isolate", "esm-static-import"],
+        "permissions": [],
+        "network": false,
+        "filesystem": "none",
+        "limits": {
+          "deadlineMs": 1000
+        }
+      },
+      "expected": {
+        "outcome": "module-load-denied",
+        "procedure": [
+          "Attempt to load the module through the sandbox module loader.",
+          "Observe the load error and verify the default export was never evaluated."
+        ],
+        "observations": {
+          "guestCodeEvaluated": false,
+          "hostFileContentsLeaked": false
+        },
+        "assertions": [
+          "At least one static specifier is rejected by the module loader; the exact first failing specifier is host-dependent.",
+          "The guest module body does not execute and no default export is produced.",
+          "Neither node:fs nor any file outside the allowed module root is resolved.",
+          "The rejection is reported as an authorization or module-resolution failure, not as a successful import of a stub."
+        ]
+      }
+    },
+    {
+      "id": "import-denial-dynamic",
+      "name": "Dynamic import escape attempts reject without loading host modules",
+      "category": "module-import",
+      "source": "const attempts = [\n  \"../../../../etc/passwd\",\n  [\"..\", \"..\", \"..\", \"..\", \"etc\", \"passwd\"].join(\"/\"),\n  \"file:///etc/passwd\",\n  \"node:child_process\",\n  \"http://127.0.0.1:9/mod.js\",\n];\n\nconst results = [];\nfor (const specifier of attempts) {\n  try {\n    await import(specifier);\n    results.push({ specifier, status: \"loaded\" });\n  } catch (error) {\n    results.push({\n      specifier,\n      status: \"rejected\",\n      errorName: String(error?.name ?? \"Error\"),\n    });\n  }\n}\n\nexport default { results };",
+      "requirements": {
+        "features": ["in-process-isolate", "esm-dynamic-import"],
+        "permissions": [],
+        "network": false,
+        "filesystem": "none",
+        "limits": {
+          "deadlineMs": 2000
+        }
+      },
+      "expected": {
+        "outcome": "operation-denied",
+        "procedure": [
+          "Import the module and allow its top-level await to settle.",
+          "Inspect every entry in the exported results array.",
+          "Verify no host file or network response was read and no child-process module was provided."
+        ],
+        "observations": {
+          "allStatusesRejected": true,
+          "hostFileContentsLeaked": false,
+          "childProcessApiExposed": false
+        },
+        "assertions": [
+          "Every dynamic import rejects; none reports status loaded.",
+          "Computed relative specifiers do not bypass the module-root check.",
+          "file: URLs and remote HTTP specifiers are denied without network access.",
+          "node:child_process is either absent or rejected; no child process is created.",
+          "The guest cannot distinguish a missing module from a denied module in a way that reveals host filesystem entries."
+        ]
+      }
+    },
+    {
+      "id": "denied-process-api",
+      "name": "Guest process APIs cannot exit the host or reach native bindings",
+      "category": "guest-api-denial",
+      "source": "const report = {\n  processType: typeof process,\n  requireType: typeof require,\n  exitAttempted: false,\n  exitDenied: false,\n  bindingType: \"unavailable\",\n};\n\nif (typeof process !== \"undefined\") {\n  try {\n    report.exitAttempted = true;\n    process.exit(7);\n    report.exitReturned = true;\n  } catch (error) {\n    report.exitDenied = true;\n    report.exitErrorName = String(error?.name ?? error);\n  }\n\n  try {\n    report.bindingType = typeof process.binding;\n  } catch (error) {\n    report.bindingType = \"throws\";\n  }\n}\n\nexport default report;",
+      "requirements": {
+        "features": ["in-process-isolate"],
+        "permissions": [],
+        "network": false,
+        "filesystem": "none",
+        "limits": {
+          "deadlineMs": 1000
+        }
+      },
+      "expected": {
+        "outcome": "operation-denied",
+        "procedure": [
+          "Import the module in a sandbox instance and read the report export.",
+          "Confirm the host process is still alive after the guest attempted process.exit(7).",
+          "Run a trivial host operation in a new instance to prove the host is responsive."
+        ],
+        "observations": {
+          "hostAliveAfterFixture": true,
+          "hostExitCodeObservedByGuest": false
+        },
+        "assertions": [
+          "process is absent, or process.exit throws or is denied; it never terminates the host.",
+          "A successful return from process.exit is a failure of the sandbox, not an accepted outcome.",
+          "process.binding is unavailable or denied and returns no native binding object.",
+          "require is not a host-loading function; guest native addon loading is unavailable.",
+          "No subprocess, signal, or environment mutation is observed by the host."
+        ]
+      }
+    },
+    {
+      "id": "denied-native-api",
+      "name": "Native library and subprocess entry points are absent or denied",
+      "category": "guest-api-denial",
+      "source": "const probes = {\n  denoPresent: typeof Deno !== \"undefined\",\n  denoDlopen: typeof Deno !== \"undefined\" && typeof Deno.dlopen === \"function\",\n  denoRun: typeof Deno !== \"undefined\" && typeof Deno.run === \"function\",\n  denoCommand: typeof Deno !== \"undefined\" && typeof Deno.Command === \"function\",\n  processDlopen: typeof process !== \"undefined\" && typeof process.dlopen === \"function\",\n};\n\nlet dlopenErrorName = null;\nif (probes.denoDlopen) {\n  try {\n    Deno.dlopen(\"/lib/x86_64-linux-gnu/libc.so.6\", {});\n  } catch (error) {\n    dlopenErrorName = String(error?.name ?? error);\n  }\n}\n\nexport default { probes, dlopenErrorName };",
+      "requirements": {
+        "features": ["in-process-isolate"],
+        "permissions": [],
+        "network": false,
+        "filesystem": "none",
+        "limits": {
+          "deadlineMs": 1000
+        }
+      },
+      "expected": {
+        "outcome": "operation-denied",
+        "procedure": [
+          "Import the module and read the probe report.",
+          "Verify no native library handle, PID, or child process was returned to the guest.",
+          "Confirm the host remains alive and can serve a subsequent operation."
+        ],
+        "observations": {
+          "nativeHandleObtained": false,
+          "subprocessStarted": false
+        },
+        "assertions": [
+          "Deno.dlopen, Deno.run, Deno.Command, and process.dlopen are absent or reject with an authorization error.",
+          "If a probed function exists only as a stub, calling it must not load a library or start a process.",
+          "No native symbol address, file descriptor, PID, or child handle is exposed to the guest.",
+          "Absence of the Deno global is a valid pass; the fixture must not require Deno-specific APIs to exist."
+        ]
+      }
+    },
+    {
+      "id": "deadline-infinite-loop",
+      "name": "A CPU-bound infinite loop is terminated at the deadline",
+      "category": "deadline",
+      "source": "// Intentionally never yields. The host deadline must terminate the isolate.\nexport function spin() {\n  let counter = 0;\n  while (true) {\n    counter = (counter + 1) >>> 0;\n  }\n}\n\nspin();\nexport default { reached: true };",
+      "requirements": {
+        "features": ["in-process-isolate", "deadline-enforcement"],
+        "permissions": [],
+        "network": false,
+        "filesystem": "none",
+        "limits": {
+          "deadlineMs": 100,
+          "cpuBound": true
+        }
+      },
+      "expected": {
+        "outcome": "timeout",
+        "procedure": [
+          "Import the module with a 100 ms deadline.",
+          "Wait for the host to report timeout or termination.",
+          "Create and run a second fresh sandbox instance afterward.",
+          "Close the timed-out instance and verify its resources are released."
+        ],
+        "observations": {
+          "defaultExportProduced": false,
+          "hostResponsiveAfterTimeout": true
+        },
+        "assertions": [
+          "The operation is reported as timed out or terminated; it is not reported as success.",
+          "The host process remains alive and a subsequent fresh instance completes a trivial operation.",
+          "The endless loop cannot delay host shutdown indefinitely.",
+          "No result, partial export, or promise resolution from the timed-out instance is accepted.",
+          "Closing the instance is idempotent and releases its isolate and channels."
+        ]
+      }
+    },
+    {
+      "id": "deadline-pending-promise",
+      "name": "A never-settling promise is bounded by the deadline",
+      "category": "deadline",
+      "source": "const never = new Promise(() => {});\nglobalThis.__conformancePending = never;\n\nawait never;\n\nexport default { reached: true };",
+      "requirements": {
+        "features": ["in-process-isolate", "deadline-enforcement", "esm-top-level-await"],
+        "permissions": [],
+        "network": false,
+        "filesystem": "none",
+        "limits": {
+          "deadlineMs": 200
+        }
+      },
+      "expected": {
+        "outcome": "timeout",
+        "procedure": [
+          "Import the module with a 200 ms deadline and allow event-loop turns to run.",
+          "Wait for the host to report timeout or termination.",
+          "Run a subsequent fresh instance and close the timed-out one."
+        ],
+        "observations": {
+          "defaultExportProduced": false,
+          "pendingPromiseKeepsHostAlive": false
+        },
+        "assertions": [
+          "Top-level await does not settle and the operation times out at the configured deadline.",
+          "The pending promise does not keep the host event loop alive after instance teardown.",
+          "The host remains responsive and a later fresh instance succeeds.",
+          "No value is accepted from the timed-out instance after cleanup.",
+          "Cleanup releases the instance's task queue and message channels without panicking."
+        ]
+      }
+    }
+  ]
+}

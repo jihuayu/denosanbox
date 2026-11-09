@@ -1,0 +1,17 @@
+[package]
+name = "denosanbox-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "Apache-2.0"
+description = "Public data model, errors and backend contract for denosanbox"
+publish = false
+
+[dependencies]
+denosanbox-modules = { path = "../modules", version = "0.1.0" }
+serde_json = "1.0.145"
+
+denosanbox-policy = { path = "../policy", version = "0.1.0" }
+tokio = { version = "1.48", features = ["rt", "sync", "time", "macros"] }
+denosanbox-mounts = { path = "../mounts", version = "0.1.0" }
+denosanbox-connectors = { path = "../connectors", version = "0.1.0" }

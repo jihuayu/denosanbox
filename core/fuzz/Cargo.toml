@@ -1,0 +1,18 @@
+[package]
+name = "denosanbox-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+[package.metadata]
+cargo-fuzz = true
+[dependencies]
+libfuzzer-sys = "0.4"
+denosanbox-policy = { path = "../policy" }
+[workspace]
+members = ["."]
+[[bin]]
+name = "boundaries"
+path = "fuzz_targets/boundaries.rs"
+test = false
+doc = false
+bench = false

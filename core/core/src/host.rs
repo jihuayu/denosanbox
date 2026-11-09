@@ -11,6 +11,9 @@ use std::time::Duration;
 use crate::host_audit::{AuditEvent, AuditOutcome, HostAudit};
 use crate::host_schema::{JsonSchema, SchemaLimits};
 use crate::{Error, Result};
+use denosanbox_connectors::{
+    ConnectorError, ConnectorLimits, HttpConnector, HttpRequest, HttpResponse,
+};
 use denosanbox_mounts::{MountAccess, MountTable};
 use denosanbox_policy::{Budget, Lease, VirtualPath};
 use std::future::Future;
@@ -95,6 +98,19 @@ pub struct HostContext {
     vfs_leases: Mutex<BTreeMap<String, Lease>>,
     mounts: Mutex<MountTable>,
     worker_handler: Mutex<WorkerHandlerState>,
+    worker_depth: AtomicUsize,
+    http: Mutex<Arc<HttpConnector>>,
+}
+
+fn network_error(error: ConnectorError) -> Error {
+    match error {
+        ConnectorError::Cancelled => Error::Cancelled,
+        ConnectorError::DeadlineExceeded => Error::DeadlineExceeded,
+        other => Error::Policy {
+            kind: other.code().to_string(),
+            message: format!("network operation: {}", other.code()),
+        },
+    }
 }
 
 fn mount_error(error: denosanbox_mounts::Error) -> Error {
@@ -143,6 +159,14 @@ impl HostContext {
     ) -> Result<Arc<Self>> {
         let id = SandboxId::mint();
         let limits = policy.limits();
+        let http = HttpConnector::new(ConnectorLimits {
+            max_request_bytes: limits.max_message_bytes(),
+            max_response_bytes: limits.max_message_bytes(),
+            timeout: limits.deadline(),
+            ..Default::default()
+        })
+        .map_err(network_error)?;
+
         let mut indexed = BTreeMap::new();
         for grant in grants {
             policy
@@ -194,13 +218,28 @@ impl HostContext {
             vfs_leases: Mutex::new(BTreeMap::new()),
             mounts: Mutex::new(MountTable::new(id, 16, limits.max_message_bytes())),
             worker_handler: Mutex::new(WorkerHandlerState::default()),
+            worker_depth: AtomicUsize::new(0),
+            http: Mutex::new(Arc::new(http)),
         }))
     }
     pub fn id(&self) -> SandboxId {
         self.id
     }
     pub fn outstanding(&self) -> usize {
-        self.outstanding.load(Ordering::Acquire)
+        let pending = self
+            .http
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_resolutions();
+        self.outstanding
+            .load(Ordering::Acquire)
+            .saturating_add(pending)
+    }
+    pub fn set_worker_depth(&self, depth: usize) {
+        self.worker_depth.store(depth, Ordering::Release);
+    }
+    pub fn worker_depth(&self) -> usize {
+        self.worker_depth.load(Ordering::Acquire)
     }
     pub fn grants(&self) -> Vec<HostGrant> {
         self.grants.values().cloned().collect()
@@ -295,11 +334,20 @@ impl HostContext {
     pub fn inherit_mounts_from(&self, parent: &HostContext) -> Result<()> {
         let (_guard, _admission) = self.reserve_work()?;
         parent.live()?;
-        let inherited = lock(&parent.mounts)?
+        let inherited = parent
+            .mounts
+            .try_lock()
+            .map_err(|_| Error::LimitExceeded {
+                limit: "mount_setup_busy".into(),
+                detail: "parent mount setup in progress".into(),
+            })?
             .clone_for(self.id)
             .map_err(mount_error)?;
         parent.live()?;
-        *lock(&self.mounts)? = inherited;
+        *self.mounts.try_lock().map_err(|_| Error::LimitExceeded {
+            limit: "mount_setup_busy".into(),
+            detail: "child mount setup in progress".into(),
+        })? = inherited;
         self.finish_resource(Ok(()))
     }
     fn finish_resource<T>(&self, result: Result<T>) -> Result<T> {
@@ -329,11 +377,17 @@ impl HostContext {
     fn read_inner(&self, path: &str) -> Result<Vec<u8>> {
         self.live()?;
         let (path, policy) = self.resolved_path(path)?;
-        let mounts = lock(&self.mounts)?;
-        if mounts.contains(&path) {
-            return mounts.read(self.id, &policy, &path).map_err(mount_error);
+        let mounted = {
+            let mounts = lock(&self.mounts)?;
+            if mounts.contains(&path) {
+                Some(mounts.clone_for(self.id).map_err(mount_error)?)
+            } else {
+                None
+            }
+        };
+        if let Some(mount) = mounted {
+            return mount.read(self.id, &policy, &path).map_err(mount_error);
         }
-        drop(mounts);
         lock(&self.view)?.read(&path).map_err(policy_error)
     }
     /// Synchronous trusted-host convenience. Guest operations use write_async.
@@ -344,13 +398,19 @@ impl HostContext {
     fn write_inner(&self, path: &str, data: &[u8]) -> Result<()> {
         self.live()?;
         let (path, policy) = self.resolved_path(path)?;
-        let mounts = lock(&self.mounts)?;
-        if mounts.contains(&path) {
-            return mounts
+        let mounted = {
+            let mounts = lock(&self.mounts)?;
+            if mounts.contains(&path) {
+                Some(mounts.clone_for(self.id).map_err(mount_error)?)
+            } else {
+                None
+            }
+        };
+        if let Some(mount) = mounted {
+            return mount
                 .write(self.id, &policy, &path, data)
                 .map_err(mount_error);
         }
-        drop(mounts);
         let mut view = lock(&self.view)?;
         let mut leases = lock(&self.vfs_leases)?;
         // Charge the incoming Vec allocation before replacing the old one.
@@ -384,17 +444,20 @@ impl HostContext {
     fn set_cwd_inner(&self, path: &str) -> Result<()> {
         self.live()?;
         let (path, policy) = self.resolved_path(path)?;
-        let mounts = lock(&self.mounts)?;
-        if mounts.contains(&path) {
-            mounts
-                .is_dir(self.id, &policy, &path)
-                .map_err(mount_error)?;
-            drop(mounts);
+        let mounted = {
+            let mounts = lock(&self.mounts)?;
+            if mounts.contains(&path) {
+                Some(mounts.clone_for(self.id).map_err(mount_error)?)
+            } else {
+                None
+            }
+        };
+        if let Some(mount) = mounted {
+            mount.is_dir(self.id, &policy, &path).map_err(mount_error)?;
             return lock(&self.view)?
                 .set_external_cwd(VirtualPath::parse(&path).map_err(policy_error)?)
                 .map_err(policy_error);
         }
-        drop(mounts);
         lock(&self.view)?.set_cwd(&path).map_err(policy_error)
     }
     pub async fn set_cwd_async(self: &Arc<Self>, path: String) -> Result<()> {
@@ -514,6 +577,49 @@ impl HostContext {
                 _=tokio::time::sleep(Duration::from_millis(5))=>{}
             }
         }
+    }
+    /// Trusted host transport customization, e.g. a deterministic resolver.
+    /// Guest input never selects or replaces the connector or resolver.
+    pub fn set_http_connector(&self, connector: HttpConnector) -> Result<()> {
+        self.live()?;
+        if self.outstanding() != 0 {
+            return Err(Error::InvalidConfiguration {
+                reason: "cannot replace active HTTP connector".into(),
+            });
+        }
+        *lock(&self.http)? = Arc::new(connector);
+        Ok(())
+    }
+    pub async fn http_request(self: &Arc<Self>, request: HttpRequest) -> Result<HttpResponse> {
+        let connector = lock(&self.http)?.clone();
+        self.offload(move |context| {
+            let remaining = context
+                .deadline()?
+                .remaining()
+                .ok_or(Error::DeadlineExceeded)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| Error::Backend {
+                    message: "network runtime unavailable".into(),
+                })?;
+            let result = runtime
+                .block_on(connector.execute_with_policy(
+                    request,
+                    || context.policy().network().clone(),
+                    &context.cancellation,
+                    remaining,
+                ))
+                .map_err(network_error);
+            drop(runtime);
+            // getaddrinfo is non-cooperative. Retain this owner's native work,
+            // ancestor admission and context until its resolver really returns.
+            while connector.pending_resolutions() != 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result
+        })
+        .await
     }
     pub fn protocol_version(&self) -> u16 {
         denosanbox_policy::PROTOCOL_VERSION
@@ -1004,5 +1110,94 @@ mod tests {
                 .unwrap(),
             json!("close")
         );
+    }
+    #[test]
+    fn network_default_deny_precedes_resolver_side_effects() {
+        struct CountingResolver(Arc<AtomicUsize>);
+        impl denosanbox_connectors::Resolver for CountingResolver {
+            fn resolve(&self, _: String, _: u16) -> denosanbox_connectors::ResolveFuture {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Err(ConnectorError::Transport) })
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let connector = HttpConnector::with_resolver(
+            ConnectorLimits::default(),
+            Arc::new(CountingResolver(count.clone())),
+        )
+        .unwrap();
+        let context = HostContext::new(
+            Policy::default(),
+            Arc::new(Mutex::new(HostRegistry::default())),
+            vec![],
+        )
+        .unwrap();
+        context.set_http_connector(connector).unwrap();
+        context.begin_invocation(Duration::from_secs(1)).unwrap();
+        let result = runtime().block_on(context.http_request(HttpRequest {
+            url: "http://localhost/".into(),
+            method: "GET".into(),
+            headers: Default::default(),
+            body: vec![],
+        }));
+        assert!(matches!(result,Err(Error::Policy{kind,..}) if kind=="network_denied"));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+    #[test]
+    fn resolver_native_work_remains_owned_after_http_deadline() {
+        struct SlowResolver {
+            pending: Arc<AtomicUsize>,
+        }
+        impl denosanbox_connectors::Resolver for SlowResolver {
+            fn resolve(&self, _: String, _: u16) -> denosanbox_connectors::ResolveFuture {
+                let pending = self.pending.clone();
+                pending.fetch_add(1, Ordering::AcqRel);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(150));
+                    pending.fetch_sub(1, Ordering::AcqRel);
+                });
+                Box::pin(std::future::pending())
+            }
+            fn pending(&self) -> usize {
+                self.pending.load(Ordering::Acquire)
+            }
+        }
+        let pending = Arc::new(AtomicUsize::new(0));
+        let connector = HttpConnector::with_resolver(
+            ConnectorLimits::default(),
+            Arc::new(SlowResolver {
+                pending: pending.clone(),
+            }),
+        )
+        .unwrap();
+        let policy = Policy::default().with_network(
+            denosanbox_policy::NetworkRules::deny_all()
+                .allow_private("localhost", 80)
+                .unwrap(),
+        );
+        let context = HostContext::new(
+            policy,
+            Arc::new(Mutex::new(HostRegistry::default())),
+            vec![],
+        )
+        .unwrap();
+        context.set_http_connector(connector).unwrap();
+        context.begin_invocation(Duration::from_millis(30)).unwrap();
+        let result = runtime().block_on(context.http_request(HttpRequest {
+            url: "http://localhost/".into(),
+            method: "GET".into(),
+            headers: Default::default(),
+            body: vec![],
+        }));
+        assert!(matches!(result, Err(Error::DeadlineExceeded)));
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert!(context.outstanding() > 0);
+        context.cancel();
+        assert!(context.outstanding() > 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while context.outstanding() != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(context.outstanding(), 0);
     }
 }

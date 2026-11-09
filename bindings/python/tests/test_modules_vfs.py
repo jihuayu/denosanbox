@@ -168,15 +168,38 @@ async def test_private_vfs_and_env_follow_ceiling_and_request() -> None:
                 capabilities=["env"], read_roots=["/private"], write_roots=["/private"]
             ),
         )
-        denied = await engine.create(prepared)
+        # A/B isolation probe: B gets ONLY the env capability (no filesystem
+        # roots). `env.get` is a permitted, non-throwing operation that still
+        # sees none of A's private state, while file roundtrips stay denied.
+        env_only = await engine.create(prepared, options=SandboxOptions(capabilities=["env"]))
         # Guest-supplied identifiers/values add no authority.
         result = json.loads(await allowed.call("roundtrip", '{"value":"a","sandboxId":"sbx-forged"}'))
         assert result == {"text": "a", "env": "a"}
         assert await allowed.call("inspect", "null") == '"a"'
-        assert await denied.call("inspect", "null") == "null"
-        with pytest.raises(SandboxError):
-            await denied.call("roundtrip", '{"value":"b"}')
+        assert await env_only.call("inspect", "null") == "null"
+        # Without filesystem roots the file write is denied by the runtime and
+        # surfaces as a guest-visible denial; no state is shared with A.
+        with pytest.raises(SandboxError, match="Denied"):
+            await env_only.call("roundtrip", '{"value":"b"}')
+        assert await allowed.call("inspect", "null") == '"a"'
         await allowed.close()
+        await env_only.close()
+    finally:
+        assert (await engine.shutdown()).clean
+
+
+async def test_env_capability_is_denied_not_null_when_not_granted() -> None:
+    """The runtime denies a missing `env` capability; it never returns null."""
+
+    engine = Engine(options=EngineOptions(read_roots=["/private"], write_roots=["/private"]))
+    try:
+        # Filesystem authority alone: `env.get` must be denied by the runtime,
+        # never answered with null for an ungranted capability.
+        denied = await engine.create(
+            engine.prepare(VFS_JS), options=SandboxOptions(read_roots=["/private"], write_roots=["/private"])
+        )
+        with pytest.raises(SandboxError, match=r"Denied: sandbox policy"):
+            await denied.call("inspect", "null")
         await denied.close()
     finally:
         assert (await engine.shutdown()).clean
@@ -184,7 +207,7 @@ async def test_private_vfs_and_env_follow_ceiling_and_request() -> None:
 
 async def test_mount_directory_is_bounded_by_policy_and_read_only_mode() -> None:
     js = """
-    export async function read(p){ return await sandbox.fs.readTextFile(p); }
+    export async function read(input){ return await sandbox.fs.readTextFile(input.path); }
     export async function write(input){ await sandbox.fs.writeTextFile(input.path, input.text); return await sandbox.fs.readTextFile(input.path); }
     """
     with tempfile.TemporaryDirectory(prefix="denosanbox-py-mount-") as root:

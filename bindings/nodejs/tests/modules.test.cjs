@@ -93,14 +93,19 @@ test('guest Worker graphs run from the prepared module map only', async () => {
   } finally { assert.equal(await engine.shutdown(), true); }
 });
 
-test('private VFS read/write and env come from engine ceiling and sandbox request', async () => {
-  const js = `export async function roundtrip(input) {
+// Roundtrip writes then reads one private file and one env var.
+const PRIVATE_JS = `export async function roundtrip(input) {
     await sandbox.fs.writeTextFile('/private/value', input.value);
     sandbox.env.set('PRIVATE', input.value);
     return {text: await sandbox.fs.readTextFile('/private/value'), env: sandbox.env.get('PRIVATE')};
-  }
-  export function inspect(){ return sandbox.env.get('PRIVATE'); }`;
-  const engine = new Engine({hostCapabilities: ['env'], readRoots: ['/private'], writeRoots: ['/private']});
+  }`;
+
+test('private VFS read/write and env come from engine ceiling and sandbox request', async () => {
+  const js = `${PRIVATE_JS}
+  export function inspect(){ return sandbox.env.get('PRIVATE'); }
+  export function inspectFile(){ return sandbox.fs.readTextFile('/private/value'); }`;
+  // The ceiling must authorize every capability the sandbox requests.
+  const engine = new Engine({hostCapabilities: ['env', 'fs'], readRoots: ['/private'], writeRoots: ['/private']});
   try {
     // A sandbox request above the ceiling fails closed with a policy error.
     await assert.rejects(
@@ -109,14 +114,24 @@ test('private VFS read/write and env come from engine ceiling and sandbox reques
     const allowed = await engine.create(engine.prepare(js), {
       capabilities: ['env'], readRoots: ['/private'], writeRoots: ['/private'],
     });
-    const denied = await engine.create(engine.prepare(js));
+    // A/B isolation: B may use env and files (capability granted) but gets no
+    // filesystem roots, so its env view is empty and its file is missing.
+    const other = await engine.create(engine.prepare(js), {capabilities: ['env', 'fs']});
     // A guest-supplied ID/value can never add authority.
     assert.deepEqual(await allowed.call('roundtrip', {value: 'a', sandboxId: 'sbx-forged'}), {text: 'a', env: 'a'});
     assert.equal(await allowed.call('inspect', null), 'a');
-    // Separate sandbox: no shared file, env or cwd.
-    assert.equal(await denied.call('inspect', null), null);
-    await assert.rejects(denied.call('roundtrip', {value: 'b'}), SandboxError);
-    await allowed.close(); await denied.close();
+    assert.equal(await other.call('inspect', null), null);
+    await assert.rejects(other.call('inspectFile', null),
+      e => e instanceof SandboxError && /Denied/.test(e.message));
+    await assert.rejects(other.call('roundtrip', {value: 'b'}),
+      e => e instanceof SandboxError && /Denied/.test(e.message));
+    assert.equal(await allowed.call('inspect', null), 'a');
+    await allowed.close(); await other.close();
+    // Ungranted `env` is denied by the runtime, never answered with null.
+    const noEnv = await engine.create(engine.prepare(js), {readRoots: ['/private'], writeRoots: ['/private']});
+    await assert.rejects(noEnv.call('inspect', null),
+      e => e instanceof SandboxError && /Denied: sandbox policy/.test(e.message));
+    await noEnv.close();
   } finally { assert.equal(await engine.shutdown(), true); }
 });
 

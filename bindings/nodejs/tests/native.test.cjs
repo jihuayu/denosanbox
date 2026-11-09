@@ -24,6 +24,33 @@ test('N-API and embedded V8 coexist across independent engines and lifecycle', a
     assert.equal((await b.close()).closedCleanly, true);
   } finally { await first.shutdown(); await second.shutdown(); }
 });
+test('Engine.prepare single-source plugins create and run alongside prepareModules', async () => {
+  // Regression: a single-source PreparedPlugin must create through the same
+  // native graph API as prepareModules; raw source is not a module map.
+  const engine = new Engine();
+  try {
+    const single = engine.prepare('export function id(x){return x;}');
+    assert.deepEqual([...single.modulePaths], ['main.js']);
+    assert.equal(single.entrypoint, 'main.js');
+    assert.equal(single.profile, 'javascript-only');
+    const nested = engine.prepare('export function ok(){return 7;}', 'lib/entry.js');
+    assert.deepEqual([...nested.modulePaths], ['lib/entry.js']);
+    assert.equal(nested.entrypoint, 'lib/entry.js');
+    const multi = engine.prepareModules({'main.js': "import {v} from './v.js'; export function get(){ return v; }", 'v.js': 'export const v = 3;'}, 'main.js');
+    const [a, b, c] = await Promise.all([engine.create(single), engine.create(nested), engine.create(multi)]);
+    assert.deepEqual(await a.call('id', {x: 1}), {x: 1});
+    assert.equal(await b.call('ok', null), 7);
+    assert.equal(await c.call('get', null), 3);
+    for (const sandbox of [a, b, c]) assert.equal((await sandbox.close()).closedCleanly, true);
+    // The same prepared plugin can create a second independent sandbox.
+    const again = await engine.create(single);
+    assert.deepEqual(await again.call('id', 'again'), 'again');
+    await again.close();
+    // Native validation still runs first for invalid single sources.
+    assert.throws(() => engine.prepare("import 'left-pad'; export {};"), e => e instanceof SandboxError && e.kind === 'module_denied');
+    assert.throws(() => engine.prepare('export {};', '/abs.js'), e => e instanceof SandboxError);
+  } finally { assert.equal(await engine.shutdown(), true); }
+});
 test('native execution leaves Node event loop responsive; deadlines isolate failure', async () => {
   const engine = new Engine();
   try {

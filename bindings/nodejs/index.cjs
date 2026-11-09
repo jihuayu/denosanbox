@@ -68,11 +68,13 @@ function sandboxOptions(options) {
 class PreparedPlugin {
   #paths;
   #profile;
-  constructor(source, entrypoint, profile, paths) {
+  constructor(graphJson, entrypoint, profile, paths) {
     this.#paths = Object.freeze(paths);
     this.#profile = profile;
-    // The frozen graph and its validated profile travel together.
-    prepared.set(this, { source, entrypoint, profile });
+    // The frozen graph (JSON object of module path -> source text) and its
+    // validated profile travel together. `Engine.create` only ever hands this
+    // JSON to the native graph API; raw source text is never re-read here.
+    prepared.set(this, { graphJson, entrypoint, profile });
     Object.freeze(this);
   }
   get entrypoint() { return prepared.get(this).entrypoint; }
@@ -110,8 +112,11 @@ class Engine {
   }
   prepare(source, entrypoint = 'main.js') {
     if (typeof source !== 'string' || typeof entrypoint !== 'string') throw new TypeError('source and entrypoint must be strings');
+    // The native single-source prepare validates the graph and path metadata;
+    // the stored private value is still a unified graph JSON object.
     const paths = sync(() => this.#native.prepare(source, entrypoint));
-    return new PreparedPlugin(source, entrypoint, 'javascript-only', paths);
+    const graphJson = JSON.stringify({[entrypoint]: source});
+    return new PreparedPlugin(graphJson, entrypoint, 'javascript-only', paths);
   }
   /**
    * Freezes a multi-module graph. `modules` maps root-relative paths
@@ -140,14 +145,18 @@ class Engine {
     const scopes = Object.entries(grants);
     const nativeOptions = sandboxOptions(options) ?? {};
     nativeOptions.scopes = scopes;
+    // `graphJson` is a frozen JSON snapshot taken at prepare time, so later
+    // `create` calls cannot observe mutation and both prepare paths hand the
+    // native graph API the same object-of-sources shape.
     let handle;
     try {
       handle = await asyncCall(() => this.#native.createModules(
         // Pass every argument explicitly: N-API optional-arg folding would
         // otherwise shift a trailing object into the previous slot. The
-        // validated profile from the immutable PreparedPlugin is carried
-        // through so a `pure-js-npm` graph never runs as `javascript-only`.
-        value.source, value.entrypoint, value.profile, JSON.stringify(grants), nativeOptions,
+        // validated profile and graph JSON from the immutable PreparedPlugin are
+        // carried through so a `pure-js-npm` graph never runs as
+        // `javascript-only` and a single-source prepare is never re-parsed.
+        value.graphJson, value.entrypoint, value.profile, JSON.stringify(grants), nativeOptions,
       ));
     } catch (error) {
       if (error instanceof SandboxError && error.kind === 'invalid_configuration' && /unknown host callback/.test(error.message)) {

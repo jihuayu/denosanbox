@@ -215,6 +215,23 @@ EngineLimits = _native.EngineLimits
 """Read-only engine hard limits as configured (see :attr:`Engine.limits`)."""
 
 
+def _positive_ms(name: str, value: int | None) -> int | None:
+    """Rejects a declared ``deadline_ms`` of zero or below before construction.
+
+    A zero deadline is accepted by nothing downstream: the facade narrows the
+    policy deadline to zero and every later create would be unusable. Node
+    rejects the same value with the same typed error at Engine construction.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int number of milliseconds")
+    if value <= 0:
+        raise InvalidConfigurationError(f"invalid_configuration: {name} must be greater than zero")
+    return value
+
+
 class EngineOptions:
     """Trusted host configuration for the engine's policy ceiling.
 
@@ -259,6 +276,7 @@ class EngineOptions:
         queue_depth: int | None = None,
         max_log_bytes: int | None = None,
     ) -> None:
+        deadline_ms = _positive_ms("deadline_ms", deadline_ms)
         self.host_capabilities = tuple(host_capabilities)
         self.read_roots = tuple(read_roots)
         self.write_roots = tuple(write_roots)

@@ -123,6 +123,30 @@ async def test_invalid_timeout_maps_to_invalid_configuration() -> None:
     await sandbox.close()
 
 
+async def test_zero_engine_deadline_is_rejected_at_construction() -> None:
+    """Regression: a zero `deadline_ms` used to build an unusable Engine; it is
+    now rejected with the same typed error Node raises at construction."""
+
+    with pytest.raises(InvalidConfigurationError) as caught:
+        denosanbox.EngineOptions(deadline_ms=0)
+    assert caught.value.kind == "invalid_configuration"
+    assert "deadline_ms" in str(caught.value)
+    with pytest.raises(InvalidConfigurationError):
+        denosanbox.EngineOptions(deadline_ms=-1)
+    assert denosanbox.EngineOptions(deadline_ms=1).deadline_ms == 1
+    with pytest.raises(TypeError):
+        denosanbox.EngineOptions(deadline_ms="5")  # type: ignore[arg-type]
+    # A positive deadline still builds a usable fake engine. It must stay at or
+    # above the facade's 30000ms default sandbox timeout, otherwise every
+    # create is correctly denied (out of scope for the zero-deadline fix).
+    engine = Engine("fake", options=denosanbox.EngineOptions(deadline_ms=30000))
+    try:
+        async with await engine.create(engine.prepare(ECHO_JS)) as sandbox:
+            assert await sandbox.call("echo", '{"ok":true}') == '{"ok":true}'
+    finally:
+        await engine.shutdown()
+
+
 async def test_prepare_errors_are_translated() -> None:
     engine = Engine("fake")
     with pytest.raises(UnsupportedLanguageError) as caught:

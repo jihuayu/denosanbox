@@ -105,7 +105,10 @@ export class PreparedPlugin {
 export class Engine {
   constructor(options?: EngineOptions);
   registerHost(name: string, callback: (context: InvocationContext, input: Json) => Json | Promise<Json>, options?: {inputLimit?: number; outputLimit?: number}): void;
-  /** Single-module graph under the `javascript-only` profile. */
+  /**
+   * Single-module graph under the `javascript-only` profile. The frozen graph
+   * is stored as `{[entrypoint]: source}` and reused verbatim by `create`.
+   */
   prepare(source: string, entrypoint?: string): PreparedPlugin;
   /**
    * Multi-module graph. `modules` maps root-relative `.js`/`.mjs`/`.ts`/`.mts`

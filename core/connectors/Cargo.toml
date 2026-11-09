@@ -1,0 +1,17 @@
+[package]
+name = "denosanbox-connectors"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Policy-mediated, bounded HTTP transport for denosanbox"
+publish = false
+
+[dependencies]
+denosanbox-policy = { path = "../policy", version = "0.1.0" }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "io-util"] }

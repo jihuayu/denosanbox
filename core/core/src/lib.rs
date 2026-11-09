@@ -22,7 +22,6 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use fake::{FakeControl, FakeFactory};
-pub use plugin::prepare_with_profile;
 pub use plugin::{
     builtin_alias_target, is_reserved_builtin_path, prepare_with_profile, WORKER_THREADS_BUILTIN,
 };

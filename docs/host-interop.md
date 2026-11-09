@@ -93,6 +93,12 @@ successful response. Cancellation cannot roll back an already completed host
 side effect. Non-cooperative work remains owned and counted until it actually
 ends, even if the caller has already received a deadline error.
 
+`closed_cleanly` describes observed cleanup, while `forced_termination` records
+how execution ended. After an incomplete close, calling close again can report
+clean once the worker has joined and native work has actually drained; the
+historical termination flag stays set. Driver disposal failures and incomplete
+children are not upgraded by this re-observation.
+
 The Deno adapter explicitly wakes its Rust waiter when execution is cancelled,
 including during module evaluation or an exported function awaiting a host
 promise. Interrupting V8 alone does not necessarily settle that promise. The

@@ -11,6 +11,39 @@ use denosanbox::{
 use serde_json::{json, Value};
 
 #[tokio::test]
+async fn default_engine_can_execute_four_admitted_roots() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let plugin = engine
+        .prepare(PluginSource::single(
+            "main.js",
+            "export function echo(value){return value;}",
+        ))
+        .unwrap();
+    let mut roots = Vec::new();
+    for _ in 0..4 {
+        roots.push(
+            engine
+                .create(plugin.clone(), SandboxOptions::default())
+                .await
+                .unwrap(),
+        );
+    }
+    for (index, root) in roots.iter().enumerate() {
+        assert_eq!(
+            root.call("echo", json!(index), InvocationOptions::default())
+                .await
+                .unwrap(),
+            json!(index)
+        );
+    }
+    for root in roots {
+        assert!(root.close().await.unwrap().closed_cleanly);
+    }
+    assert_eq!(engine.active_sandboxes(), 0);
+    assert!(engine.shutdown().await.unwrap().clean);
+}
+
+#[tokio::test]
 async fn module_startup_can_create_and_use_a_child() {
     let engine = engine();
     let plugin = engine

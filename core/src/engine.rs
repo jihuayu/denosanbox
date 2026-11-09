@@ -652,7 +652,10 @@ impl SandboxHandle {
             return Err(Error::Closed);
         }
         let policy_limits = self.state.host.policy().limits();
-        let message_limit = self.limits.max_message_bytes.min(policy_limits.max_message_bytes());
+        let message_limit = self
+            .limits
+            .max_message_bytes
+            .min(policy_limits.max_message_bytes());
         check_message_size(&input, message_limit)?;
 
         let now = Instant::now();
@@ -695,16 +698,22 @@ impl SandboxHandle {
             }
             None => relative_deadline,
         };
-        let policy_deadline = now.checked_add(policy_limits.deadline()).ok_or_else(|| Error::InvalidConfiguration {
-            reason: "policy deadline overflows monotonic clock".into(),
+        let policy_deadline = now.checked_add(policy_limits.deadline()).ok_or_else(|| {
+            Error::InvalidConfiguration {
+                reason: "policy deadline overflows monotonic clock".into(),
+            }
         })?;
         let deadline = deadline.min(self.state.expires).min(policy_deadline);
         if deadline <= Instant::now() {
             return Err(Error::DeadlineExceeded);
         }
 
-        let queue_slot = QueueSlot::reserve(&self.state.queued_calls,
-            self.limits.max_pending_invocations.min(policy_limits.queue_depth()))?;
+        let queue_slot = QueueSlot::reserve(
+            &self.state.queued_calls,
+            self.limits
+                .max_pending_invocations
+                .min(policy_limits.queue_depth()),
+        )?;
         let input_lease = self
             .state
             .host
@@ -741,8 +750,12 @@ impl SandboxHandle {
         match tokio::time::timeout_at(tokio_deadline, reply_rx).await {
             Ok(Ok(result)) => {
                 let value = result?;
-                check_message_size(&value, self.limits.max_message_bytes.min(
-                    self.state.host.policy().limits().max_message_bytes()))?;
+                check_message_size(
+                    &value,
+                    self.limits
+                        .max_message_bytes
+                        .min(self.state.host.policy().limits().max_message_bytes()),
+                )?;
                 Ok(value)
             }
             Ok(Err(_)) => Err(Error::Closed),
@@ -899,8 +912,15 @@ impl QueueSlot {
     fn reserve(counter: &Arc<AtomicUsize>, capacity: usize) -> Result<Self> {
         let mut queued = counter.load(Ordering::Acquire);
         loop {
-            if queued >= capacity { return Err(Error::QueueFull { capacity }); }
-            match counter.compare_exchange_weak(queued, queued + 1, Ordering::AcqRel, Ordering::Acquire) {
+            if queued >= capacity {
+                return Err(Error::QueueFull { capacity });
+            }
+            match counter.compare_exchange_weak(
+                queued,
+                queued + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => return Ok(Self(counter.clone())),
                 Err(current) => queued = current,
             }
@@ -908,7 +928,9 @@ impl QueueSlot {
     }
 }
 impl Drop for QueueSlot {
-    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct WorkerState {
@@ -1098,14 +1120,18 @@ fn worker_loop(
                 if state.close_requested.load(Ordering::SeqCst) {
                     state.control.cancel();
                 }
-                let duration = job.deadline.saturating_duration_since(Instant::now())
+                let duration = job
+                    .deadline
+                    .saturating_duration_since(Instant::now())
                     .min(state.host.policy().limits().deadline());
                 job.invocation.timeout = job.invocation.timeout.min(duration);
                 job.invocation.deadline = Some(SystemTime::now() + duration);
-                let result = check_message_size(&job.invocation.input,
-                    state.host.policy().limits().max_message_bytes())
-                    .and_then(|_| state.host.begin_invocation(duration))
-                    .and_then(|_| driver.invoke(job.invocation));
+                let result = check_message_size(
+                    &job.invocation.input,
+                    state.host.policy().limits().max_message_bytes(),
+                )
+                .and_then(|_| state.host.begin_invocation(duration))
+                .and_then(|_| driver.invoke(job.invocation));
                 state.in_flight.store(false, Ordering::SeqCst);
                 match &result {
                     Ok(_) => {

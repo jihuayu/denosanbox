@@ -320,7 +320,8 @@ impl HostContext {
         let after = narrowed.limits();
         if before.heap_target_bytes() != after.heap_target_bytes()
             || before.memory_budget_bytes() != after.memory_budget_bytes()
-            || before.max_sandboxes() != after.max_sandboxes() {
+            || before.max_sandboxes() != after.max_sandboxes()
+        {
             return Err(Error::UnsupportedFeature {
                 feature: "live allocation limits; create a new sandbox with smaller limits".into(),
             });
@@ -478,10 +479,12 @@ impl HostContext {
     }
 
     fn message_limit(&self) -> usize {
-        self.max_message_bytes.min(self.policy().limits().max_message_bytes())
+        self.max_message_bytes
+            .min(self.policy().limits().max_message_bytes())
     }
     fn host_call_limit(&self) -> usize {
-        self.max_host_calls.min(self.policy().limits().queue_depth())
+        self.max_host_calls
+            .min(self.policy().limits().queue_depth())
     }
     fn reserve_work(&self) -> Result<(Outstanding, Lease)> {
         self.live()?;

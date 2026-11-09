@@ -1,0 +1,17 @@
+[package]
+name = "denosanbox-c"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Experimental stable C ABI for the denosanbox native core"
+
+[lib]
+name = "denosanbox_c"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+denosanbox = { path = "../../core" }
+futures-util = "0.3"
+serde_json = "1"
+tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }

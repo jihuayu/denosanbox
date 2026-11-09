@@ -60,10 +60,17 @@ static void release_slow(uint64_t user_data) {
     note_release(&slow_released, user_data);
 }
 
-static void copy_string(const char *text, deno_buffer *out) {
-    if (deno_buffer_copy((const uint8_t *)text, strlen(text), out, NULL) != DENO_STATUS_OK) {
+/* Copies text into an owned result buffer. Every fallible ABI call needs a
+ * writable error output, so failures are freed here and propagate. */
+static deno_status_t copy_string(const char *text, deno_buffer *out) {
+    deno_error error = {0};
+    deno_status_t status =
+        deno_buffer_copy((const uint8_t *)text, strlen(text), out, &error);
+    if (status != DENO_STATUS_OK) {
         *out = (deno_buffer){0};
     }
+    deno_error_free(&error);
+    return status;
 }
 
 /* echo: returns trusted context metadata plus the received input. */
@@ -95,8 +102,7 @@ static deno_status_t echo_callback(deno_context_token context,
         return DENO_STATUS_INTERNAL;
     }
     (void)input; /* input is borrowed; do not retain it */
-    copy_string(body, out_result);
-    return DENO_STATUS_OK;
+    return copy_string(body, out_result);
 }
 
 /* slow: blocks until cancelled, checking only the native context token. */
@@ -121,8 +127,7 @@ static deno_status_t slow_callback(deno_context_token context,
         struct timespec pause = {.tv_sec = 0, .tv_nsec = 5 * 1000 * 1000};
         nanosleep(&pause, NULL);
     }
-    copy_string("{\"finished\":true}", out_result);
-    return DENO_STATUS_OK;
+    return copy_string("{\"finished\":true}", out_result);
 }
 
 static const char ECHO_GUEST[] =
@@ -283,7 +288,7 @@ int main(void) {
     CHECK(result.data != NULL &&
               memmem(result.data, result.len, "tenant-forged", 13) == NULL,
           "forged guest scope is not trusted");
-    CHECK(result.data != NULL && memmem(result.data, result.len, "sandbox-", 8) != NULL,
+    CHECK(result.data != NULL && memmem(result.data, result.len, "\"sandbox_id\":\"sbx-", 18) != NULL,
           "alpha sees a trusted sandbox id");
     deno_buffer_free(&result);
     deno_job_free(job);
@@ -342,6 +347,24 @@ int main(void) {
     CHECK(cancel_status == DENO_STATUS_CANCELLED, "cancelled job reports cancelled");
     deno_error_free(&error);
     CHECK(result.token == 0, "cancelled job yields no buffer");
+    /* Cancellation is terminal for the job, not for the foreign callback: the
+     * blocked callback observes the native cancel on its own schedule. Poll the
+     * bounded pending-operations diagnostic until it drains, then read the
+     * callback's atomic result. */
+    uint64_t pending = 0;
+    unsigned long long drain_ms = 0;
+    deno_status_t pending_status = DENO_STATUS_INTERNAL;
+    while (drain_ms < 5000) {
+        pending_status = deno_sandbox_pending_host_operations(0, &pending);
+        if (pending_status != DENO_STATUS_OK || pending == 0) {
+            break;
+        }
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 5 * 1000 * 1000};
+        nanosleep(&pause, NULL);
+        drain_ms += 5;
+    }
+    CHECK(pending_status == DENO_STATUS_OK, "pending host operations query succeeds");
+    CHECK(pending == 0, "cancelled callback drained after bounded poll");
     CHECK(atomic_load(&slow_cancel_check) == (int)DENO_STATUS_CANCELLED,
           "callback observed native context cancellation");
     /* The context token is dead once the callback returned. */
@@ -362,7 +385,10 @@ int main(void) {
     CHECK(deno_sandbox_free(alpha, &error) == DENO_STATUS_OK, "alpha frees");
     deno_error_free(&error);
     CHECK(atomic_load(&echo_released) == 0, "beta still holds echo userdata");
-    CHECK(atomic_load(&slow_released) == 1, "slow userdata released after its sandbox closes");
+    /* The engine registry keeps the slow registration owner until the engine is
+     * freed, so closing its last sandbox is not enough to release userdata. */
+    CHECK(atomic_load(&slow_released) == 0,
+          "engine registration keeps slow userdata after its sandbox closes");
     CHECK(deno_sandbox_close(beta, &report, &error) == DENO_STATUS_OK, "beta closes");
     deno_error_free(&error);
     CHECK(deno_sandbox_free(beta, &error) == DENO_STATUS_OK, "beta frees");
@@ -373,10 +399,12 @@ int main(void) {
     CHECK(deno_engine_close(engine, &shutdown, &error) == DENO_STATUS_OK, "engine closes");
     deno_error_free(&error);
     CHECK(atomic_load(&echo_released) == 0, "close keeps callback owner until free");
+    CHECK(atomic_load(&slow_released) == 0, "engine owner still keeps slow userdata");
     CHECK(deno_engine_free(engine, &error) == DENO_STATUS_OK, "engine frees");
     deno_error_free(&error);
     CHECK(atomic_load(&echo_released) == 1, "echo userdata released exactly once after free");
-    CHECK(atomic_load(&slow_released) == 1, "slow userdata still released exactly once");
+    CHECK(atomic_load(&slow_released) == 1,
+          "slow userdata released exactly once after engine free");
 
     if (failures != 0) {
         fprintf(stderr, "%d host callback check(s) failed\n", failures);

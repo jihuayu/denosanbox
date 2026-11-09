@@ -145,6 +145,19 @@ impl Engine {
         denosanbox_core::prepare(source, &self.inner.config.limits)
     }
 
+    /// Validates and freezes a source graph under an approved compatibility
+    /// profile. The profile is preserved on every child entrypoint selection.
+    pub fn prepare_with_profile(
+        &self,
+        source: PluginSource,
+        profile: denosanbox_core::modules::CompatibilityProfile,
+    ) -> Result<PreparedPlugin> {
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Closed);
+        }
+        denosanbox_core::prepare_with_profile(source, &self.inner.config.limits, profile)
+    }
+
     /// Creates a new sandbox with an independent isolate and module instances.
     pub async fn create(
         &self,

@@ -19,6 +19,7 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use fake::{FakeControl, FakeFactory};
+pub use plugin::prepare_with_profile;
 pub use plugin::{
     prepare, resolve_relative, scan_import_specifiers, validate_path, PluginSource, PreparedPlugin,
 };

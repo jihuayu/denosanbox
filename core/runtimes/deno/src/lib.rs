@@ -147,6 +147,8 @@ impl DriverFactory for DenoFactory {
                     .map_err(|e| Error::Backend {
                         message: e.to_string(),
                     })?;
+                // V8 captures the current Tokio handle for delayed tasks.
+                let enter_guard = executor.enter();
                 let mut runtime = JsRuntime::new(RuntimeOptions {
                     module_loader: Some(Rc::new(GraphLoader(plugin.clone()))),
                     extensions: vec![sandbox_ops::init(context.clone(), thread_control.clone())],
@@ -214,6 +216,7 @@ impl DriverFactory for DenoFactory {
             "#,
                     )
                     .map_err(|e| thread_control.error(e))?;
+                drop(enter_guard);
                 Ok(Box::new(DenoDriver {
                     runtime,
                     executor,

@@ -6,7 +6,7 @@ This is an experimental native library. It mediates guest APIs and isolates Java
 
 ## Run the Rust host
 
-Install Rust 1.99.1, a C/C++ toolchain, Python 3 and the platform dependencies required by `deno_core 0.413.0`. The repository toolchain file installs rustfmt and Clippy. First compilation downloads the pinned V8 native archive. Linux x86_64 is the validated native platform.
+Install Rust 1.99.1 (pinned by the repository toolchain file, which also installs rustfmt and Clippy), a C/C++ toolchain, Python 3 and the platform dependencies required by `deno_core 0.413.0`. First compilation downloads the pinned V8 native archive. **Linux x86_64 is the only validated native platform**; the Node binding loader rejects other platforms/Node versions and no other OS support is claimed.
 
 ```sh
 cargo run --manifest-path core/Cargo.toml --example backend --locked
@@ -42,11 +42,13 @@ Modules are supplied in immutable, host-prepared graphs. Static imports, re-expo
 
 [Offline package preparation](core/modules/README.md) verifies SHA-256 digests and rejects lifecycle scripts/native dependencies. The audited npm profile supports vendored ESM; [real npm fixtures](fixtures/npm/sources.json) exercise dequal and nanoid/non-secure. This does not enable a package manager or unrestricted Node compatibility.
 
-Guest APIs are explicit capabilities. The runtime never exposes raw `Deno.core`, host environment variables, process signals, subprocess creation, FFI, inspector or shared memory. See [the compatibility matrix](docs/compatibility.md) for the supported surface and failure behavior.
+Guest APIs are explicit capabilities (`sandbox.{fs,env,host,cwd,chdir,exit}`, policy-gated `fetch` and host-created Workers). The runtime never exposes raw `Deno.core`, host process environment, signals, subprocess creation, FFI, inspector or shared memory (`WebAssembly`/`SharedArrayBuffer`/`Atomics` are removed). Guest-created managed JSON Workers are forthcoming in the runtime job. Network is deny-by-default: host, every DNS answer, redirect, port, private-address grant and byte/deadline bound must be explicit; an unusable configured proxy fails closed instead of connecting directly. See [the compatibility matrix](docs/compatibility.md) and [the threat model](docs/threat-model.md).
 
 ## Validation
 
-[Shared behavior fixtures](core/testkit/README.md) run through Rust, Python and Node native APIs. Rust integration suites cover state/module isolation, policy denial, cancellation, deadlines, resource ownership and teardown. [Boundary fuzzing](core/fuzz/README.md) exercises malformed frames, paths and permission intersections. [Benchmarks](dev/benchmarks/README.md) include commands, hardware/configuration and measured JSON output.
+[Shared behavior fixtures](core/testkit/README.md) run through Rust, Python and Node native APIs. Rust integration suites cover state/module isolation, policy denial, cancellation, deadlines, resource ownership and teardown; `core/tests/runtime_limits.rs` covers bounded `ArrayBuffer` budgets, message/queue bounds and per-invocation logs; `core/tests/host_security.rs` covers guest spoofing of host identity/scope, ungranted capabilities, schema limits and metadata-only audit. [Boundary fuzzing](core/fuzz/README.md) exercises malformed frames, paths and permission intersections. [Benchmarks](dev/benchmarks/README.md) record commands, hardware/configuration and one measured run (an observation, not a capacity claim).
+
+CI (`.github/workflows/ci.yml`) pins Rust 1.99.1, Node 24.22.1 and Python 3.12 on `ubuntu-24.04`, builds and links the optional C ABI plus Go adapter via `bindings/c/test.sh` (with Go 1.27.3), and runs the nightly fuzz smoke target. No package registry publishing or production deployment happens from this repository.
 
 Engine-independent checks do not require V8:
 
@@ -56,4 +58,4 @@ cargo test --manifest-path core/Cargo.toml --no-default-features \
 python3 dev/validate-fixtures.py
 ```
 
-The larger `fixtures/conformance` catalog contains additional declarative scenarios; its Python validator checks structure and never claims JavaScript execution.
+The larger `fixtures/conformance` catalog contains additional declarative scenarios; its Python validator checks structure and never claims JavaScript execution. Known open gaps (narrowed `max_log_bytes` enforcement, runtime-created Workers, C callback API) are listed in [the threat model](docs/threat-model.md#known-gaps).

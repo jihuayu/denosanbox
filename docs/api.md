@@ -18,16 +18,20 @@ A dropped handle requests cancellation without blocking an async host thread. Ex
 
 Policies deny by default. Host-created identities and owner/generation checks, rather than guest-supplied IDs, authorize resource access. Child authority is bounded by the host ceiling, parent's effective policy, parent's delegation policy and the child request. Self-narrowing affects future checks; it does not undo committed side effects or revoke data already returned to a guest. An authorized parent can intentionally proxy work for a child.
 
-Host callbacks receive trusted identity, bounded input, deadline/cancellation and an explicit business scope. Register business operations such as `orders.read`, not raw database handles, arbitrary SQL or private keys. Callback work never holds the supervisor or registry lock. Timeout/cancellation does not roll back a committed business side effect. A host callback that ignores cancellation must remain accounted for until it actually finishes.
+In the core API (`HostContext`), host callbacks receive trusted identity, bounded input, deadline/cancellation and an explicit business scope. Guest JSON is data only: fields such as `tenant`, `scope` or `sandboxId` in the payload cannot replace the trusted context, and guest-supplied ids never authorize resources (owner/generation checks do). Ungranted or policy-denied capabilities are rejected before dispatch; registered `JsonSchema` input/output validation and schema traversal budgets apply before/after the callback. `HostAudit` records bounded metadata only (sandbox id, registered capability name or the fixed `<ungranted>`/`<invalid>` tag, outcome) and never payloads, scopes or callback error text. Register business operations such as `orders.read`, not raw database handles, arbitrary SQL or private keys. Callback work never holds the supervisor or registry lock. Timeout/cancellation does not roll back a committed business side effect. A host callback that ignores cancellation must remain accounted for until it actually finishes.
 
 ## Errors and protocol
 
 The Rust error enum exposes stable `kind()` categories; native bindings translate those categories. Unsupported languages/APIs and unavailable backends fail explicitly. Capability negotiation is performed before guest execution. Guest/host framing uses protocol version 1 (`DSB1`), bounded payloads and explicit request IDs; unknown versions, reserved bytes, malformed lengths and trailing data are rejected. Business operation schemas are separate from transport framing.
+
+The public facade re-exports policy, schema, audit and mount types but not `HostContext`; host-boundary tests that need the trusted context type (e.g. `core/tests/host_security.rs`) use `denosanbox-core::HostContext` directly, which is the same crate the facade is built on.
 
 The fake backend is an explicitly selected contract test backend. It does not claim JavaScript, TypeScript or host API compatibility. Supported production capabilities are reported by the selected runtime/facade combination.
 
 ## Toolchain and release policy
 
 Rust 1.99.1, `deno_core 0.413.0`, the V8 version selected by its lockfile, and `deno_ast 0.53.3` are the validated source/build combination. Commit lockfiles for reproducibility and rerun conformance/native coexistence tests before upgrades. Deno extensions/snapshots from another version cannot be mixed into this adapter. There is no externally generated snapshot in this implementation.
+
+The backend is fixed per `Engine` at construction (`BackendKind::Deno` by default); there is no `selectedEngine` switch and no live migration between backends. See [compatibility](compatibility.md) for the supported language/module profile and the limits actually enforced.
 
 Bindings release independently from the core's 0.1 API. A binding must document its own compatible core version, interpreter/runtime, native artifact platform, ownership and cancellation behavior. Installing Python or Node packages never grants native-code execution to guest modules.

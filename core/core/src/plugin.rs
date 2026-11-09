@@ -159,6 +159,15 @@ impl PreparedPlugin {
         self.graph.profile
     }
 
+    /// Resolves a child entrypoint *relative to this graph's entrypoint* and
+    /// selects it. The parent's directory is the base, so `./x.js` and
+    /// `../x.js` mean what they do in the importing module; escapes and
+    /// paths outside the graph are denied.
+    pub fn resolve_child_entrypoint(&self, specifier: &str) -> Result<Self, Error> {
+        let path = resolve_relative(&self.graph.entrypoint, specifier)?;
+        self.with_entrypoint(&path)
+    }
+
     /// Select a visible entrypoint from this immutable prepared graph.
     pub fn with_entrypoint(&self, entrypoint: &str) -> Result<Self, Error> {
         validate_path(entrypoint)?;
@@ -174,6 +183,8 @@ impl PreparedPlugin {
                 modules: self.graph.modules.clone(),
                 total_bytes: self.graph.total_bytes,
                 profile: self.graph.profile,
+                limits: self.graph.limits.clone(),
+                trusted: self.graph.trusted.clone(),
             }),
         })
     }
@@ -200,6 +211,77 @@ impl PreparedPlugin {
                 == Some(builtin_source(path).unwrap_or(""))
     }
 
+    /// Limits this graph was prepared within.
+    pub fn limits(&self) -> &EngineLimits {
+        &self.graph.limits
+    }
+
+    /// Stronger of the preparation limits and `limits` (exact minimums, no
+    /// re-preparation, so sources, transpiled output, profile and trusted
+    /// builtins are preserved verbatim).
+    pub fn effective_limits(&self, limits: &EngineLimits) -> EngineLimits {
+        self.graph.limits.narrow(limits)
+    }
+
+    /// Rejects a graph that violates `limits` before any resource is created.
+    ///
+    /// A [`PreparedPlugin`] is only constructible through `prepare*` against
+    /// *some* limits; when it is handed to another engine (or created with
+    /// overrides) the target limits must be re-asserted. Counts and byte caps
+    /// are exact: modifying, transpiling or injecting after preparation would
+    /// bypass the profile checks, so this never re-parses.
+    pub fn validate_with_limits(&self, limits: &EngineLimits) -> Result<(), Error> {
+        limits.validate()?;
+        let count = self.graph.modules.len();
+        if count > limits.max_modules {
+            return Err(Error::LimitExceeded {
+                limit: "max_modules".to_string(),
+                detail: format!("plugin has {count} modules but the limit is {}", limits.max_modules),
+            });
+        }
+        let mut total = 0usize;
+        for (path, source) in &self.graph.modules {
+            if source.len() > limits.max_module_bytes {
+                return Err(Error::LimitExceeded {
+                    limit: "max_module_bytes".to_string(),
+                    detail: format!(
+                        "module '{path}' is {} bytes but the limit is {}",
+                        source.len(),
+                        limits.max_module_bytes
+                    ),
+                });
+            }
+            total = total.saturating_add(source.len());
+        }
+        if total > limits.max_graph_bytes {
+            return Err(Error::LimitExceeded {
+                limit: "max_graph_bytes".to_string(),
+                detail: format!(
+                    "plugin graph is {total} bytes but the limit is {}",
+                    limits.max_graph_bytes
+                ),
+            });
+        }
+        if !self.graph.modules.contains_key(&self.graph.entrypoint) {
+            return Err(Error::InvalidPlugin {
+                reason: "entrypoint is not present in modules".to_string(),
+            });
+        }
+        for path in &self.graph.trusted {
+            let expected = builtin_source(path).ok_or_else(|| Error::ModuleDenied {
+                specifier: path.clone(),
+                reason: "unknown trusted module".to_string(),
+            })?;
+            if self.graph.modules.get(path).map(String::as_str) != Some(expected) {
+                return Err(Error::ModuleDenied {
+                    specifier: path.clone(),
+                    reason: "trusted module was modified after preparation".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Iterates immutable `(path, source)` pairs in deterministic path order.
     pub fn iter_modules(&self) -> impl Iterator<Item = (&str, &str)> {
         self.graph
@@ -223,6 +305,10 @@ pub(crate) struct PreparedGraph {
     pub(crate) modules: BTreeMap<String, String>,
     pub(crate) total_bytes: usize,
     pub(crate) profile: CompatibilityProfile,
+    /// Limits the graph was prepared and proven within.
+    pub(crate) limits: EngineLimits,
+    /// Reserved trusted modules present (never guest-supplied).
+    pub(crate) trusted: BTreeSet<String>,
 }
 
 /// Validates and freezes a host-supplied source graph with the default
@@ -379,6 +465,11 @@ pub fn prepare_with_profile(
             modules,
             total_bytes,
             profile,
+            limits: limits.clone(),
+            trusted: injected
+                .iter()
+                .map(|(path, _)| (*path).to_string())
+                .collect(),
         }),
     })
 }

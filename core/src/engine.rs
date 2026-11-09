@@ -3,11 +3,13 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::worker_broker;
+use crate::workers::{WorkerHandle, WorkerOptions};
 use denosanbox_core::{
-    BackendKind, CloseReport, CreatedDriver, Driver, DriverControl, DriverFactory, EngineConfig,
-    EngineLimits, Error, FakeFactory, HostContext, HostRegistry, Invocation, InvocationContext,
-    InvocationOptions, PluginSource, Policy, PreparedPlugin, RegisteredCallback, Result,
-    SandboxOptions, ShutdownReport,
+    BackendKind, Capabilities, CloseReport, CreatedDriver, Driver, DriverControl, DriverFactory,
+    EngineConfig, EngineLimits, Error, FakeFactory, Feature, HostContext, HostRegistry, Invocation,
+    InvocationContext, InvocationOptions, PluginRequirements, PluginSource, Policy, PreparedPlugin,
+    RegisteredCallback, Result, RuntimeMetrics, SandboxOptions, ShutdownReport, StartOptions,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -158,6 +160,62 @@ impl Engine {
         denosanbox_core::prepare_with_profile(source, &self.inner.config.limits, profile)
     }
 
+    /// Truthful capabilities of this engine's backend. Mediated features are
+    /// advertised only because their mediators are wired for every sandbox.
+    pub fn capabilities(&self) -> Capabilities {
+        let base = self.inner.factory.capabilities();
+        if self.inner.config.backend != BackendKind::Deno {
+            return base;
+        }
+        let mut capabilities = base
+            .with_feature(Feature::JsonCalls)
+            .with_feature(Feature::IndependentIsolates)
+            .with_feature(Feature::DeadlineCancellation)
+            .with_feature(Feature::VirtualEnvironment)
+            .with_feature(Feature::HostCallbacks)
+            .with_feature(Feature::VirtualFilesystem)
+            .with_feature(Feature::MountedDirectories)
+            .with_feature(Feature::Fetch)
+            .with_feature(Feature::ManagedChildren)
+            .with_feature(Feature::WebWorkers)
+            .with_feature(Feature::NodeWorkerThreads);
+        // Shared memory and native code are never claimable.
+        capabilities = capabilities
+            .without_feature(Feature::SharedMemory)
+            .without_feature(Feature::NativeCode);
+        capabilities
+    }
+
+    /// Rejects requirements this engine cannot honor, before any source is
+    /// parsed or executed.
+    pub fn require_capabilities(&self, requirements: &PluginRequirements) -> Result<()> {
+        self.capabilities().require(requirements)
+    }
+
+    /// Capability-gated preparation: missing features fail with a typed
+    /// [`Error::UnsupportedFeature`] before parsing.
+    pub fn prepare_with_requirements(
+        &self,
+        source: PluginSource,
+        requirements: &PluginRequirements,
+    ) -> Result<PreparedPlugin> {
+        self.require_capabilities(requirements)?;
+        self.prepare(source)
+    }
+
+    /// Aggregated measured backend metrics for live sandboxes.
+    pub async fn metrics(&self) -> RuntimeMetrics {
+        let states: Vec<Arc<WorkerState>> = {
+            let registry = self.inner.workers.lock().expect("worker registry poisoned");
+            registry.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut metrics = RuntimeMetrics::default();
+        for state in states {
+            metrics.merge(&state.measured_metrics().await);
+        }
+        metrics
+    }
+
     /// Creates a new sandbox with an independent isolate and module instances.
     pub async fn create(
         &self,
@@ -230,6 +288,10 @@ impl Engine {
         let default_timeout = options
             .default_invocation_timeout
             .unwrap_or(self.inner.config.limits.default_invocation_timeout);
+        // Re-assert this engine's limits on the prepared graph (it may have been
+        // prepared by another engine with looser limits) before any thread,
+        // isolate, admission or memory reservation is created.
+        plugin.validate_with_limits(&self.inner.config.limits)?;
         let default_timeout = default_timeout.min(options.policy.limits().deadline());
         let expires = (Instant::now() + default_timeout).min(
             parent
@@ -279,6 +341,7 @@ impl Engine {
                 detail: "Deno requires at least 8MiB including termination reserve".into(),
             });
         }
+        let prepared = plugin.clone();
         let subtree_budget = parent
             .map(|p| {
                 p.state
@@ -319,8 +382,16 @@ impl Engine {
             host.inherit_mounts_from(&parent.state.host)?;
         }
         host.set_worker_depth(parent.map(|p| p.depth() + 1).unwrap_or(0));
+        // Trusted per-context broker and the weak parent factory are bound by
+        // Rust before the isolate thread starts. Guests never supply root IDs:
+        // the parent's own prepared graph and policy are captured here.
+        let base_entrypoint = plugin.entrypoint().to_string();
+        host.set_worker_handler(worker_broker::handler(
+            self.parent_spawner(&host),
+            base_entrypoint,
+            self.inner.config.limits.clone(),
+        ))?;
         host.begin_invocation(default_timeout)?;
-        let prepared = plugin.clone();
         let CreatedDriver { init, control } =
             self.inner.factory.create(plugin, &options, host.clone())?;
 
@@ -330,6 +401,7 @@ impl Engine {
         let state = Arc::new(WorkerState {
             sender,
             control,
+            metrics: Arc::new(Mutex::new(RuntimeMetrics::default())),
             host,
             prepared,
             delegation: options.delegation,
@@ -353,12 +425,14 @@ impl Engine {
         });
 
         if let Some(parent) = parent {
-            let mut children = parent.state.children.lock().unwrap();
-            if parent.state.closed_for_calls.load(Ordering::Acquire) {
-                return Err(Error::Closed);
+            {
+                let mut children = parent.state.children.lock().unwrap();
+                if parent.state.closed_for_calls.load(Ordering::Acquire) {
+                    return Err(Error::Closed);
+                }
+                children.retain(|child| child.strong_count() > 0);
+                children.push(Arc::downgrade(&state));
             }
-            children.retain(|child| child.strong_count() > 0);
-            children.push(Arc::downgrade(&state));
         }
         let thread_state = state.clone();
         let join = std::thread::Builder::new()
@@ -416,7 +490,64 @@ impl Engine {
             state,
             limits: self.inner.config.limits.clone(),
             default_timeout,
+            owns_handle: true,
         })
+    }
+
+    /// Builds the trusted parent-side factory handed to the guest broker.
+    ///
+    /// The closure never accepts a guest-supplied parent identity: the parent
+    /// handle (its prepared graph, policy ceiling, delegation, grants and
+    /// deadline) is captured by Rust. Children always take the regular
+    /// `Engine::create_child` path: delegation intersection, admission,
+    /// memory reservation, absolute deadline and parent-close propagation.
+    ///
+    /// The handler is stored inside this very `HostContext`, so the closure
+    /// holds only weak references: owning either the host or the engine here
+    /// would form an `Arc` cycle (host -> broker -> host/engine).
+    fn parent_spawner(&self, host: &Arc<HostContext>) -> worker_broker::SpawnWorker {
+        let host = Arc::downgrade(host);
+        let engine = Arc::downgrade(&self.inner);
+        Arc::new(move |entrypoint, options| {
+            let host = host.clone();
+            let engine = engine.clone();
+            Box::pin(async move {
+                let engine = Engine {
+                    inner: engine.upgrade().ok_or(Error::Closed)?,
+                };
+                engine.spawn_for_guest(&host, &entrypoint, options).await
+            })
+        })
+    }
+
+    /// Resolves the trusted parent handle for `host` from the live registry.
+    ///
+    /// Only sandboxes registered for guest work are parents, so dropping the
+    /// last root handle (cancel/close/abandon) also prevents further spawns.
+    fn live_parent(&self, host: &Weak<HostContext>) -> Option<SandboxHandle> {
+        let host = host.upgrade()?;
+        let registry = self.inner.workers.lock().expect("worker registry poisoned");
+        registry
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|state| Arc::ptr_eq(&state.host, &host))
+            .map(|state| SandboxHandle {
+                state,
+                limits: self.inner.config.limits.clone(),
+                default_timeout: self.inner.config.limits.default_invocation_timeout,
+                // A transient view only; it must never cancel on drop.
+                owns_handle: false,
+            })
+    }
+
+    async fn spawn_for_guest(
+        &self,
+        host: &Weak<HostContext>,
+        entrypoint: &str,
+        options: SandboxOptions,
+    ) -> Result<WorkerHandle> {
+        let parent = self.live_parent(host).ok_or(Error::Closed)?;
+        engine_child_worker(&parent, entrypoint, options).await
     }
 
     /// Closes every sandbox owned by this engine.
@@ -459,6 +590,9 @@ pub struct SandboxHandle {
     state: Arc<WorkerState>,
     limits: EngineLimits,
     default_timeout: Duration,
+    /// Registered handles count against `WorkerState::handles`; transient
+    /// views created by the engine never cancel on drop.
+    owns_handle: bool,
 }
 
 impl SandboxHandle {
@@ -606,11 +740,14 @@ impl SandboxHandle {
 
 impl Clone for SandboxHandle {
     fn clone(&self) -> Self {
-        self.state.handles.fetch_add(1, Ordering::AcqRel);
+        if self.owns_handle {
+            self.state.handles.fetch_add(1, Ordering::AcqRel);
+        }
         Self {
             state: self.state.clone(),
             limits: self.limits.clone(),
             default_timeout: self.default_timeout,
+            owns_handle: self.owns_handle,
         }
     }
 }
@@ -619,7 +756,7 @@ impl Drop for SandboxHandle {
     fn drop(&mut self) {
         // Detach rather than block a runtime from Drop. The worker observes the
         // close flag and exits; an explicit `close()` is required to join/observe.
-        if self.state.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.owns_handle && self.state.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.state.request_close();
         }
     }
@@ -729,6 +866,9 @@ struct CallJob {
 struct WorkerState {
     sender: mpsc::Sender<WorkerMsg>,
     control: Arc<dyn DriverControl>,
+    /// Measured backend snapshots; refreshed by the worker thread after each
+    /// invocation so reporting never contends with guest execution.
+    metrics: Arc<Mutex<RuntimeMetrics>>,
     host: Arc<HostContext>,
     prepared: PreparedPlugin,
     delegation: Policy,
@@ -752,6 +892,15 @@ struct WorkerState {
 }
 
 impl WorkerState {
+    /// Best-effort measured metrics. Never blocks on the worker thread long:
+    /// the cached snapshot is used if the live query is not answered quickly.
+    async fn measured_metrics(&self) -> RuntimeMetrics {
+        self.metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn request_close(&self) {
         if !self.close_requested.swap(true, Ordering::SeqCst) {
             self.closed_for_calls.store(true, Ordering::SeqCst);
@@ -854,7 +1003,21 @@ fn worker_loop(
             return;
         }
     };
-    let started = driver.start();
+    let state_for_metrics = state.clone();
+    let start_options = StartOptions {
+        on_invocation: Some(Arc::new(move |update: &RuntimeMetrics| {
+            state_for_metrics
+                .metrics
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .merge(update);
+        })),
+        // The Deno backend acknowledges its own spawn id on the owner thread
+        // before the first guest message; other backends have no handshake.
+        ack: None,
+    };
+    record_metric(&state.metrics, &driver.metrics());
+    let started = driver.start_with(start_options);
     let start_ok = started.is_ok();
     let _ = startup.send(started);
     if !start_ok {
@@ -908,6 +1071,7 @@ fn worker_loop(
                     Err(_) => {}
                 }
                 let _ = job.reply.send(result);
+                record_metric(&state.metrics, &driver.metrics());
                 if state.close_requested.load(Ordering::SeqCst) {
                     break;
                 }
@@ -932,6 +1096,34 @@ fn worker_loop(
     *state.report.lock().expect("report mutex poisoned") = Some(report);
 
     state.finished.notify_waiters();
+}
+
+/// Spawn outside any engine lock. The caller has already resolved `parent`
+/// from the live registry (a transient, non-owning handle).
+async fn engine_child_worker(
+    parent: &SandboxHandle,
+    entrypoint: &str,
+    options: SandboxOptions,
+) -> Result<WorkerHandle> {
+    let engine_inner = parent.state.engine.upgrade().ok_or(Error::Closed)?;
+    let plugin = parent.prepared_plugin().resolve_child_entrypoint(entrypoint)?;
+    let engine = Engine {
+        inner: engine_inner.clone(),
+    };
+    let child = engine.create_child(parent, plugin, options).await?;
+    Ok(WorkerHandle::from_sandbox(
+        child,
+        WorkerOptions {
+            queue_capacity: worker_broker::MAX_QUEUED_MESSAGES,
+            max_queued_bytes: worker_broker::MAX_QUEUED_BYTES,
+            max_message_bytes: engine_inner.config.limits.max_message_bytes,
+            invocation_timeout: worker_broker::MESSAGE_TIMEOUT,
+        },
+    ))
+}
+
+fn record_metric(cell: &Mutex<RuntimeMetrics>, update: &RuntimeMetrics) {
+    cell.lock().unwrap_or_else(|e| e.into_inner()).merge(update);
 }
 
 fn map_policy(error: denosanbox_core::policy::Error) -> Error {

@@ -91,6 +91,20 @@ impl WorkerHandle {
         })
     }
 
+    /// Wrap an already-created child sandbox. Used by the trusted broker after
+    /// `Engine::create_child` succeeded; no policy is applied here.
+    pub(crate) fn from_sandbox(child: SandboxHandle, limits: WorkerOptions) -> Self {
+        Self {
+            inner: Arc::new(WorkerInner {
+                child,
+                slots: Arc::new(Semaphore::new(limits.queue_capacity)),
+                bytes: Arc::new(Semaphore::new(limits.max_queued_bytes)),
+                options: limits,
+                closed: AtomicBool::new(false),
+            }),
+        }
+    }
+
     /// Send a JSON message and await the worker's reply.
     ///
     /// Queue and byte permits are held for the whole invocation, including the

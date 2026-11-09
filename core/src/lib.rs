@@ -6,12 +6,16 @@
 //! contract tests.
 
 mod engine;
+mod worker_broker;
 
 pub use denosanbox_core::{
     BackendKind, CloseReport, EngineConfig, EngineLimits, Error, InvocationOptions, PluginSource,
     PreparedPlugin, Result, SandboxOptions, ShutdownReport,
 };
 pub use engine::{Engine, SandboxHandle};
+
+/// Truthful capability negotiation types.
+pub use denosanbox_core::{Capabilities, Feature, PluginRequirements, RuntimeMetrics};
 
 /// Public facade version, mirrored by `denosanbox-core::API_VERSION`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

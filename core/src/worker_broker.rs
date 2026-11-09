@@ -1,6 +1,12 @@
 //! A trusted, per-parent broker; guest identifiers have authority only in this map.
+//!
+//! The broker is installed on a [`HostContext`] by Rust before the isolate
+//! thread starts. Every operation is re-validated here: entries resolve inside
+//! the parent's immutable prepared graph, `spawn` always goes through
+//! `Engine::create_child`, and `post`/`terminate` are the only operations that
+//! map a guest identifier to a child.
 use crate::{EngineLimits, Error, Result, SandboxOptions, WorkerHandle};
-use denosanbox_core::host::WorkerHandler;
+use denosanbox_core::WorkerHandler;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -9,6 +15,15 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+/// Maximum message batch a child may return from one `onmessage` invocation.
+pub(crate) const MAX_REPLY_BATCH: usize = 32;
+/// Maximum queued/in-flight parent messages per child.
+pub(crate) const MAX_QUEUED_MESSAGES: usize = 32;
+/// Per-child byte cap for parent messages.
+pub(crate) const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
+/// Timeout for a single parent-message invocation.
+pub(crate) const MESSAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) type SpawnWorker = Arc<
     dyn Fn(String, SandboxOptions) -> Pin<Box<dyn Future<Output = Result<WorkerHandle>> + Send>>
         + Send
@@ -16,10 +31,24 @@ pub(crate) type SpawnWorker = Arc<
 >;
 
 struct State {
+    /// Children created by a successful spawn whose guest handle is not acked.
+    staged: BTreeMap<String, WorkerHandle>,
+    /// Wakes `post` callers waiting for each staged id to be acked.
+    ready: BTreeMap<String, Arc<tokio::sync::Notify>>,
+    /// Children whose spawn was acknowledged to the guest.
     children: BTreeMap<String, WorkerHandle>,
     next: u64,
     pending: usize,
+    /// Spawn slots reserved for acknowledged-but-unterminated guest handles.
+    admitted: usize,
 }
+
+impl State {
+    fn live(&self) -> usize {
+        self.staged.len() + self.children.len()
+    }
+}
+
 struct Broker {
     spawn: SpawnWorker,
     base: String,
@@ -92,8 +121,8 @@ fn entrypoint(base: &str, specifier: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-// A cancelled spawn future releases its pending reservation; Engine::create's
-// startup guard separately owns and tears down any partially initialized isolate.
+/// A pending spawn reservation. Dropping the future (parent deadline, cancel
+/// or saturation) always releases the quota slot exactly once.
 struct Pending(Arc<Broker>, bool);
 impl Drop for Pending {
     fn drop(&mut self) {
@@ -118,12 +147,15 @@ pub(crate) fn handler(
         base: base_entrypoint,
         limits,
         state: Mutex::new(State {
+            staged: BTreeMap::new(),
+            ready: BTreeMap::new(),
             children: BTreeMap::new(),
             next: 0,
             pending: 0,
+            admitted: 0,
         }),
     });
-    Arc::new(move |operation, input| {
+    Arc::new(move |operation: String, input: Value| {
         let broker = broker.clone();
         Box::pin(async move { broker.operation(&operation, input).await })
     })
@@ -132,6 +164,10 @@ pub(crate) fn handler(
 impl Broker {
     async fn close(&self, id: &str, worker: WorkerHandle) -> Result<()> {
         let report = worker.close().await?;
+        let mut state = lock(&self.state)?;
+        state.children.remove(id);
+        state.admitted = state.admitted.saturating_sub(1);
+        drop(state);
         if !report.closed_cleanly {
             // Retain the owner and its accounting while host work remains live.
             return Err(Error::Policy {
@@ -139,7 +175,6 @@ impl Broker {
                 message: "Worker still owns unfinished host work".into(),
             });
         }
-        lock(&self.state)?.children.remove(id);
         Ok(())
     }
 
@@ -154,99 +189,239 @@ impl Broker {
             });
         }
         match operation {
-            "spawn" => {
-                allowed_fields(&input, &["specifier", "options"])?;
-                let path = entrypoint(&self.base, string_field(&input, "specifier")?)?;
-                if let Some(options) = input.get("options") {
-                    allowed_fields(options, &["type", "name"])?;
-                    if options
-                        .get("type")
-                        .is_some_and(|kind| kind.as_str() != Some("module"))
-                    {
-                        return Err(Error::UnsupportedFeature {
-                            feature: "classic_workers".into(),
-                        });
-                    }
-                    if options
-                        .get("name")
-                        .is_some_and(|name| name.as_str().is_none_or(|name| name.len() > 128))
-                    {
-                        return Err(invalid("invalid Worker name"));
-                    }
-                }
-                {
-                    let mut state = lock(&self.state)?;
-                    if state.children.len() + state.pending >= self.limits.max_active_sandboxes {
-                        return Err(Error::QueueFull {
-                            capacity: self.limits.max_active_sandboxes,
-                        });
-                    }
-                    state.pending += 1;
-                }
-                let mut reservation = Pending(self.clone(), true);
-                let worker = (self.spawn)(path, SandboxOptions::default()).await?;
-                let id = {
-                    let mut state = lock(&self.state)?;
-                    let next = state
-                        .next
-                        .checked_add(1)
-                        .ok_or_else(|| Error::LimitExceeded {
-                            limit: "worker_identifiers".into(),
-                            detail: "Worker identifier space exhausted".into(),
-                        })?;
-                    state.next = next;
-                    let id = next.to_string();
-                    state.children.insert(id.clone(), worker);
-                    state.pending -= 1;
-                    reservation.1 = false;
-                    id
-                };
-                Ok(json!(id))
-            }
-            "post" => {
-                allowed_fields(&input, &["id", "message"])?;
-                let id = string_field(&input, "id")?.to_owned();
-                let message = input
-                    .get("message")
-                    .cloned()
-                    .ok_or_else(|| invalid("missing Worker message"))?;
-                let worker = lock(&self.state)?
-                    .children
-                    .get(&id)
-                    .cloned()
-                    .ok_or(Error::Closed)?;
-                let reply = worker.post_message(message).await?;
-                if let Some(messages) = reply.get("__workerMessages") {
-                    if messages
-                        .as_array()
-                        .is_none_or(|messages| messages.len() > 32)
-                    {
-                        return Err(Error::LimitExceeded {
-                            limit: "worker_reply_batch".into(),
-                            detail: "invalid Worker reply batch".into(),
-                        });
-                    }
-                    if reply.get("closed").and_then(Value::as_bool) == Some(true) {
-                        self.close(&id, worker).await?;
-                    }
-                }
-                Ok(reply)
-            }
-            "terminate" => {
-                allowed_fields(&input, &["id"])?;
-                let id = string_field(&input, "id")?;
-                let worker = lock(&self.state)?
-                    .children
-                    .get(id)
-                    .cloned()
-                    .ok_or(Error::Closed)?;
-                self.close(id, worker).await?;
-                Ok(Value::Null)
-            }
-            _ => Err(Error::UnsupportedFeature {
-                feature: format!("Worker operation {operation}"),
+            "spawn" => self.spawn(&input).await,
+            "ack" => self.ack(&input),
+            "abort" => self.abort(&input),
+            "post" => self.post(&input).await,
+            "terminate" => self.terminate(&input).await,
+            other => Err(Error::UnsupportedFeature {
+                feature: format!("Worker operation {other}"),
             }),
         }
+    }
+
+    async fn spawn(self: &Arc<Self>, input: &Value) -> Result<Value> {
+        allowed_fields(input, &["specifier", "options"])?;
+        let path = entrypoint(&self.base, string_field(input, "specifier")?)?;
+        match input.get("options") {
+            Some(options) => {
+                allowed_fields(options, &["type", "name"])?;
+                match options.get("type") {
+                    Some(Value::String(kind)) if kind == "module" => {}
+                    Some(Value::String(_)) => {
+                        return Err(Error::UnsupportedFeature {
+                            feature: "classic_workers".into(),
+                        })
+                    }
+                    Some(_) => return Err(invalid("invalid Worker type")),
+                    None => {
+                        return Err(Error::UnsupportedFeature {
+                            feature: "classic_workers".into(),
+                        })
+                    }
+                }
+                if options
+                    .get("name")
+                    .is_some_and(|name| name.as_str().is_none_or(|name| name.len() > 128))
+                {
+                    return Err(invalid("invalid Worker name"));
+                }
+            }
+            None => {
+                return Err(Error::UnsupportedFeature {
+                    feature: "classic_workers".into(),
+                })
+            }
+        }
+        {
+            let mut state = lock(&self.state)?;
+            if state.live() + state.pending + state.admitted >= self.limits.max_active_sandboxes {
+                return Err(Error::QueueFull {
+                    capacity: self.limits.max_active_sandboxes,
+                });
+            }
+            state.pending += 1;
+        }
+        let mut reservation = Pending(self.clone(), true);
+        let mut options = SandboxOptions::default();
+        // The inbox allowance is charged on top of the child heap target, which
+        // the engine only accepts above its Deno floor (64MiB default).
+        options.memory_limit_bytes = Some(
+            MAX_QUEUED_BYTES.max(denosanbox_core::policy::Limits::default().heap_target_bytes()),
+        );
+        let worker = (self.spawn)(path, options).await?;
+        let id = {
+            let mut state = lock(&self.state)?;
+            let next = state
+                .next
+                .checked_add(1)
+                .ok_or(Error::LimitExceeded {
+                    limit: "worker_identifiers".into(),
+                    detail: "Worker identifier space exhausted".into(),
+                })?;
+            state.next = next;
+            let id = next.to_string();
+            state.pending = state.pending.saturating_sub(1);
+            state.admitted += 1;
+            state.staged.insert(id.clone(), worker);
+            state.ready.insert(id.clone(), Arc::new(tokio::sync::Notify::new()));
+            reservation.1 = false;
+            id
+        };
+        Ok(json!(id))
+    }
+
+    /// Marks a spawn complete once this sandbox has finished starting.
+    ///
+    /// Called first on the *child's* thread for its own id, then by the parent
+    /// right before it delivers the first message; both are idempotent. The
+    /// very first message therefore implies "child ready" without the parent
+    /// having to suspend on a bare ack round trip.
+    fn ack(&self, input: &Value) -> Result<Value> {
+        allowed_fields(input, &["id"])?;
+        let id = string_field(input, "id")?;
+        let mut state = lock(&self.state)?;
+        match state.staged.remove(id) {
+            Some(worker) => {
+                state.children.insert(id.to_owned(), worker);
+                if let Some(waiters) = state.ready.remove(id) {
+                    waiters.notify_waiters();
+                }
+                Ok(Value::Null)
+            }
+            // Already acknowledged, terminated or aborted: idempotent success.
+            None => Ok(Value::Null),
+        }
+    }
+
+    fn abort(&self, input: &Value) -> Result<Value> {
+        allowed_fields(input, &["id"])?;
+        let id = string_field(input, "id")?;
+        let mut state = lock(&self.state)?;
+        if let Some(worker) = state.staged.remove(id) {
+            state.admitted = state.admitted.saturating_sub(1);
+            if let Some(waiters) = state.ready.remove(id) {
+                waiters.notify_waiters();
+            }
+            worker.cancel();
+        }
+        Ok(Value::Null)
+    }
+
+    async fn post(&self, input: &Value) -> Result<Value> {
+        allowed_fields(input, &["id", "message"])?;
+        let id = string_field(input, "id")?.to_owned();
+        let message = input
+            .get("message")
+            .cloned()
+            .ok_or_else(|| invalid("missing Worker message"))?;
+        let encoded = serde_json::to_vec(&message)
+            .map_err(|_| invalid("invalid Worker JSON"))?
+            .len();
+        if encoded > self.limits.max_message_bytes {
+            return Err(Error::LimitExceeded {
+                limit: "worker_message_bytes".into(),
+                detail: "Worker message is too large".into(),
+            });
+        }
+        // Resolve without holding the lock across the wait.
+        let staged = {
+            let state = lock(&self.state)?;
+            if state.children.contains_key(&id) {
+                None
+            } else {
+                // Startup not acknowledged yet: wait natively for this same
+                // child rather than rejecting or reordering the message.
+                let staged = state.staged.get(&id).cloned().ok_or(Error::Closed)?;
+                let ready = state.ready.get(&id).cloned().ok_or(Error::Closed)?;
+                Some((staged, ready))
+            }
+        };
+        if let Some((staged, ready)) = staged {
+            wait_ready(&self.state, &id, &ready).await?;
+            // Startup is over: promote to the acknowledged map before the
+            // message is delivered. A spawn that was aborted meanwhile fails
+            // with `Closed` instead of delivering.
+            let promoted = {
+                let mut state = lock(&self.state)?;
+                if state.staged.remove(&id).is_some() {
+                    state.children.insert(id.clone(), staged);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !promoted {
+                return Err(Error::Closed);
+            }
+        }
+        let worker = lock(&self.state)?
+            .children
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Closed
+            })?;
+        let reply = worker.post_message(message).await?;
+        if let Some(messages) = reply.get("__workerMessages") {
+            if messages
+                .as_array()
+                .is_none_or(|messages| messages.len() > MAX_REPLY_BATCH)
+            {
+                return Err(Error::LimitExceeded {
+                    limit: "worker_reply_batch".into(),
+                    detail: "invalid Worker reply batch".into(),
+                });
+            }
+        }
+        if reply
+            .get("closed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let still = lock(&self.state)?.children.contains_key(&id);
+            if still {
+                self.close(&id, worker).await?;
+            }
+        }
+        Ok(reply)
+    }
+
+    async fn terminate(&self, input: &Value) -> Result<Value> {
+        allowed_fields(input, &["id"])?;
+        let id = string_field(input, "id")?.to_owned();
+        let (staged, worker) = {
+            let mut state = lock(&self.state)?;
+            if let Some(worker) = state.staged.remove(&id) {
+                state.admitted = state.admitted.saturating_sub(1);
+                (true, worker)
+            } else {
+                match state.children.get(&id) {
+                    Some(worker) => (false, worker.clone()),
+                    None => return Ok(Value::Null),
+                }
+            }
+        };
+        if staged {
+            worker.cancel();
+            return Ok(Value::Null);
+        }
+        self.close(&id, worker).await?;
+        Ok(Value::Null)
+    }
+}
+
+/// Waits until `id` is acknowledged or removed (abort/terminate). The child
+/// handle captured by the caller keeps the pending startup itself alive.
+async fn wait_ready(state: &Mutex<State>, id: &str, notify: &tokio::sync::Notify) -> Result<()> {
+    loop {
+        let notified = notify.notified();
+        if !lock(state)?.ready.contains_key(id) {
+            return Ok(());
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(10), notified)
+            .await
+            .ok();
     }
 }
 

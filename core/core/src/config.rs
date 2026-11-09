@@ -66,6 +66,28 @@ impl Default for EngineLimits {
 }
 
 impl EngineLimits {
+    /// Per-field minimum. Every field becomes the stricter of the two, so a
+    /// narrowed set never loosens a previously proven bound.
+    #[must_use]
+    pub fn narrow(&self, other: &EngineLimits) -> EngineLimits {
+        let pick = |a: Duration, b: Duration| Duration::from_nanos(a.as_nanos().min(b.as_nanos()) as u64);
+        EngineLimits {
+            max_active_sandboxes: self.max_active_sandboxes.min(other.max_active_sandboxes),
+            max_pending_invocations: self
+                .max_pending_invocations
+                .min(other.max_pending_invocations),
+            max_message_bytes: self.max_message_bytes.min(other.max_message_bytes),
+            default_invocation_timeout: pick(
+                self.default_invocation_timeout,
+                other.default_invocation_timeout,
+            ),
+            max_invocation_timeout: pick(self.max_invocation_timeout, other.max_invocation_timeout),
+            max_modules: self.max_modules.min(other.max_modules),
+            max_module_bytes: self.max_module_bytes.min(other.max_module_bytes),
+            max_graph_bytes: self.max_graph_bytes.min(other.max_graph_bytes),
+        }
+    }
+
     /// Validates a limit set. All values must be non-zero and internally sane.
     pub fn validate(&self) -> Result<(), Error> {
         let fields = [

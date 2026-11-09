@@ -1,5 +1,15 @@
-(function installWorkerRuntime(ops, config) {
+// Trusted bootstrap. A single IIFE: trusted ops are captured as closure values
+// first, the raw `Deno` namespace is hidden, and only then are mediated globals
+// installed. No lexical or global helper names survive (nothing like
+// `__denosanboxBootstrap`/`__denosanboxConfig` is left for guests to call).
+(function () {
   'use strict';
+  const rawCore = typeof Deno === 'object' && Deno !== null ? Deno.core : undefined;
+  // Trusted, Rust-bound handshake callback (null for roots), consumed below.
+  const ops = rawCore && rawCore.ops;
+  if (!ops) throw new Error('trusted ops unavailable');
+  const config = __SANDBOX_CONFIG__;
+  const childAckCallback = config.childAck;
   const define = Object.defineProperty;
   const freeze = Object.freeze;
   const keys = Object.keys;
@@ -13,12 +23,26 @@
   const slice = Array.prototype.slice;
   const thenMethod = Promise.prototype.then;
   const resolvePromise = Promise.resolve.bind(Promise);
-  const makePromise = Promise;
   const objectPrototype = Object.prototype;
   const charCodeAt = String.prototype.charCodeAt;
-  const callWorker = (operation, input) => ops.op_sandbox_worker(operation, input);
+  const stringifyText = String;
+  const opWorker = ops.op_sandbox_worker;
+  const opLog = ops.op_sandbox_log;
+  const opFetch = ops.op_sandbox_fetch;
+  const opResource = ops.op_sandbox_resource;
+  const opResourceAsync = ops.op_sandbox_resource_async;
+  const opHost = ops.op_sandbox_host;
+  const callWorker = (operation, input) => apply(opWorker, undefined, [operation, stringify(input)]);
   const then = (promise, ok, error) => apply(thenMethod, promise, [ok, error]);
+  const encode = (value) => {
+    const text = stringify(value);
+    if (typeof text !== 'string' || text.length > config.maxMessageBytes) {
+      throw new RangeError('message limit exceeded');
+    }
+    return text;
+  };
   let activeWorkers = 0;
+  let childAck = null;
   let dispatching = false;
   let childClosed = false;
   let outbox = [];
@@ -75,7 +99,9 @@
   class Events {
     constructor() { this.listeners = Object.create(null); }
     add(type, callback) {
-      if (!['message', 'error', 'messageerror', 'exit'].includes(type)) throw unsupported('Worker event type');
+      if (type !== 'message' && type !== 'error' && type !== 'messageerror' && type !== 'exit') {
+        throw unsupported('Worker event type');
+      }
       if (typeof callback !== 'function') throw new TypeError('Worker listener must be a function');
       const list = this.listeners[type] || (this.listeners[type] = []);
       if (list.indexOf(callback) >= 0) return;
@@ -120,7 +146,7 @@
       for (let i = 0; i < web.length; i++) await apply(web[i], globalThis, [message]);
       const node = nodeChildEvents.snapshot('message');
       for (let i = 0; i < node.length; i++) await apply(node[i], parentPort, [value]);
-      return { __workerMessages: outbox, closed: childClosed };
+      return { __workerMessages: outbox.slice(0), closed: childClosed };
     } finally { dispatching = false; outbox = []; outboxBytes = 0; }
   }
 
@@ -129,9 +155,13 @@
     constructor(specifier, options = {}) {
       if (!options || typeof options !== 'object') throw new TypeError('Worker options must be an object');
       const fields = keys(options);
-      for (let i = 0; i < fields.length; i++) if (fields[i] !== 'type' && fields[i] !== 'name') throw unsupported('Worker option ' + fields[i]);
+      for (let i = 0; i < fields.length; i++) {
+        if (fields[i] !== 'type' && fields[i] !== 'name') throw unsupported('Worker option ' + fields[i]);
+      }
       if (options.type !== 'module') throw unsupported('Only explicit module Workers are supported');
-      if (options.name !== undefined && (typeof options.name !== 'string' || options.name.length > 128)) throw new TypeError('Invalid Worker name');
+      if (options.name !== undefined && (typeof options.name !== 'string' || options.name.length > 128)) {
+        throw new TypeError('Invalid Worker name');
+      }
       if (typeof specifier !== 'string' && specifier && typeof specifier.href === 'string') specifier = specifier.href;
       if (typeof specifier !== 'string' || !specifier.length || specifier.length > 4096) throw new TypeError('Invalid Worker entrypoint');
       if (activeWorkers >= config.maxChildren) throw failure('QuotaExceededError', 'Worker child admission is full');
@@ -142,7 +172,11 @@
       const request = { type: 'module' };
       if (options.name !== undefined) request.name = options.name;
       state.ready = callWorker('spawn', { specifier, options: request });
-      then(state.ready, undefined, error => { state.closed = true; state.release(); this.#error(error); });
+      then(state.ready, undefined, error => {
+        state.closed = true;
+        state.release();
+        this.#error(error);
+      });
     }
     #emit(type, extra) {
       const state = this.#state;
@@ -153,15 +187,15 @@
       for (let i = 0; i < list.length; i++) { try { apply(list[i], this, [item]); } catch (_) {} }
     }
     #error(error) {
-      const safe = error instanceof Error ? error : failure('WorkerError', String(error));
-      this.#emit('error', { error: safe, message: String(safe.message) });
+      const safe = error instanceof Error ? error : failure('WorkerError', stringifyText(error));
+      this.#emit('error', { error: safe, message: stringifyText(safe.message) });
     }
     get onmessage() { return this.#state.onmessage; }
     set onmessage(value) { this.#state.onmessage = value; }
     get onerror() { return this.#state.onerror; }
     set onerror(value) { this.#state.onerror = value; }
-    addEventListener(type, callback) { this.#state.events.add(String(type), callback); }
-    removeEventListener(type, callback) { this.#state.events.remove(String(type), callback); }
+    addEventListener(type, callback) { this.#state.events.add(stringifyText(type), callback); }
+    removeEventListener(type, callback) { this.#state.events.remove(stringifyText(type), callback); }
     postMessage(value, transfer) {
       const state = this.#state;
       if (state.closed) throw failure('InvalidStateError', 'Worker is closed');
@@ -216,37 +250,145 @@
     }
     off(type, callback) {
       const records = nodeWrappers.get(this) || [];
-      for (let i = records.length - 1; i >= 0; i--) if (records[i].type === type && records[i].callback === callback) {
-        this.removeEventListener(type, records[i].wrapper); records.splice(i, 1);
+      for (let i = records.length - 1; i >= 0; i--) {
+        if (records[i].type === type && records[i].callback === callback) {
+          this.removeEventListener(type, records[i].wrapper);
+          records.splice(i, 1);
+        }
       }
       return this;
     }
     removeListener(type, callback) { return this.off(type, callback); }
     terminate() { return then(super.terminate(), () => 0); }
   }
+
   const parentPort = config.isChild ? freeze({
     postMessage: childPost,
-    on(type, callback) { nodeChildEvents.add(String(type), callback); return parentPort; },
+    on(type, callback) { nodeChildEvents.add(stringifyText(type), callback); return parentPort; },
     once(type, callback) {
-      const once = value => { nodeChildEvents.remove(String(type), once); return apply(callback, parentPort, [value]); };
-      nodeChildEvents.add(String(type), once); return parentPort;
+      const once = value => { nodeChildEvents.remove(stringifyText(type), once); return apply(callback, parentPort, [value]); };
+      nodeChildEvents.add(stringifyText(type), once);
+      return parentPort;
     },
-    off(type, callback) { nodeChildEvents.remove(String(type), callback); return parentPort; },
-    removeListener(type, callback) { nodeChildEvents.remove(String(type), callback); return parentPort; },
+    off(type, callback) { nodeChildEvents.remove(stringifyText(type), callback); return parentPort; },
+    removeListener(type, callback) { nodeChildEvents.remove(stringifyText(type), callback); return parentPort; },
     close: closeChild,
   }) : null;
+
+  // Mediated resources (all frozen; their ops live only in closures above).
+  const resource = (name, ...args) => apply(opResource, undefined, [name, encode(args)]);
+  const sandbox = freeze({
+    fs: freeze({
+      readTextFile: (path) => apply(opResourceAsync, undefined, ['read', encode([path])]),
+      writeTextFile: (path, data) => apply(opResourceAsync, undefined, ['write', encode([path, data])]),
+    }),
+    env: freeze({
+      get: (name) => resource('env_get', name),
+      set: (name, value) => resource('env_set', name, value),
+    }),
+    host: freeze({ protocolVersion: 1, call: (name, input) => apply(opHost, undefined, [name, encode(input)]) }),
+    cwd: () => resource('cwd'),
+    chdir: (path) => apply(opResourceAsync, undefined, ['chdir', encode([path])]),
+    exit: () => resource('exit'),
+  });
+  const fetchImpl = async (url, init = {}) => {
+    if (typeof url !== 'string') throw new TypeError('fetch supports a URL string');
+    const text = init.body === undefined ? '' : stringifyText(init.body);
+    if (text.length > config.maxMessageBytes) throw new RangeError('request body exceeds limit');
+    const input = stringify({ url, method: init.method || 'GET', headers: init.headers || {}, body: text });
+    if (input.length > config.maxMessageBytes) throw new RangeError('request exceeds limit');
+    const response = await apply(opFetch, undefined, [input]);
+    const bytes = Uint8Array.from(response.body);
+    const decode = () => decodeURIComponent(escape(Array.from(bytes, c => String.fromCharCode(c)).join('')));
+    return freeze({
+      status: response.status,
+      ok: response.status >= 200 && response.status < 300,
+      url: response.url,
+      headers: freeze({ get: (name) => response.headers[stringifyText(name).toLowerCase()] ?? null }),
+      text: async () => decode(),
+      json: async () => parse(decode()),
+      arrayBuffer: async () => bytes.buffer,
+    });
+  };
+  // The native op enforces the effective per-invocation log budget; this JS
+  // check keeps a single record bounded before serialization.
+  const emitLog = (...args) => {
+    const text = args.map(arg => stringifyText(arg)).join(' ');
+    if (utf8Bytes(text) > config.maxLogRecordBytes) throw new RangeError('log record limit exceeded');
+    apply(opLog, undefined, [text]);
+  };
+  const consoleApi = freeze({ log: emitLog, info: emitLog, warn: emitLog, error: emitLog, debug: emitLog });
+
   const readonly = (name, value) => define(globalThis, name, { value, writable: false, configurable: false });
   if (typeof globalThis.self === 'undefined') readonly('self', globalThis);
   define(globalThis, 'onmessage', { get: () => childOnMessage, set: value => { childOnMessage = value; }, configurable: false });
-  readonly('addEventListener', (type, callback) => childEvents.add(String(type), callback));
-  readonly('removeEventListener', (type, callback) => childEvents.remove(String(type), callback));
+  readonly('addEventListener', (type, callback) => childEvents.add(stringifyText(type), callback));
+  readonly('removeEventListener', (type, callback) => childEvents.remove(stringifyText(type), callback));
   readonly('postMessage', childPost);
   readonly('close', closeChild);
-  readonly('__denosanboxDispatchWorkerMessage', dispatchChild);
-  readonly('__denosanboxNodeWorker', freeze(NodeWorker));
-  readonly('__denosanboxParentPort', parentPort);
-  readonly('__denosanboxIsMainThread', !config.isChild);
+  define(globalThis, '__denosanboxDispatchWorkerMessage', { value: dispatchChild, writable: false, configurable: true });
+  // Engine-dispatched handshake resolved by the native driver. The broker
+  // installs `childAck` for this child (bound by Rust to its own spawn id, no
+  // guest input); it returns null when there is nothing to acknowledge.
+  define(globalThis, '__denosanboxAckWorker', {
+    value: () => (childAck === null ? null : childAck()),
+    writable: false,
+    configurable: true,
+  });
+  // The `worker_threads` alias objects exist only under the host-approved
+  // profile (chosen by trusted native code, never by guest input). In every
+  // other profile the reserved builtin is absent from the graph, so the names
+  // are unbound and `node:worker_threads` cannot be imported.
+  if (config.nodeWorkerThreads) {
+    readonly('__denosanboxNodeWorker', freeze(NodeWorker));
+    readonly('__denosanboxParentPort', parentPort);
+    readonly('__denosanboxIsMainThread', !config.isChild);
+  }
+  readonly('Worker', freeze(Worker));
+  readonly('sandbox', sandbox);
+  readonly('fetch', fetchImpl);
+  readonly('console', consoleApi);
   freeze(Worker.prototype);
   freeze(NodeWorker.prototype);
-  readonly('Worker', freeze(Worker));
-})
+
+  // Raw trusted bindings are hidden BEFORE any guest module loads. A property
+  // that can be redefined or deleted is removed; otherwise it is inerted with
+  // an `undefined` value when redefinition is permitted. The bootstrap never
+  // freezes `globalThis` (guests may keep independent global state), so these
+  // writes always take effect.
+  const hideRaw = (name) => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+    if (descriptor === undefined) return;
+    if (descriptor.configurable) {
+      if (!Reflect.deleteProperty(globalThis, name)) throw new Error('raw namespace removal failed: ' + name);
+      return;
+    }
+    if (descriptor.writable) {
+      Reflect.set(globalThis, name, undefined);
+      return;
+    }
+    throw new Error('raw namespace is not removable: ' + name);
+  };
+  for (const name of ['Deno', 'coreprint', 'node', 'process', 'require']) hideRaw(name);
+  // Shared-memory / native engines are neutralized, never claimed as features.
+  for (const name of ['SharedArrayBuffer', 'Atomics', 'WebAssembly']) {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+    if (descriptor === undefined) continue;
+    if (descriptor.configurable || descriptor.writable) {
+      try { Reflect.deleteProperty(globalThis, name); } catch (_) {}
+      if (typeof globalThis[name] !== 'undefined') Reflect.set(globalThis, name, undefined);
+    }
+  }
+
+  // Authoritative check: any reachable raw entry point aborts startup with a
+  // typed error instead of leaving a partially trusted global behind.
+  const leaked = [];
+  for (const name of ['Deno', 'coreprint', 'node', 'process', 'require']) {
+    if (typeof globalThis[name] !== 'undefined') leaked.push(name);
+  }
+  for (const name of ['SharedArrayBuffer', 'Atomics', 'WebAssembly']) {
+    const kind = typeof globalThis[name];
+    if (kind !== 'undefined' && kind !== 'number') leaked.push(name);
+  }
+  if (leaked.length) throw new Error('trusted namespace removal failed: ' + leaked.join(','));
+})();

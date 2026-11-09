@@ -4,6 +4,7 @@
 //! facade re-exports these items in a stable language-binding-friendly shape.
 
 mod backend;
+mod capabilities;
 mod config;
 mod error;
 mod fake;
@@ -11,8 +12,10 @@ mod host;
 mod plugin;
 
 pub use backend::{
-    CreatedDriver, Driver, DriverControl, DriverFactory, Invocation, UnavailableFactory,
+    AckCallback, CreatedDriver, Driver, DriverControl, DriverFactory, Invocation, MetricsObserver,
+    StartOptions, UnavailableFactory,
 };
+pub use capabilities::{Capabilities, Feature, PluginRequirements, RuntimeMetrics};
 pub use config::{
     BackendKind, CloseReport, EngineConfig, EngineLimits, InvocationOptions, SandboxOptions,
     ShutdownReport,
@@ -20,6 +23,9 @@ pub use config::{
 pub use error::{Error, Result};
 pub use fake::{FakeControl, FakeFactory};
 pub use plugin::prepare_with_profile;
+pub use plugin::{
+    builtin_alias_target, is_reserved_builtin_path, prepare_with_profile, WORKER_THREADS_BUILTIN,
+};
 pub use plugin::{
     prepare, resolve_relative, scan_import_specifiers, validate_path, PluginSource, PreparedPlugin,
 };

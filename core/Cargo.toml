@@ -2,13 +2,13 @@
 name = "denosanbox"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.99"
 license = "Apache-2.0"
 description = "Embeddable, thread-affine JavaScript sandbox foundation built on deno_core"
 publish = false
 
 [workspace]
-members = ["core", "modules", "policy", "testkit", "runtimes/deno"]
+members = ["core", "modules", "policy", "testkit", "mounts", "connectors", "runtimes/deno"]
 resolver = "2"
 
 [dependencies]

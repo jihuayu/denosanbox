@@ -15,10 +15,10 @@ async def test_shared_behavior(case):
         for step in case['steps']:
             sandbox = sandboxes[step['sandbox']]
             if step['expected']['kind'] == 'ok':
-                assert await sandbox.call(step['export'], step['input']) == step['expected']['value']
+                assert json.loads(await sandbox.call(step['export'], json.dumps(step['input'], ensure_ascii=False))) == step['expected']['value']
             else:
                 with pytest.raises(SandboxError) as caught:
-                    await sandbox.call(step['export'], step['input'])
+                    await sandbox.call(step['export'], json.dumps(step['input'], ensure_ascii=False))
                 assert caught.value.kind == step['expected']['code']
     finally:
         await engine.shutdown()

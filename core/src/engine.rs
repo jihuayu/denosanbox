@@ -445,6 +445,7 @@ impl Engine {
             cancelled: AtomicU64::new(0),
             join: Mutex::new(None),
             report: Mutex::new(None),
+            driver_disposed: AtomicBool::new(false),
             finished: Arc::new(tokio::sync::Notify::new()),
             joined: Arc::new(AtomicBool::new(false)),
             active: Mutex::new(Some(guard)),
@@ -976,6 +977,7 @@ struct WorkerState {
     cancelled: AtomicU64,
     join: Mutex<Option<JoinHandle<()>>>,
     report: Mutex<Option<CloseReport>>,
+    driver_disposed: AtomicBool,
     finished: Arc<tokio::sync::Notify>,
     joined: Arc<AtomicBool>,
     active: Mutex<Option<ActiveGuard>>,
@@ -1054,7 +1056,11 @@ impl WorkerState {
                 report.forced_termination = true;
             }
             report.pending_host_operations = self.host.outstanding();
-            if joined && waiting_for_host_work && report.pending_host_operations == 0 {
+            if joined
+                && self.driver_disposed.load(Ordering::Acquire)
+                && waiting_for_host_work
+                && report.pending_host_operations == 0
+            {
                 // A successfully disposed driver may have reported native
                 // work still draining. Reobserve that work, rather than
                 // retaining its old incomplete snapshot forever. Driver
@@ -1115,7 +1121,11 @@ fn worker_loop(
     let start_ok = started.is_ok();
     let _ = startup.send(started);
     if !start_ok {
-        let report = driver.close().unwrap_or(CloseReport {
+        let closed = driver.close();
+        state
+            .driver_disposed
+            .store(closed.is_ok(), Ordering::Release);
+        let report = closed.unwrap_or(CloseReport {
             closed_cleanly: false,
             ..CloseReport::default()
         });
@@ -1184,7 +1194,11 @@ fn worker_loop(
             let _ = job.reply.send(Err(Error::Closed));
         }
     }
-    let mut report = driver.close().unwrap_or(CloseReport {
+    let closed = driver.close();
+    state
+        .driver_disposed
+        .store(closed.is_ok(), Ordering::Release);
+    let mut report = closed.unwrap_or(CloseReport {
         invocations_completed: state.completed.load(Ordering::SeqCst),
         invocations_cancelled: state.cancelled.load(Ordering::SeqCst),
         forced_termination: state.control.is_cancelled(),

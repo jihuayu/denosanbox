@@ -8,7 +8,44 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::host_audit::{AuditEvent, AuditOutcome, HostAudit};
+use crate::host_schema::{JsonSchema, SchemaLimits};
 use crate::{Error, Result};
+use denosanbox_policy::Budget;
+use std::time::SystemTime;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilitySchemas {
+    pub input: JsonSchema,
+    pub output: JsonSchema,
+}
+impl Default for CapabilitySchemas {
+    fn default() -> Self {
+        Self {
+            input: JsonSchema::Any,
+            output: JsonSchema::Any,
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct HostConfig {
+    pub schemas: BTreeMap<String, CapabilitySchemas>,
+    pub schema_limits: SchemaLimits,
+    pub audit: Arc<HostAudit>,
+    /// Shared ancestor admission pool. Clone this config for sibling sandboxes.
+    pub host_budget: Arc<Budget>,
+}
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            schemas: BTreeMap::new(),
+            schema_limits: SchemaLimits::default(),
+            audit: Arc::new(HostAudit::default()),
+            host_budget: Budget::new(32),
+        }
+    }
+}
+
 use denosanbox_policy::{
     CancellationToken, Deadline, HostRegistry, InvocationContext, Policy, RegisteredCallback,
     ResourceView, SandboxId, ViewLimits,
@@ -33,6 +70,8 @@ pub struct HostContext {
     max_host_calls: usize,
     max_message_bytes: usize,
     closed: AtomicBool,
+    config: HostConfig,
+    host_budget: Arc<Budget>,
 }
 
 fn policy_error(error: denosanbox_policy::Error) -> Error {
@@ -64,6 +103,14 @@ impl HostContext {
         registry: Arc<Mutex<HostRegistry>>,
         grants: Vec<HostGrant>,
     ) -> Result<Arc<Self>> {
+        Self::new_with_config(policy, registry, grants, HostConfig::default())
+    }
+    pub fn new_with_config(
+        policy: Policy,
+        registry: Arc<Mutex<HostRegistry>>,
+        grants: Vec<HostGrant>,
+        config: HostConfig,
+    ) -> Result<Arc<Self>> {
         let id = SandboxId::mint();
         let limits = policy.limits();
         let mut indexed = BTreeMap::new();
@@ -94,6 +141,9 @@ impl HostContext {
             max_total_bytes: limits.heap_target_bytes().min(16 * 1024 * 1024),
             ..Default::default()
         };
+        let host_budget = config
+            .host_budget
+            .child(limits.queue_depth().min(32) as u64);
         Ok(Arc::new(Self {
             id,
             view: Mutex::new(ResourceView::new(id, policy, view_limits)),
@@ -105,6 +155,8 @@ impl HostContext {
             max_host_calls: limits.queue_depth().min(32),
             max_message_bytes: limits.max_message_bytes(),
             closed: AtomicBool::new(false),
+            config,
+            host_budget,
         }))
     }
     pub fn id(&self) -> SandboxId {
@@ -112,6 +164,25 @@ impl HostContext {
     }
     pub fn outstanding(&self) -> usize {
         self.outstanding.load(Ordering::Acquire)
+    }
+    pub fn grants(&self) -> Vec<HostGrant> {
+        self.grants.values().cloned().collect()
+    }
+    /// Child configs retain this node as their concurrency ancestor.
+    pub fn host_config(&self) -> HostConfig {
+        HostConfig {
+            host_budget: self.host_budget.clone(),
+            ..self.config.clone()
+        }
+    }
+    pub fn audit(&self) -> Arc<HostAudit> {
+        self.config.audit.clone()
+    }
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+    pub fn deadline(&self) -> Result<Deadline> {
+        Ok(*lock(&self.deadline)?)
     }
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
@@ -186,6 +257,44 @@ impl HostContext {
     }
 
     pub async fn call(self: &Arc<Self>, name: String, input: Value) -> Result<Value> {
+        let audit_name = self
+            .grants
+            .get(&name)
+            .map_or("<ungranted>", |grant| grant.callback.name())
+            .to_string();
+        self.config.audit.record(AuditEvent {
+            at: SystemTime::now(),
+            sandbox: self.id,
+            capability: audit_name.clone(),
+            outcome: AuditOutcome::Started,
+        });
+        let result = self.call_inner(name, input).await;
+        let outcome = match &result {
+            Ok(_) => AuditOutcome::Completed,
+            Err(Error::Cancelled | Error::Closed) => AuditOutcome::Cancelled,
+            Err(Error::DeadlineExceeded) => AuditOutcome::DeadlineExceeded,
+            Err(Error::QueueFull { .. } | Error::LimitExceeded { .. }) => {
+                AuditOutcome::LimitExceeded
+            }
+            Err(Error::Policy { kind, .. }) if kind == "SchemaRejected" => {
+                AuditOutcome::SchemaRejected
+            }
+            Err(Error::Policy { kind, .. }) if kind == "LimitExceeded" || kind == "Overflow" => {
+                AuditOutcome::LimitExceeded
+            }
+
+            Err(Error::Policy { .. }) => AuditOutcome::Denied,
+            Err(_) => AuditOutcome::Failed,
+        };
+        self.config.audit.record(AuditEvent {
+            at: SystemTime::now(),
+            sandbox: self.id,
+            capability: audit_name,
+            outcome,
+        });
+        result
+    }
+    async fn call_inner(self: &Arc<Self>, name: String, input: Value) -> Result<Value> {
         self.live()?;
         lock(&self.view)?
             .policy()
@@ -195,6 +304,22 @@ impl HostContext {
             kind: "Denied".into(),
             message: "host capability not granted".into(),
         })?;
+        let schemas = self.config.schemas.get(&name).cloned().unwrap_or_default();
+        let schema_limits = SchemaLimits {
+            max_string_bytes: self
+                .config
+                .schema_limits
+                .max_string_bytes
+                .min(self.max_message_bytes),
+            ..self.config.schema_limits
+        };
+        schemas
+            .input
+            .validate(&input, schema_limits)
+            .map_err(|_| Error::Policy {
+                kind: "SchemaRejected".into(),
+                message: "host input failed registered schema".into(),
+            })?;
         let input = serde_json::to_vec(&input).map_err(|_| Error::Execution {
             message: "invalid host input".into(),
         })?;
@@ -214,6 +339,7 @@ impl HostContext {
         let dispatch = lock(&self.registry)?
             .prepare_dispatch(&context, &grant.callback, input)
             .map_err(policy_error)?;
+        let admission = self.host_budget.reserve(1).map_err(policy_error)?;
         let mut active = self.outstanding.load(Ordering::Acquire);
         loop {
             if active >= self.max_host_calls {
@@ -238,6 +364,7 @@ impl HostContext {
             .name("denosanbox-host-call".into())
             .spawn(move || {
                 let _guard = guard;
+                let _admission = admission;
                 let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if dispatch.is_async() {
                         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -256,6 +383,8 @@ impl HostContext {
                         message: "host callback panicked".into(),
                     }),
                     Ok(result) => result.and_then(|(request, output)| {
+                        owner.live()?;
+                        deadline.check().map_err(policy_error)?;
                         if output.len() > owner.max_message_bytes {
                             return Err(Error::LimitExceeded {
                                 limit: "host_output_bytes".into(),
@@ -265,11 +394,21 @@ impl HostContext {
                         let output = lock(&owner.registry)?
                             .accept_result(&request, output)
                             .map_err(policy_error)?;
-                        serde_json::from_slice(&output).map_err(|_| Error::Execution {
-                            message: "host callback returned invalid JSON".into(),
-                        })
+                        let value: Value =
+                            serde_json::from_slice(&output).map_err(|_| Error::Execution {
+                                message: "host callback returned invalid JSON".into(),
+                            })?;
+                        schemas
+                            .output
+                            .validate(&value, schema_limits)
+                            .map_err(|_| Error::Policy {
+                                kind: "SchemaRejected".into(),
+                                message: "host output failed registered schema".into(),
+                            })?;
+                        Ok(value)
                     }),
                 };
+                drop(_admission);
                 drop(_guard);
                 let _ = sender.send(result);
             })
@@ -282,7 +421,11 @@ impl HostContext {
             self.live()?;
             deadline.check().map_err(policy_error)?;
             tokio::select! {
-                result=&mut receiver=>return result.map_err(|_|Error::Backend{message:"host callback worker exited".into()})?,
+                result=&mut receiver=> {
+                    self.live()?;
+                    deadline.check().map_err(policy_error)?;
+                    return result.map_err(|_|Error::Backend{message:"host callback worker exited".into()})?;
+                },
                 _=tokio::time::sleep(Duration::from_millis(5))=>{}
             }
         }
@@ -416,5 +559,119 @@ mod tests {
         assert_eq!(b.env_get("TZ").unwrap(), None);
         a.narrow_policy(&Policy::default()).unwrap();
         assert!(a.read("/tmp/a").is_err());
+    }
+    #[test]
+    fn schemas_reject_before_callback_and_audit_never_records_payloads() {
+        let hosts = Arc::new(Mutex::new(HostRegistry::default()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let called = count.clone();
+        let cb = hosts
+            .lock()
+            .unwrap()
+            .register(
+                "orders.read",
+                1024,
+                1024,
+                move |_: &InvocationContext, _: &[u8]| {
+                    called.fetch_add(1, Ordering::Relaxed);
+                    Ok(br#""secret-output""#.to_vec())
+                },
+            )
+            .unwrap();
+        let mut config = HostConfig::default();
+        config.schemas.insert(
+            "orders.read".into(),
+            CapabilitySchemas {
+                input: JsonSchema::Integer,
+                output: JsonSchema::Boolean,
+            },
+        );
+        let audit = config.audit.clone();
+        let ctx = HostContext::new_with_config(
+            Policy::default().allow_capability("orders.read").unwrap(),
+            hosts,
+            vec![HostGrant {
+                callback: cb,
+                scope: "secret-scope".into(),
+            }],
+            config,
+        )
+        .unwrap();
+        ctx.begin_invocation(Duration::from_secs(1)).unwrap();
+        assert!(
+            matches!(runtime().block_on(ctx.call("orders.read".into(),json!("secret-input"))),Err(Error::Policy{kind,..}) if kind=="SchemaRejected")
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(
+            matches!(runtime().block_on(ctx.call("orders.read".into(),json!(1))),Err(Error::Policy{kind,..}) if kind=="SchemaRejected")
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert!(runtime()
+            .block_on(ctx.call("secret-capability-name".into(), json!(null)))
+            .is_err());
+        let events = audit.drain(100);
+        assert!(events
+            .iter()
+            .any(|e| e.outcome == AuditOutcome::SchemaRejected));
+        assert!(!format!("{events:?}").contains("secret"));
+    }
+    #[test]
+    fn child_host_calls_share_ancestor_admission_until_actual_completion() {
+        let hosts = Arc::new(Mutex::new(HostRegistry::default()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let finish_rx = Mutex::new(finish_rx);
+        let cb = hosts
+            .lock()
+            .unwrap()
+            .register(
+                "blocking",
+                128,
+                128,
+                move |_: &InvocationContext, _: &[u8]| {
+                    started_tx.send(()).unwrap();
+                    finish_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    Ok(b"null".to_vec())
+                },
+            )
+            .unwrap();
+        let policy = Policy::default().allow_capability("blocking").unwrap();
+        let config = HostConfig {
+            host_budget: Budget::new(1),
+            ..Default::default()
+        };
+        let global = config.host_budget.clone();
+        let grant = HostGrant {
+            callback: cb,
+            scope: "test".into(),
+        };
+        let parent = HostContext::new_with_config(
+            policy.clone(),
+            hosts.clone(),
+            vec![grant.clone()],
+            config,
+        )
+        .unwrap();
+        let child =
+            HostContext::new_with_config(policy, hosts, vec![grant], parent.host_config()).unwrap();
+        parent.begin_invocation(Duration::from_secs(2)).unwrap();
+        child.begin_invocation(Duration::from_secs(2)).unwrap();
+        runtime().block_on(async {
+            let first=tokio::spawn(async move{parent.call("blocking".into(),json!(null)).await});
+            let deadline=std::time::Instant::now()+Duration::from_secs(1);
+            while started_rx.try_recv().is_err() {
+                assert!(std::time::Instant::now()<deadline,"callback did not start");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(global.used(),1);
+            assert!(matches!(child.call("blocking".into(),json!(null)).await,Err(Error::Policy{kind,..}) if kind=="LimitExceeded"));
+            finish_tx.send(()).unwrap();
+            assert_eq!(first.await.unwrap().unwrap(),json!(null));
+            assert_eq!(global.used(),0);
+        });
     }
 }

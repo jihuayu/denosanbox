@@ -34,19 +34,6 @@ fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) 
     }
 }
 
-fn wait_flag(flag: &Mutex<bool>, wake: &Condvar, what: &str) {
-    let limit = Instant::now() + Duration::from_secs(5);
-    let mut ready = flag.lock().unwrap_or_else(|err| err.into_inner());
-    while !*ready {
-        let remaining = limit.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "timed out waiting for: {what}");
-        ready = wake
-            .wait_timeout(ready, remaining)
-            .unwrap_or_else(|err| err.into_inner())
-            .0;
-    }
-}
-
 #[tokio::test]
 async fn explicit_shutdown_releases_tracked_capture() {
     let drops = Arc::new(AtomicUsize::new(0));

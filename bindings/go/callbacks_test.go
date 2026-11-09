@@ -312,6 +312,7 @@ func TestHostCallbackNonCooperativeStaysAccounted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWithCapabilities: %v", err)
 	}
+	waitFor(t, 2*time.Second, func() bool { return liveRegistrationCount() == 0 })
 	baseLive := liveRegistrationCount()
 	started := make(chan struct{})
 	gate := make(chan struct{})
@@ -434,6 +435,7 @@ func TestHostRegistrationRegistryBounded(t *testing.T) {
 	echo := func(ctx HostContext, input json.RawMessage) (json.RawMessage, error) {
 		return json.RawMessage("null"), nil
 	}
+	waitFor(t, 2*time.Second, func() bool { return liveRegistrationCount() == 0 })
 	base := liveRegistrationCount()
 	for i := 0; i < cycles; i++ {
 		counter := watchRelease(echo)

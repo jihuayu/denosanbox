@@ -154,7 +154,19 @@ impl WorkerHandle {
             .call("onmessage", message, invocation)
             .await;
         pending.completed = true;
-        result
+        let result = result?;
+        let reply_bytes = serde_json::to_vec(&result)
+            .map_err(|error| Error::Execution {
+                message: format!("failed to serialize worker reply: {error}"),
+            })?
+            .len();
+        if reply_bytes > self.inner.options.max_message_bytes {
+            return Err(Error::LimitExceeded {
+                limit: "max_message_bytes".into(),
+                detail: format!("worker reply is {reply_bytes} bytes"),
+            });
+        }
+        Ok(result)
     }
 
     /// Depth of the underlying child sandbox.
@@ -234,8 +246,8 @@ fn validate_options(engine: &Engine, limits: &WorkerOptions) -> Result<()> {
     if limits.max_queued_bytes > u32::MAX as usize {
         return Err(invalid("max_queued_bytes must not exceed u32::MAX".into()));
     }
-    if limits.invocation_timeout.is_zero() {
-        return Err(invalid("invocation_timeout must be non-zero".into()));
+    if limits.invocation_timeout < Duration::from_millis(1) {
+        return Err(invalid("invocation_timeout must be at least 1ms".into()));
     }
     let engine_limits = engine.limits();
     if limits.invocation_timeout > engine_limits.max_invocation_timeout {

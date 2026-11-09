@@ -19,6 +19,7 @@ async fn root(engine: &Engine) -> denosanbox::SandboxHandle {
                 r#"export async function onmessage(value) {
   if (value === 'hold') return new Promise(() => {});
   if (value === 'spin') { while (true) {} }
+  if (value === 'large') return 'x'.repeat(1024);
   return { value, kind: 'child' };
 }"#
                 .into(),
@@ -119,8 +120,8 @@ async fn oversized_messages_do_not_consume_queue_capacity() {
         "child.js",
         SandboxOptions::default(),
         WorkerOptions {
-            max_message_bytes: 16,
-            max_queued_bytes: 32,
+            max_message_bytes: 32,
+            max_queued_bytes: 64,
             ..WorkerOptions::default()
         },
     )
@@ -135,6 +136,8 @@ async fn oversized_messages_do_not_consume_queue_capacity() {
         worker.post_message(json!(1)).await.unwrap(),
         json!({"value": 1, "kind": "child"})
     );
+    let oversized_reply = worker.post_message(json!("large")).await.unwrap_err();
+    assert_eq!(oversized_reply.kind(), "limit_exceeded");
     worker.close().await.unwrap();
     parent.close().await.unwrap();
     engine.shutdown().await.unwrap();

@@ -15,7 +15,7 @@ on their own.
 | `vfs` | `ResourceView`: private in-memory FS, logical cwd/env/tmp, bounded allocations. No host FS/env/process access. |
 | `net` | Explicit-host/port grants, checked against every resolved IP; non-global addresses need an explicit private grant. No network I/O. |
 | `limits`/`budget` | Default limits; hierarchical byte `Budget` with RAII `Lease`, checked overflow, `Deadline`, cooperative `CancellationToken`. |
-| `registry` | Synchronous `HostRegistry` callbacks, per-sandbox grants with business scope, bounded input/output, stale result rejection. |
+| `registry` | Sync/async `HostRegistry` callbacks, per-sandbox grants with business scope, bounded input/output, stale result rejection. |
 | `protocol` | Versioned bounded framing (`DSB1` v1) and sanitized typed error encoding. |
 
 ## Integration API (for the runtime agent)
@@ -30,6 +30,7 @@ let id = SandboxId::mint();
 // Policy is deny-default; grant only what is needed.
 let host_policy = Policy::default()
     .allow_read("/app")?
+    .allow_read("/tmp/work")?
     .allow_write("/tmp/work")?
     .allow_capability("clock")?
     .with_network(NetworkRules::deny_all().allow("api.example.com", 443)?);
@@ -46,7 +47,7 @@ let handle = registry.insert(id, ResourceSpec::File {
     path: VirtualPath::parse("/tmp/work/input.txt")?,
     writable: true,
 })?;
-registry.get(handle)?;            // validates owner + generation + kind
+registry.get_for(id, handle)?;    // validates trusted caller + owner + generation + kind
 registry.close_all(id);           // invalidates `handle`
 assert!(registry.get(handle).is_err());
 
@@ -73,11 +74,13 @@ host_policy.network().check("api.example.com", 443, &resolved)?;
 host_policy.network().check_redirect("api.example.com", 443, &resolved)?;
 ```
 
-`HostRegistry::begin` / `accept_result` implement the offloaded two-phase path:
-the runtime moves `InvocationRequest` to a worker, then calls
-`accept_result`; it returns `ErrorKind::LateResult` if the sandbox was closed or
-the grant revoked meanwhile. Callbacks are **synchronous/blocking** — this crate
-does not provide an async executor.
+`HostRegistry::prepare_dispatch` returns an owned `Dispatch`. Drop the registry
+lock before executing it: offload synchronous callbacks with `dispatch.run()`;
+await async callbacks with `dispatch.run_async()`. Then reacquire the registry
+lock for `accept_result(&request, output)`. This rejects expired/cancelled work,
+closed owners, and revoked/regranted callback generations. `register_async`
+accepts a closure returning a `Send + 'static` future; the runtime supplies an
+executor. `run_async` deliberately rejects blocking callback variants.
 
 Wire protocol: `Frame::encode(max_payload)` / `Frame::decode(bytes, max_payload)`,
 version `PROTOCOL_VERSION = 1`, magic `DSB1`, 20-byte header, payload capped at
@@ -90,7 +93,7 @@ stable numeric `ErrorKind` and sanitized UTF-8 text.
 * Symlinks (`Policy::create_symlink`, `ResourceView::symlink`) — both return
   `ErrorKind::Unsupported` until a race-safe implementation exists.
 * Any process execution, host environment mutation, or real network I/O.
-* Async callbacks, wildcard/DNS-suffix network rules, IP-literal hosts.
+* Wildcard/DNS-suffix network rules and IP-literal hosts.
 
 ## Gaps and caveats
 

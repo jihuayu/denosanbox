@@ -45,9 +45,19 @@ impl Deadline {
     /// Deadline `after` from now.
     #[must_use]
     pub fn after(after: Duration) -> Self {
+        let now = Instant::now();
         Self {
-            at: Instant::now() + after,
+            at: now.checked_add(after).unwrap_or(now),
         }
+    }
+    /// Keep the earlier absolute deadline, so descendants cannot extend it.
+    pub fn earliest(self, other: Self) -> Self {
+        Self {
+            at: self.at.min(other.at),
+        }
+    }
+    pub fn child_after(self, duration: Duration) -> Self {
+        self.earliest(Self::after(duration))
     }
     /// Whether the deadline has passed.
     #[must_use]
@@ -175,7 +185,7 @@ impl Lease {
     /// Total amount reserved.
     #[must_use]
     pub fn amount(&self) -> u64 {
-        self.charges.iter().map(|(_, n)| *n).sum()
+        self.charges.first().map_or(0, |(_, amount)| *amount)
     }
 }
 

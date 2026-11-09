@@ -174,6 +174,25 @@ impl ResourceRegistry {
         Ok(rec)
     }
 
+    /// Validate a guest handle against the trusted current caller identity.
+    /// `get` is for trusted host inspection; guest operations must use this method.
+    pub fn get_for(&self, caller: SandboxId, handle: ResourceHandle) -> Result<&ResourceRecord> {
+        if handle.owner() != caller {
+            return Err(Error::denied("resource belongs to another sandbox"));
+        }
+        self.get(handle)
+    }
+
+    /// Close a guest handle only when owned by the trusted caller.
+    pub fn remove_for(
+        &mut self,
+        caller: SandboxId,
+        handle: ResourceHandle,
+    ) -> Result<ResourceRecord> {
+        self.get_for(caller, handle)?;
+        self.remove(handle)
+    }
+
     /// Close one handle (same staleness checks as [`Self::get`]).
     pub fn remove(&mut self, handle: ResourceHandle) -> Result<ResourceRecord> {
         self.get(handle)?;

@@ -77,6 +77,14 @@ impl ResourceView {
     pub fn sandbox_id(&self) -> SandboxId {
         self.id
     }
+    /// Narrow future operation checks. Already-open host resources are not
+    /// represented by this in-memory view and require separate revocation.
+    pub fn narrow_policy(&mut self, requested: &Policy) -> Result<()> {
+        self.open()?;
+        self.policy = self.policy.narrow(requested)?;
+        Ok(())
+    }
+
     /// Effective policy.
     #[must_use]
     pub fn policy(&self) -> &Policy {
@@ -148,6 +156,9 @@ impl ResourceView {
         self.open()?;
         let p = self.resolve(raw)?;
         self.policy.check_write(&p)?;
+        if self.dirs.contains(&p) {
+            return Err(Error::invalid_argument("path is a directory"));
+        }
         if data.len() > self.limits.max_file_bytes {
             return Err(Error::limit_exceeded("file too large"));
         }
@@ -163,17 +174,26 @@ impl ResourceView {
         if old == 0 && !self.files.contains_key(&p) && self.files.len() >= self.limits.max_files {
             return Err(Error::limit_exceeded("file count limit exceeded"));
         }
-        // Create ancestor directories, staying inside the writable grant.
+        let mut missing = Vec::new();
         let mut parent = p.parent();
         while let Some(dir) = parent {
+            if self.files.contains_key(&dir) {
+                return Err(Error::invalid_argument("ancestor is a file"));
+            }
             if !self.dirs.contains(&dir) {
-                if self.dirs.len() >= self.limits.max_dirs {
-                    return Err(Error::limit_exceeded("directory limit exceeded"));
-                }
-                self.dirs.insert(dir.clone());
+                missing.push(dir.clone());
             }
             parent = dir.parent();
         }
+        if self
+            .dirs
+            .len()
+            .checked_add(missing.len())
+            .is_none_or(|n| n > self.limits.max_dirs)
+        {
+            return Err(Error::limit_exceeded("directory limit exceeded"));
+        }
+        self.dirs.extend(missing);
         self.total_bytes = new_total;
         self.files.insert(p, data.to_vec());
         Ok(())
@@ -184,6 +204,16 @@ impl ResourceView {
         self.open()?;
         let p = self.resolve(raw)?;
         self.policy.check_write(&p)?;
+        if self.files.contains_key(&p) {
+            return Err(Error::invalid_argument("path is a file"));
+        }
+        let mut parent = p.parent();
+        while let Some(dir) = parent {
+            if self.files.contains_key(&dir) {
+                return Err(Error::invalid_argument("ancestor is a file"));
+            }
+            parent = dir.parent();
+        }
         if self.dirs.len() >= self.limits.max_dirs && !self.dirs.contains(&p) {
             return Err(Error::limit_exceeded("directory limit exceeded"));
         }
@@ -204,11 +234,15 @@ impl ResourceView {
         Ok(())
     }
 
-    /// Whether a path exists (no policy check; metadata only).
+    /// Whether an authorized path exists; false for denied paths or closed views.
     #[must_use]
     pub fn exists(&self, raw: &str) -> bool {
-        self.resolve(raw)
-            .map(|p| self.files.contains_key(&p) || self.dirs.contains(&p))
+        self.open()
+            .and_then(|()| self.resolve(raw))
+            .and_then(|p| {
+                self.policy.check_read(&p)?;
+                Ok(self.files.contains_key(&p) || self.dirs.contains(&p))
+            })
             .unwrap_or(false)
     }
 
@@ -253,6 +287,9 @@ impl ResourceView {
         {
             return Err(Error::invalid_argument("invalid env name"));
         }
+        if value.contains('\0') {
+            return Err(Error::invalid_argument("env value contains NUL"));
+        }
         if value.len() > self.limits.max_env_value_bytes {
             return Err(Error::limit_exceeded("env value too large"));
         }
@@ -274,6 +311,7 @@ impl ResourceView {
     pub fn close(&mut self) {
         self.closed = true;
         self.files.clear();
+        self.dirs.clear();
         self.env.clear();
         self.total_bytes = 0;
     }
@@ -346,7 +384,7 @@ mod tests {
             ViewLimits::default(),
         );
         v.write("/work/deep/a/b.txt", b"ok").unwrap();
-        assert!(v.exists("/work/deep/a/b.txt"));
+        assert!(!v.exists("/work/deep/a/b.txt")); // write grant does not grant metadata reads
         assert!(v.write("/work/other.txt", b"no").is_err());
     }
 

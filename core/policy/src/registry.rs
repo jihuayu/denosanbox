@@ -1,22 +1,15 @@
-//! Host callback registration, per-sandbox grants and invocation context.
-//!
-//! Callbacks are **synchronous** and blocking; the runtime is responsible for
-//! offloading them to a worker thread. A result produced after the sandbox's
-//! grant generation was closed is rejected by [`HostRegistry::accept_result`].
-
-use std::collections::HashMap;
+//! Bounded host callbacks. Prepare dispatch while locked, then execute without
+//! holding the registry lock. Call `accept_result` after completion.
+use crate::{CancellationToken, Deadline, Error, Generation, Result, SandboxId};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use crate::budget::{CancellationToken, Deadline};
-use crate::error::{Error, Result};
-use crate::id::{Generation, SandboxId};
-
-/// Blocking host callback.
 pub trait Callback: Send + Sync {
-    /// Handle bounded `input`; return bounded output or a guest-safe error.
     fn call(&self, ctx: &InvocationContext, input: &[u8]) -> Result<Vec<u8>>;
 }
-
 impl<F> Callback for F
 where
     F: Fn(&InvocationContext, &[u8]) -> Result<Vec<u8>> + Send + Sync,
@@ -25,12 +18,26 @@ where
         self(ctx, input)
     }
 }
-
-/// Host-minted callback id.
+pub type CallbackFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
+pub trait AsyncCallback: Send + Sync {
+    fn call(&self, ctx: InvocationContext, input: Vec<u8>) -> CallbackFuture;
+}
+impl<F, Fut> AsyncCallback for F
+where
+    F: Fn(InvocationContext, Vec<u8>) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
+{
+    fn call(&self, ctx: InvocationContext, input: Vec<u8>) -> CallbackFuture {
+        Box::pin(self(ctx, input))
+    }
+}
+#[derive(Clone)]
+enum Handler {
+    Sync(Arc<dyn Callback>),
+    Async(Arc<dyn AsyncCallback>),
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CallbackId(u64);
-
-/// Public metadata for a registered callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredCallback {
     id: CallbackId,
@@ -38,31 +45,20 @@ pub struct RegisteredCallback {
     input_limit: usize,
     output_limit: usize,
 }
-
 impl RegisteredCallback {
-    /// Callback id.
-    #[must_use]
     pub fn id(&self) -> CallbackId {
         self.id
     }
-    /// Display name.
-    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
-    /// Maximum input bytes.
-    #[must_use]
     pub fn input_limit(&self) -> usize {
         self.input_limit
     }
-    /// Maximum output bytes.
-    #[must_use]
     pub fn output_limit(&self) -> usize {
         self.output_limit
     }
 }
-
-/// Trusted per-invocation context.
 #[derive(Debug, Clone)]
 pub struct InvocationContext {
     sandbox_id: SandboxId,
@@ -70,10 +66,7 @@ pub struct InvocationContext {
     cancellation: CancellationToken,
     scope: String,
 }
-
 impl InvocationContext {
-    /// Host-only constructor.
-    #[must_use]
     pub fn new(
         sandbox_id: SandboxId,
         deadline: Deadline,
@@ -87,33 +80,23 @@ impl InvocationContext {
             scope: scope.into(),
         }
     }
-    /// Trusted sandbox identity.
-    #[must_use]
     pub fn sandbox_id(&self) -> SandboxId {
         self.sandbox_id
     }
-    /// Deadline.
-    #[must_use]
     pub fn deadline(&self) -> Deadline {
         self.deadline
     }
-    /// Cancellation token.
-    #[must_use]
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
     }
-    /// Explicit business scope granted for this call.
-    #[must_use]
     pub fn scope(&self) -> &str {
         &self.scope
     }
-    fn check_live(&self) -> Result<()> {
+    pub fn check_live(&self) -> Result<()> {
         self.cancellation.check()?;
         self.deadline.check()
     }
 }
-
-/// A validated request; safe to hand to a worker thread.
 #[derive(Debug, Clone)]
 pub struct InvocationRequest {
     sandbox_id: SandboxId,
@@ -121,51 +104,84 @@ pub struct InvocationRequest {
     generation: Generation,
     scope: String,
     input: Vec<u8>,
+    context: InvocationContext,
 }
-
 impl InvocationRequest {
-    /// Sandbox the request belongs to.
-    #[must_use]
     pub fn sandbox_id(&self) -> SandboxId {
         self.sandbox_id
     }
-    /// Callback id.
-    #[must_use]
     pub fn callback_id(&self) -> CallbackId {
         self.callback_id
     }
-    /// Grant generation captured at begin.
-    #[must_use]
     pub fn generation(&self) -> Generation {
         self.generation
     }
-    /// Business scope.
-    #[must_use]
     pub fn scope(&self) -> &str {
         &self.scope
     }
-    /// Bounded input.
-    #[must_use]
     pub fn input(&self) -> &[u8] {
         &self.input
     }
 }
-
+pub struct Dispatch {
+    request: InvocationRequest,
+    handler: Handler,
+}
+impl fmt::Debug for Dispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Dispatch")
+            .field("request", &self.request)
+            .finish()
+    }
+}
+impl Dispatch {
+    pub fn is_async(&self) -> bool {
+        matches!(self.handler, Handler::Async(_))
+    }
+    /// Execute a synchronous callback on a host worker thread, never under a registry lock.
+    pub fn run(self) -> Result<(InvocationRequest, Vec<u8>)> {
+        self.request.context.check_live()?;
+        let output = match self.handler {
+            Handler::Sync(cb) => cb.call(&self.request.context, &self.request.input)?,
+            Handler::Async(_) => {
+                return Err(Error::unsupported("async callback requires run_async"))
+            }
+        };
+        self.request.context.check_live()?;
+        Ok((self.request, output))
+    }
+    /// Await an async callback outside the registry lock. Sync callbacks must be
+    /// offloaded via `run`; they are deliberately not executed on an async executor.
+    pub async fn run_async(self) -> Result<(InvocationRequest, Vec<u8>)> {
+        self.request.context.check_live()?;
+        let output = match self.handler {
+            Handler::Async(cb) => {
+                cb.call(self.request.context.clone(), self.request.input.clone())
+                    .await?
+            }
+            Handler::Sync(_) => {
+                return Err(Error::unsupported(
+                    "blocking callback requires offloaded run",
+                ))
+            }
+        };
+        self.request.context.check_live()?;
+        Ok((self.request, output))
+    }
+}
 #[derive(Debug, Clone)]
 struct Grant {
     generation: Generation,
     scope: String,
 }
-
-/// Callback table + grants. Not cloneable; one per host runtime.
 pub struct HostRegistry {
-    callbacks: HashMap<CallbackId, (RegisteredCallback, Box<dyn Callback>)>,
+    callbacks: HashMap<CallbackId, (RegisteredCallback, Handler)>,
     grants: HashMap<(SandboxId, CallbackId), Grant>,
-    generations: HashMap<SandboxId, Generation>,
+    closed: HashSet<SandboxId>,
     next_id: u64,
+    next_grant: u64,
     capacity: usize,
 }
-
 impl fmt::Debug for HostRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HostRegistry")
@@ -174,13 +190,11 @@ impl fmt::Debug for HostRegistry {
             .finish()
     }
 }
-
 impl Default for HostRegistry {
     fn default() -> Self {
         Self::new(256)
     }
 }
-
 fn valid_scope(scope: &str) -> bool {
     !scope.is_empty()
         && scope.len() <= 64
@@ -188,21 +202,17 @@ fn valid_scope(scope: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-/".contains(&b))
 }
-
 impl HostRegistry {
-    /// Registry with a callback cap.
-    #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
             callbacks: HashMap::new(),
             grants: HashMap::new(),
-            generations: HashMap::new(),
+            closed: HashSet::new(),
             next_id: 1,
+            next_grant: 1,
             capacity,
         }
     }
-
-    /// Register a host callback with hard input/output byte bounds.
     pub fn register(
         &mut self,
         name: &str,
@@ -210,83 +220,102 @@ impl HostRegistry {
         output_limit: usize,
         callback: impl Callback + 'static,
     ) -> Result<RegisteredCallback> {
+        self.insert(
+            name,
+            input_limit,
+            output_limit,
+            Handler::Sync(Arc::new(callback)),
+        )
+    }
+    pub fn register_async(
+        &mut self,
+        name: &str,
+        input_limit: usize,
+        output_limit: usize,
+        callback: impl AsyncCallback + 'static,
+    ) -> Result<RegisteredCallback> {
+        self.insert(
+            name,
+            input_limit,
+            output_limit,
+            Handler::Async(Arc::new(callback)),
+        )
+    }
+    fn insert(
+        &mut self,
+        name: &str,
+        input_limit: usize,
+        output_limit: usize,
+        callback: Handler,
+    ) -> Result<RegisteredCallback> {
         if self.callbacks.len() >= self.capacity {
             return Err(Error::limit_exceeded("callback registry full"));
         }
-        if name.is_empty() || name.len() > 64 || input_limit == 0 || output_limit == 0 {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.:-".contains(&b))
+            || input_limit == 0
+            || output_limit == 0
+        {
             return Err(Error::invalid_argument("invalid callback registration"));
         }
-        let id = CallbackId(
-            self.next_id
-                .checked_add(1)
-                .map(|_| self.next_id)
-                .ok_or_else(|| Error::overflow("callback id exhausted"))?,
-        );
-        self.next_id = self.next_id.saturating_add(1);
+        if self.callbacks.values().any(|(m, _)| m.name == name) {
+            return Err(Error::invalid_argument("callback name already registered"));
+        }
+        let next = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| Error::overflow("callback id exhausted"))?;
         let meta = RegisteredCallback {
-            id,
-            name: name.to_string(),
+            id: CallbackId(self.next_id),
+            name: name.into(),
             input_limit,
             output_limit,
         };
-        self.callbacks
-            .insert(id, (meta.clone(), Box::new(callback)));
+        self.next_id = next;
+        self.callbacks.insert(meta.id, (meta.clone(), callback));
         Ok(meta)
     }
-
-    fn generation_of(&self, id: SandboxId) -> Generation {
-        self.generations
-            .get(&id)
-            .copied()
-            .unwrap_or(Generation::ZERO)
-    }
-
-    /// Grant `sandbox` the right to call `cb` within an explicit scope.
     pub fn grant(
         &mut self,
         sandbox: SandboxId,
         cb: &RegisteredCallback,
         scope: &str,
     ) -> Result<()> {
-        if !self.callbacks.contains_key(&cb.id) {
+        if self.closed.contains(&sandbox) {
+            return Err(Error::stale_handle("sandbox closed"));
+        }
+        if self.callbacks.get(&cb.id).map(|(m, _)| m) != Some(cb) {
             return Err(Error::unknown_callback("callback not registered"));
         }
         if !valid_scope(scope) {
             return Err(Error::invalid_argument("invalid business scope"));
         }
-        let generation = self
-            .generations
-            .entry(sandbox)
-            .or_insert_with(|| Generation(1))
-            .to_owned();
+        let generation = Generation(self.next_grant);
+        self.next_grant = self
+            .next_grant
+            .checked_add(1)
+            .ok_or_else(|| Error::overflow("grant generation exhausted"))?;
         self.grants.insert(
             (sandbox, cb.id),
             Grant {
                 generation,
-                scope: scope.to_string(),
+                scope: scope.into(),
             },
         );
         Ok(())
     }
-
-    /// Revoke one grant.
     pub fn revoke_grant(&mut self, sandbox: SandboxId, cb: &RegisteredCallback) -> bool {
         self.grants.remove(&(sandbox, cb.id)).is_some()
     }
-
-    /// Close a sandbox: revoke all grants and bump its generation, so results
-    /// still in flight can no longer be accepted.
     pub fn close_sandbox(&mut self, sandbox: SandboxId) -> usize {
+        self.closed.insert(sandbox);
         let before = self.grants.len();
         self.grants.retain(|(owner, _), _| *owner != sandbox);
-        self.generations
-            .entry(sandbox)
-            .and_modify(|g| *g = g.next())
-            .or_insert_with(|| Generation(1));
         before - self.grants.len()
     }
-
-    /// Validate and prepare a request for off-thread execution.
     pub fn begin(
         &self,
         ctx: &InvocationContext,
@@ -294,61 +323,67 @@ impl HostRegistry {
         input: Vec<u8>,
     ) -> Result<InvocationRequest> {
         ctx.check_live()?;
-        let (meta, _) = self
-            .callbacks
-            .get(&cb.id)
-            .ok_or_else(|| Error::unknown_callback("callback not registered"))?;
-        if meta.input_limit != cb.input_limit || meta.output_limit != cb.output_limit {
-            return Err(Error::unknown_callback("callback metadata mismatch"));
+        if self.closed.contains(&ctx.sandbox_id) {
+            return Err(Error::stale_handle("sandbox closed"));
+        }
+        if self.callbacks.get(&cb.id).map(|(m, _)| m) != Some(cb) {
+            return Err(Error::unknown_callback("callback not registered"));
         }
         let grant = self
             .grants
-            .get(&(ctx.sandbox_id(), cb.id))
+            .get(&(ctx.sandbox_id, cb.id))
             .ok_or_else(|| Error::denied("callback not granted"))?;
-        if grant.generation != self.generation_of(ctx.sandbox_id()) {
-            return Err(Error::stale_handle("callback grant is stale"));
-        }
-        if grant.scope != ctx.scope() {
+        if grant.scope != ctx.scope {
             return Err(Error::denied("callback scope mismatch"));
         }
         if input.len() > cb.input_limit {
             return Err(Error::limit_exceeded("callback input too large"));
         }
         Ok(InvocationRequest {
-            sandbox_id: ctx.sandbox_id(),
+            sandbox_id: ctx.sandbox_id,
             callback_id: cb.id,
             generation: grant.generation,
             scope: grant.scope.clone(),
             input,
+            context: ctx.clone(),
         })
     }
-
-    /// Execute synchronously on the calling thread (runtime should offload).
+    pub fn prepare_dispatch(
+        &self,
+        ctx: &InvocationContext,
+        cb: &RegisteredCallback,
+        input: Vec<u8>,
+    ) -> Result<Dispatch> {
+        let request = self.begin(ctx, cb, input)?;
+        let handler = self
+            .callbacks
+            .get(&cb.id)
+            .ok_or_else(|| Error::unknown_callback("callback not registered"))?
+            .1
+            .clone();
+        Ok(Dispatch { request, handler })
+    }
+    /// Convenience for an exclusively owned registry. For a shared registry,
+    /// prepare dispatch under its lock, drop the guard, run, then accept result.
     pub fn invoke(
         &self,
         ctx: &InvocationContext,
         cb: &RegisteredCallback,
         input: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        let req = self.begin(ctx, cb, input)?;
-        let (_, callback) = self
-            .callbacks
-            .get(&req.callback_id)
-            .ok_or_else(|| Error::unknown_callback("callback not registered"))?;
-        let output = callback.call(ctx, req.input())?;
+        let (req, output) = self.prepare_dispatch(ctx, cb, input)?.run()?;
         self.accept_result(&req, output)
     }
-
-    /// Validate a worker-produced result; rejects late results after closure.
     pub fn accept_result(&self, req: &InvocationRequest, output: Vec<u8>) -> Result<Vec<u8>> {
-        if self.generation_of(req.sandbox_id) != req.generation {
-            return Err(Error::late_result("result belongs to a closed generation"));
-        }
+        req.context.check_live()?;
         let grant = self
             .grants
             .get(&(req.sandbox_id, req.callback_id))
             .ok_or_else(|| Error::late_result("grant revoked before completion"))?;
-        if grant.generation != req.generation || grant.scope != req.scope {
+        if self.closed.contains(&req.sandbox_id)
+            || grant.generation != req.generation
+            || grant.scope != req.scope
+        {
             return Err(Error::late_result("result belongs to a stale grant"));
         }
         let (meta, _) = self

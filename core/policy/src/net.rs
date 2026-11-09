@@ -133,48 +133,32 @@ impl NetworkRules {
         self.insert(host, PortRange::range(start, end)?, true)
     }
 
-    fn insert(self, host: &str, port: PortRange, allow_private: bool) -> Result<Self> {
-        let host = HostPattern::parse(host)?;
-        let mut me = self;
-        let mut ports = BTreeSet::from([port]);
-        let mut private = allow_private;
-        if let Some(existing) = me.rules.iter().find(|r| r.host == host).cloned() {
-            me.rules.remove(&existing);
-            ports.extend(existing.ports);
-            private |= existing.allow_private;
-        }
-        me.rules.insert(NetworkRule {
-            host,
-            ports,
-            allow_private: private,
+    fn insert(mut self, host: &str, port: PortRange, allow_private: bool) -> Result<Self> {
+        self.rules.insert(NetworkRule {
+            host: HostPattern::parse(host)?,
+            ports: BTreeSet::from([port]),
+            allow_private,
         });
-        Ok(me)
+        Ok(self)
     }
 
-    /// Validate one connection attempt. `resolved` must be the full set of
-    /// addresses the host actually intends to dial, and every one is checked.
+    /// Check the actual addresses to be connected; connectors must pin these
+    /// addresses when dialing and repeat this check at every redirect.
     pub fn check(&self, host: &str, port: u16, resolved: &[IpAddr]) -> Result<()> {
-        if port == 0 {
-            return Err(Error::network_denied("port 0 denied"));
-        }
         let host = HostPattern::parse(host).map_err(|_| Error::network_denied("invalid host"))?;
-        let rule = self
-            .rules
-            .iter()
-            .find(|r| r.host == host)
-            .ok_or_else(|| Error::network_denied("host denied"))?;
-        if !rule.ports.iter().any(|r| r.contains(port)) {
-            return Err(Error::network_denied("port denied"));
+        if port == 0 || resolved.is_empty() {
+            return Err(Error::network_denied("invalid connection destination"));
         }
-        if resolved.is_empty() {
-            return Err(Error::network_denied("no resolved addresses"));
+        let private = resolved.iter().any(|ip| requires_private_grant(*ip));
+        if self.rules.iter().any(|r| {
+            r.host == host
+                && r.ports.iter().any(|p| p.contains(port))
+                && (!private || r.allow_private)
+        }) {
+            Ok(())
+        } else {
+            Err(Error::network_denied("connection destination denied"))
         }
-        for ip in resolved {
-            if requires_private_grant(*ip) && !rule.allow_private {
-                return Err(Error::network_denied("private address not granted"));
-            }
-        }
-        Ok(())
     }
 
     /// A redirect must be re-checked exactly like a fresh destination.
@@ -256,17 +240,11 @@ fn v4_is_global(ip: Ipv4Addr) -> bool {
 
 fn v6_is_global(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    if ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (s[0] & 0xffc0) == 0xfe80
-        || (s[0] & 0xfe00) == 0xfc00
-        || (s[0] == 0x2001 && s[1] == 0x0db8)
-        || s[0] == 0x2002
-    {
-        return false;
-    }
-    true
+    // Only global unicast 2000::/3, excluding special/documentation prefixes.
+    (s[0] & 0xe000) == 0x2000
+        && !(s[0] == 0x2001 && (s[1] < 0x0200 || s[1] == 0x0db8))
+        && s[0] != 0x2002
+        && !((s[0] & 0xfff0) == 0x3ff0)
 }
 
 #[cfg(test)]

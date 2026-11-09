@@ -4,10 +4,9 @@
  * This is a deliberately small, direct-native subset of the denosanbox core.
  * It is NOT the final stable language-binding surface.
  *
- * ABI 1 is additive: every declaration below existed in ABI 1.0 and keeps its
- * signature and structure layout. The host-callback product (engine capability
- * ceiling, callback registration, grants, callback context) was added without a
- * version bump; it does not claim issue-16 completeness beyond what is listed.
+ * ABI 1 is additive: existing declarations keep their signatures and structure
+ * layouts. The host-callback product (engine capability ceiling, callback
+ * registration, grants, callback context) was added without a version bump.
  * Polling is still the only async completion path.
  *
  * Threading: all token APIs are safe to call concurrently. Runtime calls never

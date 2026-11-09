@@ -55,7 +55,7 @@ Network access is deny-by-default: host, every DNS answer, redirect, port, priva
 
 ## Limits
 
-Defaults are set so the default sandbox count is usable: the global active sandbox count is 4 and includes descendants; each isolate has a 64 MiB JS heap target with finite 4 MiB termination headroom; the per-tree managed-memory budget is 256 MiB; the shared Rust `HostConfig` managed-memory pool is 512 MiB. Explicitly smaller shared pools are never auto-expanded. These are accounting targets, not hard RSS limits, and do not contain native OOM or crashes. Per-sandbox policy limits (`max_sandboxes`, `queue_depth`, deadline, message, log, heap target, memory budget) are enforced on queued and direct calls and can only narrow along a tree.
+Defaults are set so the default sandbox count is usable: the global active sandbox count is 4 and includes descendants; each isolate has a 64 MiB JS heap target with finite 4 MiB termination headroom; the per-tree managed-memory budget is 256 MiB; the shared Rust `HostConfig` managed-memory pool is 512 MiB. Explicitly smaller shared pools are never auto-expanded. These are accounting targets, not hard RSS limits, and do not contain native OOM or crashes. Sandbox counts, heap targets and memory budgets are reserved at creation/admission. Queue, message and deadline limits also apply to queued and direct calls; log limits apply during execution. Child limits can only narrow along a tree.
 
 ## Validation
 

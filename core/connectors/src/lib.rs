@@ -2,12 +2,13 @@
 //! No raw sockets, listeners, cookies, downloads or environment proxy fallback.
 use denosanbox_policy::{CancellationToken, NetworkRules};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, OnceLock,
 };
 use std::time::Duration;
@@ -50,22 +51,97 @@ impl std::error::Error for ConnectorError {}
 pub type Result<T> = std::result::Result<T, ConnectorError>;
 pub type ResolveFuture = Pin<Box<dyn Future<Output = Result<Vec<IpAddr>>> + Send>>;
 
+/// Per-query completion token issued by the trusted resolver. Resolution is
+/// owned by one request, never by the shared resolver object: dropping the
+/// async future (deadline/cancellation) does not release the lease, because
+/// native `getaddrinfo` cannot be aborted. The lease is released only when the
+/// resolver's own work for that query really finishes. A resolver that cannot
+/// retain the lease for native work must report it as still pending here.
+#[derive(Debug)]
+pub struct ResolutionLease {
+    done: Arc<CompletionSlot>,
+}
+impl ResolutionLease {
+    /// Unsettled lease; the matching [`ResolutionCompletion`] settles it once
+    /// the owning resolver work really ends.
+    pub fn pending() -> (Self, ResolutionCompletion) {
+        let slot = Arc::new(CompletionSlot {
+            done: AtomicBool::new(false),
+        });
+        let completion = ResolutionCompletion(Arc::clone(&slot));
+        (
+            Self {
+                done: slot,
+            },
+            completion,
+        )
+    }
+    /// A lease for work that is already complete (synchronous answers).
+    pub fn completed() -> Self {
+        Self {
+            done: Arc::new(CompletionSlot {
+                done: AtomicBool::new(true),
+            }),
+        }
+    }
+    pub fn is_settled(&self) -> bool {
+        self.done.done.load(Ordering::Acquire)
+    }
+    /// Settle this lease directly, e.g. when a custom resolver's work ended
+    /// behind a clone of the lease. Does not abort outstanding native work.
+    pub fn finish(&self) {
+        self.done.done.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct CompletionSlot {
+    done: AtomicBool,
+}
+
+/// Held by the resolver until its resolution for one query has truly finished,
+/// including native work that outlives a dropped `ResolveFuture`. Dropping or
+/// calling [`ResolutionCompletion::complete`] settles that query's lease.
+#[derive(Debug)]
+pub struct ResolutionCompletion(Arc<CompletionSlot>);
+impl ResolutionCompletion {
+    pub fn complete(self) {}
+}
+impl Drop for ResolutionCompletion {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::Release);
+    }
+}
+
 /// Trusted host extension point. Guest data cannot replace the resolver.
+///
+/// Extension contract: `resolve` must hand back a [`ResolutionLease`] for this
+/// query only and keep it unsettled until its work finishes. If the resolver
+/// offloads to non-cooperative native work (e.g. `getaddrinfo`), it must move
+/// ownership of the lease into that work so the lease survives cancellation of
+/// the returned future. The connector then reports this request as still
+/// owning host work until that lease settles; it never consults shared,
+/// resolver-wide or cross-request state.
 pub trait Resolver: Send + Sync {
     fn resolve(&self, host: String, port: u16) -> ResolveFuture;
-    fn pending(&self) -> usize {
-        0
+    /// Trait default for already-complete answers; implementations with native
+    /// work must override it to retain the lease until real completion.
+    fn begin(&self, host: String, port: u16) -> (ResolveFuture, ResolutionLease) {
+        (self.resolve(host, port), ResolutionLease::completed())
     }
 }
 #[derive(Debug, Default)]
-pub struct SystemResolver {
-    pending: Arc<AtomicUsize>,
-}
+pub struct SystemResolver;
 impl Resolver for SystemResolver {
     fn resolve(&self, host: String, port: u16) -> ResolveFuture {
-        let pending = self.pending.clone();
-        Box::pin(async move {
+        self.begin(host, port).0
+    }
+    fn begin(&self, host: String, port: u16) -> (ResolveFuture, ResolutionLease) {
+        let (lease, completion) = ResolutionLease::pending();
+        let future = Box::pin(async move {
             static ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+            // The lease is also held by this future until the native thread is
+            // safely started; a failed spawn settles it via `completion`.
             let permit = ADMISSION
                 .get_or_init(|| Arc::new(Semaphore::new(4)))
                 .clone()
@@ -73,18 +149,12 @@ impl Resolver for SystemResolver {
                 .await
                 .map_err(|_| ConnectorError::Transport)?;
             let (tx, rx) = oneshot::channel();
-            struct Pending(Arc<AtomicUsize>);
-            impl Drop for Pending {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::AcqRel);
-                }
-            }
-            pending.fetch_add(1, Ordering::AcqRel);
-            let pending_guard = Pending(pending);
             std::thread::Builder::new()
                 .name("denosanbox-dns".into())
                 .spawn(move || {
-                    let _pending = pending_guard;
+                    // Ownership/admission remains retained on this native thread
+                    // after an awaiting task cancels.
+                    let _completion = completion;
                     let _permit = permit;
                     // getaddrinfo may be non-cooperative. Ownership/admission remains
                     // retained on this native thread after an awaiting task cancels.
@@ -111,10 +181,8 @@ impl Resolver for SystemResolver {
                 })
                 .map_err(|_| ConnectorError::Transport)?;
             rx.await.map_err(|_| ConnectorError::Transport)?
-        })
-    }
-    fn pending(&self) -> usize {
-        self.pending.load(Ordering::Acquire)
+        });
+        (future, lease)
     }
 }
 
@@ -184,8 +252,52 @@ impl HttpConnector {
         }
         Ok(Self { limits, resolver })
     }
-    pub fn pending_resolutions(&self) -> usize {
-        self.resolver.pending()
+    /// Run one whole request (resolution and transport) and return its result
+    /// together with this request's resolution lease. The lease lets an owner
+    /// account for native DNS work that outlives a deadline or cancellation;
+    /// it is per call, so concurrent owners of the same connector never block
+    /// or drain each other.
+    pub async fn execute_owned<F>(
+        &self,
+        request: HttpRequest,
+        policy: F,
+        cancellation: &CancellationToken,
+        remaining: Duration,
+    ) -> (Result<HttpResponse>, ResolutionLease)
+    where
+        F: Fn() -> NetworkRules + Send + Sync,
+    {
+        if cancellation.is_cancelled() {
+            return (Err(ConnectorError::Cancelled), ResolutionLease::completed());
+        }
+        if remaining.is_zero() {
+            return (
+                Err(ConnectorError::DeadlineExceeded),
+                ResolutionLease::completed(),
+            );
+        }
+        let mut lease = ResolutionLease::completed();
+        let slot = Cell::new(None);
+        let work = self.execute_inner(request, &policy, &slot);
+        tokio::pin!(work);
+        let timer = tokio::time::sleep(remaining.min(self.limits.timeout));
+        tokio::pin!(timer);
+        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        let result = loop {
+            tokio::select! {
+                biased;
+                _ = &mut timer => break Err(ConnectorError::DeadlineExceeded),
+                _ = tick.tick() => { if cancellation.is_cancelled() { break Err(ConnectorError::Cancelled); } }
+                result = &mut work => break if cancellation.is_cancelled() { Err(ConnectorError::Cancelled) } else { result },
+            }
+        };
+        // The future is dropped only after this point, so a resolution that was
+        // in flight has already stored its lease above.
+        drop(work);
+        if let Some(adopted) = slot.take() {
+            lease = adopted;
+        }
+        (result, lease)
     }
     pub async fn execute(
         &self,
@@ -214,7 +326,8 @@ impl HttpConnector {
         if remaining.is_zero() {
             return Err(ConnectorError::DeadlineExceeded);
         }
-        let work = self.execute_inner(request, &policy);
+        let slot = Cell::new(None);
+        let work = self.execute_inner(request, &policy, &slot);
         tokio::pin!(work);
         let timer = tokio::time::sleep(remaining.min(self.limits.timeout));
         tokio::pin!(timer);
@@ -233,11 +346,18 @@ impl HttpConnector {
         host: &str,
         port: u16,
         policy: &F,
+        lease: &Cell<Option<ResolutionLease>>,
     ) -> Result<Vec<IpAddr>> {
         policy()
             .check_host(host, port)
             .map_err(|_| ConnectorError::Denied)?;
-        let ips = self.resolver.resolve(host.to_owned(), port).await?;
+        let (future, owned) = self.resolver.begin(host.to_owned(), port);
+        // Record ownership before awaiting so a dropped/hung future still
+        // leaves its lease with this request.
+        if !owned.is_settled() {
+            lease.set(Some(owned));
+        }
+        let ips = future.await?;
         if ips.is_empty() || ips.len() > 16 {
             return Err(ConnectorError::Denied);
         }
@@ -250,6 +370,7 @@ impl HttpConnector {
         &self,
         mut request: HttpRequest,
         policy: &F,
+        lease: &Cell<Option<ResolutionLease>>,
     ) -> Result<HttpResponse> {
         let mut url = checked_url(&request.url)?;
         let mut method = reqwest::Method::from_bytes(request.method.as_bytes())
@@ -284,7 +405,9 @@ impl HttpConnector {
             if proxy_applies(&url) {
                 return Err(ConnectorError::UnsupportedProxy);
             }
-            let ips = self.resolve_checked(&host, port, policy).await?;
+            let ips = self
+            .resolve_checked(&host, port, policy, lease)
+            .await?;
             let sockets: Vec<_> = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -486,6 +609,7 @@ fn proxy_applies(url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     struct Sequence {
         calls: Arc<AtomicUsize>,
         answers: Vec<Vec<IpAddr>>,
@@ -513,7 +637,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             client
-                .resolve_checked("allowed.test", 80, &NetworkRules::deny_all)
+                .resolve_checked(
+                    "allowed.test",
+                    80,
+                    &NetworkRules::deny_all,
+                    &Cell::new(None),
+                )
                 .await
                 .unwrap_err(),
             ConnectorError::Denied
@@ -522,14 +651,14 @@ mod tests {
         let rules = NetworkRules::deny_all().allow("allowed.test", 80).unwrap();
         assert_eq!(
             client
-                .resolve_checked("allowed.test", 80, &|| rules.clone())
+                .resolve_checked("allowed.test", 80, &|| rules.clone(), &Cell::new(None))
                 .await
                 .unwrap(),
             vec!["8.8.8.8".parse::<IpAddr>().unwrap()]
         );
         assert_eq!(
             client
-                .resolve_checked("allowed.test", 80, &|| rules.clone())
+                .resolve_checked("allowed.test", 80, &|| rules.clone(), &Cell::new(None))
                 .await
                 .unwrap_err(),
             ConnectorError::Denied

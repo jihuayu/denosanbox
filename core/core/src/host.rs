@@ -12,7 +12,7 @@ use crate::host_audit::{AuditEvent, AuditOutcome, HostAudit};
 use crate::host_schema::{JsonSchema, SchemaLimits};
 use crate::{Error, Result};
 use denosanbox_connectors::{
-    ConnectorError, ConnectorLimits, HttpConnector, HttpRequest, HttpResponse,
+    ConnectorError, ConnectorLimits, HttpConnector, HttpRequest, HttpResponse, ResolutionLease,
 };
 use denosanbox_mounts::{MountAccess, MountTable};
 use denosanbox_policy::{Budget, Lease, VirtualPath};
@@ -89,6 +89,9 @@ pub struct HostContext {
     cancellation: CancellationToken,
     deadline: Mutex<Deadline>,
     outstanding: Arc<AtomicUsize>,
+    /// Per-request resolution leases whose native resolver work is still
+    /// running after the owning request returned. Never shared resolver state.
+    pending_resolutions: Mutex<Vec<ResolutionLease>>,
     max_host_calls: usize,
     max_message_bytes: usize,
     closed: AtomicBool,
@@ -210,6 +213,7 @@ impl HostContext {
             cancellation: CancellationToken::new(),
             deadline: Mutex::new(Deadline::after(limits.deadline())),
             outstanding: Arc::new(AtomicUsize::new(0)),
+            pending_resolutions: Mutex::new(Vec::new()),
             max_host_calls: limits.queue_depth().min(32),
             max_message_bytes: limits.max_message_bytes(),
             closed: AtomicBool::new(false),
@@ -226,15 +230,21 @@ impl HostContext {
     pub fn id(&self) -> SandboxId {
         self.id
     }
+    /// Own host work only: callbacks/offloads plus this context's native DNS
+    /// leases. Settled leases are pruned first, so a dead request never pins
+    /// admission or the next invocation.
     pub fn outstanding(&self) -> usize {
-        let pending = self
-            .http
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pending_resolutions();
+        if let Ok(mut leases) = self.pending_resolutions.lock() {
+            leases.retain(|lease| !lease.is_settled());
+        }
         self.outstanding
             .load(Ordering::Acquire)
-            .saturating_add(pending)
+            .saturating_add(self.lock_pending().len())
+    }
+    fn lock_pending(&self) -> MutexGuard<'_, Vec<ResolutionLease>> {
+        self.pending_resolutions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
     pub fn set_worker_depth(&self, depth: usize) {
         self.worker_depth.store(depth, Ordering::Release);
@@ -604,19 +614,19 @@ impl HostContext {
                 .map_err(|_| Error::Backend {
                     message: "network runtime unavailable".into(),
                 })?;
-            let result = runtime
-                .block_on(connector.execute_with_policy(
-                    request,
-                    || context.policy().network().clone(),
-                    &context.cancellation,
-                    remaining,
-                ))
-                .map_err(network_error);
+            let (result, lease) = runtime.block_on(connector.execute_owned(
+                request,
+                || context.policy().network().clone(),
+                &context.cancellation,
+                remaining,
+            ));
+            let result = result.map_err(network_error);
             drop(runtime);
-            // getaddrinfo is non-cooperative. Retain this owner's native work,
-            // ancestor admission and context until its resolver really returns.
-            while connector.pending_resolutions() != 0 {
-                std::thread::sleep(Duration::from_millis(5));
+            // getaddrinfo is non-cooperative. Retain this request's own native
+            // lease (and with it ancestor admission) until it really settles,
+            // even though the connector future was dropped at the deadline.
+            if !lease.is_settled() {
+                context.lock_pending().push(lease);
             }
             result
         })
@@ -1149,62 +1159,282 @@ mod tests {
         assert!(matches!(result,Err(Error::Policy{kind,..}) if kind=="network_denied"));
         assert_eq!(count.load(Ordering::Relaxed), 0);
     }
+    /// Shared test resolver: `b.denosanbox-dns.test` hangs in "native" work
+    /// that ends only when the test opens [`SharedGate::open`]; everything
+    /// else answers `loopback` immediately. Every query owns its own lease.
+    #[derive(Default)]
+    struct SharedGate {
+        open: std::sync::Condvar,
+        closed: std::sync::Mutex<bool>,
+        pending: AtomicUsize,
+    }
+    impl SharedGate {
+        fn wait_closed(&self) {
+            let mut closed = self
+                .closed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*closed {
+                let (guard, timeout) = self
+                    .open
+                    .wait_timeout(closed, Duration::from_secs(5))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                closed = guard;
+                assert!(!timeout.timed_out(), "gate never opened");
+            }
+        }
+        fn open(&self) {
+            *self
+                .closed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            self.open.notify_all();
+        }
+        fn pending(&self) -> usize {
+            self.pending.load(Ordering::Acquire)
+        }
+    }
+    struct GatedResolver {
+        gate: Arc<SharedGate>,
+        loopback: std::net::IpAddr,
+    }
+    impl denosanbox_connectors::Resolver for GatedResolver {
+        fn resolve(&self, host: String, port: u16) -> denosanbox_connectors::ResolveFuture {
+            self.begin(host, port).0
+        }
+        fn begin(
+            &self,
+            host: String,
+            _: u16,
+        ) -> (denosanbox_connectors::ResolveFuture, ResolutionLease) {
+            if host != "b.denosanbox-dns.test" {
+                let loopback = self.loopback;
+                return (
+                    Box::pin(async move { Ok(vec![loopback]) }),
+                    ResolutionLease::completed(),
+                );
+            }
+            let (lease, completion) = ResolutionLease::pending();
+            self.gate.pending.fetch_add(1, Ordering::AcqRel);
+            let gate = self.gate.clone();
+            // The async future ends at once; the lease and the "native" work
+            // stay owned by this thread until the gate opens.
+            std::thread::spawn(move || {
+                gate.wait_closed();
+                gate.pending.fetch_sub(1, Ordering::AcqRel);
+                completion.complete();
+            });
+            (
+                Box::pin(async { Err(ConnectorError::Transport) }),
+                lease,
+            )
+        }
+    }
+    /// Explicit loopback grant. The name is unusual so the host's own proxy
+    /// environment never applies; the granted port is an OS-ephemeral port cast
+    /// to the bogus scheme default (the policy reserved-port check stays).
+    fn loopback_policy(host: &str, port: u16) -> Policy {
+        Policy::default().with_network(
+            denosanbox_policy::NetworkRules::deny_all()
+                .allow_private(host, port)
+                .unwrap(),
+        )
+    }
+    fn network_request(url: String) -> HttpRequest {
+        HttpRequest {
+            url,
+            method: "GET".into(),
+            headers: Default::default(),
+            body: vec![],
+        }
+    }
+    fn unresolved_limit(result: Result<()>) -> bool {
+        matches!(&result, Err(Error::LimitExceeded { limit, .. }) if limit == "unfinished_host_calls")
+    }
+    /// Explicitly granted loopback through the caller-supplied resolver. The
+    /// host's inherited proxy (if any) must still fail the hop closed before
+    /// any transport, so this runs in every environment.
     #[test]
-    fn resolver_native_work_remains_owned_after_http_deadline() {
-        struct SlowResolver {
-            pending: Arc<AtomicUsize>,
-        }
-        impl denosanbox_connectors::Resolver for SlowResolver {
-            fn resolve(&self, _: String, _: u16) -> denosanbox_connectors::ResolveFuture {
-                let pending = self.pending.clone();
-                pending.fetch_add(1, Ordering::AcqRel);
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(150));
-                    pending.fetch_sub(1, Ordering::AcqRel);
-                });
-                Box::pin(std::future::pending())
+    fn inherited_proxy_still_fails_closed_for_granted_loopback() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port() as u16;
+        let lane = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
             }
-            fn pending(&self) -> usize {
-                self.pending.load(Ordering::Acquire)
-            }
-        }
-        let pending = Arc::new(AtomicUsize::new(0));
+        });
         let connector = HttpConnector::with_resolver(
             ConnectorLimits::default(),
-            Arc::new(SlowResolver {
-                pending: pending.clone(),
+            Arc::new(GatedResolver {
+                gate: Arc::new(SharedGate::default()),
+                loopback: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             }),
         )
         .unwrap();
-        let policy = Policy::default().with_network(
-            denosanbox_policy::NetworkRules::deny_all()
-                .allow_private("localhost", 80)
-                .unwrap(),
-        );
         let context = HostContext::new(
-            policy,
+            loopback_policy("a.denosanbox-dns.test", port),
             Arc::new(Mutex::new(HostRegistry::default())),
             vec![],
         )
         .unwrap();
         context.set_http_connector(connector).unwrap();
-        context.begin_invocation(Duration::from_millis(30)).unwrap();
-        let result = runtime().block_on(context.http_request(HttpRequest {
-            url: "http://localhost/".into(),
-            method: "GET".into(),
-            headers: Default::default(),
-            body: vec![],
-        }));
-        assert!(matches!(result, Err(Error::DeadlineExceeded)));
-        assert_eq!(pending.load(Ordering::Acquire), 1);
-        assert!(context.outstanding() > 0);
-        context.cancel();
-        assert!(context.outstanding() > 0);
+        context.begin_invocation(Duration::from_secs(1)).unwrap();
+        let result = runtime().block_on(context.http_request(network_request(format!(
+            "http://a.denosanbox-dns.test:{port}/"
+        ))));
+        if std::env::var("HTTP_PROXY")
+            .or_else(|_| std::env::var("http_proxy"))
+            .is_ok_and(|value| !value.is_empty())
+        {
+            assert!(
+                matches!(&result, Err(Error::Policy { kind, .. }) if kind == "unsupported_proxy"),
+                "inherited proxy must not be bypassed: {result:?}"
+            );
+        }
+        assert_eq!(context.outstanding(), 0);
+        lane.join().expect("loopback lane");
+    }
+    #[test]
+    fn shared_resolver_clones_keep_dns_ownership_per_request() {
+        // No network transport here: all contexts share one deterministic
+        // resolver through clones of one connector. B's native DNS is gated;
+        // everyone else's own resolution is instant. Requires that the host
+        // environment does not force a proxy for these names (host-only
+        // NO_PROXY override).
+        let gate = Arc::new(SharedGate::default());
+        let resolver = Arc::new(GatedResolver {
+            gate: gate.clone(),
+            loopback: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        });
+        let connector = HttpConnector::with_resolver(
+            ConnectorLimits {
+                timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+            resolver.clone(),
+        )
+        .unwrap();
+        let hosts = Arc::new(Mutex::new(HostRegistry::default()));
+        let a = HostContext::new(
+            loopback_policy("a.denosanbox-dns.test", 80),
+            hosts.clone(),
+            vec![],
+        )
+        .unwrap();
+        let b = HostContext::new(
+            loopback_policy("b.denosanbox-dns.test", 80),
+            hosts.clone(),
+            vec![],
+        )
+        .unwrap();
+        // B and C are children of their own small admission pools; A is not.
+        let child_config = |pool: Arc<Budget>| HostConfig {
+            host_budget: pool,
+            ..Default::default()
+        };
+        let c = HostContext::new_with_config(
+            loopback_policy("b.denosanbox-dns.test", 80),
+            hosts.clone(),
+            vec![],
+            child_config(Budget::new(4)),
+        )
+        .unwrap();
+        a.set_http_connector(connector.clone()).unwrap();
+        b.set_http_connector(connector.clone()).unwrap();
+        c.set_http_connector(connector.clone()).unwrap();
+        runtime().block_on(async {
+            b.begin_invocation(Duration::from_millis(150)).unwrap();
+            let b_got = tokio::time::timeout(
+                Duration::from_secs(2),
+                b.http_request(network_request("http://b.denosanbox-dns.test/".into())),
+            )
+            .await
+            .expect("B bounded by its own deadline");
+            assert!(
+                !matches!(&b_got, Err(Error::Policy { kind, .. }) if kind == "unsupported_proxy"),
+                "inherited proxy must be re-read from the test override"
+            );
+            assert!(matches!(b_got, Err(Error::DeadlineExceeded)));
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while gate.pending() != 1 {
+                assert!(std::time::Instant::now() < deadline, "B DNS started");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // B owns its unfinished lease and keeps its own admission.
+            assert!(b.outstanding() >= 1, "B owns its unfinished DNS lease");
+            assert!(unresolved_limit(b.begin_invocation(Duration::from_secs(1))));
+
+            // A (sibling of C, sharing B's resolver) finishes immediately.
+            a.begin_invocation(Duration::from_millis(150)).unwrap();
+            let a_result = tokio::time::timeout(
+                Duration::from_secs(2),
+                a.http_request(network_request("http://a.denosanbox-dns.test/".into())),
+            )
+            .await
+            .expect("A waited for B's resolver");
+            assert!(
+                !matches!(&a_result, Err(Error::Policy { kind, .. }) if kind == "transport_error"),
+                "A's own resolution must complete: {a_result:?}"
+            );
+            assert_eq!(a.outstanding(), 0, "B's DNS is not charged to A");
+            a.begin_invocation(Duration::from_secs(1))
+                .expect("A can start while B DNS hangs");
+
+            // An independent context in B's resolver group finishes cleanly,
+            // and B's lease does not leak into it.
+            c.begin_invocation(Duration::from_secs(1)).unwrap();
+            let c_result = tokio::time::timeout(
+                Duration::from_secs(2),
+                c.http_request(network_request("http://a.denosanbox-dns.test/".into())),
+            )
+            .await
+            .expect("C waited for B's resolver");
+            assert!(
+                !matches!(&c_result, Err(Error::Policy { kind, .. }) if kind == "transport_error"),
+                "C's own resolution must complete: {c_result:?}"
+            );
+            assert_eq!(c.outstanding(), 0);
+            // A live native lease keeps its own tree's admission charged.
+            assert!(unresolved_limit(b.begin_invocation(Duration::from_secs(1))));
+            b.cancel();
+            assert!(b.is_closed());
+            assert!(b.outstanding() >= 1, "B close reports incomplete work");
+            gate.open();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while b.outstanding() != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(b.outstanding(), 0, "B drains after its native DNS completes");
+        assert_eq!(a.outstanding(), 0);
+        assert_eq!(c.outstanding(), 0);
+    }
+    #[test]
+    fn failed_spawn_settles_resolver_lease() {
+        let context = HostContext::new(
+            loopback_policy("localhost", 80),
+            Arc::new(Mutex::new(HostRegistry::default())),
+            vec![],
+        )
+        .unwrap();
+        context.begin_invocation(Duration::from_secs(1)).unwrap();
+        let result = runtime().block_on(context.http_request(network_request(
+            "http://localhost:0/".into(),
+        )));
+        assert!(result.is_err(), "port 0 cannot be connected");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while context.outstanding() != 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(context.outstanding(), 0);
+        assert_eq!(
+            context.outstanding(),
+            0,
+            "finished/failed resolutions release their lease"
+        );
+        context.begin_invocation(Duration::from_secs(1)).unwrap();
     }
     #[test]
     fn completed_contexts_do_not_accumulate_retired_registry_owners() {

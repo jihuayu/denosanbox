@@ -296,9 +296,9 @@ def test_cross_engine_prepared_plugin_rejection_is_typed() -> None:
     import asyncio
 
     async def scenario() -> None:
-        tiny = Engine("fake")
+        tiny = Engine("deno")
         source = "export function run(){return 1;}"  # 29 bytes
-        broad = Engine("fake", max_module_bytes=1)
+        broad = Engine("deno", max_module_bytes=1)
         assert broad.limits.max_module_bytes == 1
         prepared = tiny.prepare(source)
         try:

@@ -139,3 +139,53 @@ test('explicit native callback shutdown permits Node process exit', () => {
   assert.equal(completed.status,0,completed.stderr);
   assert.match(completed.stdout,/shutdown-ok/);
 });
+
+test('shutdown releases Node callback captures and Engine cycles', () => {
+  const {spawnSync}=require('node:child_process');
+  const modulePath=require('node:path').resolve(__dirname,'..');
+  const script=`
+    const assert=require('node:assert/strict');
+    const {Engine}=require(${JSON.stringify(modulePath)});
+    async function assertCollected(ref,label){
+      for(let i=0;i<60;i++){
+        // WeakRef.deref() keeps a live target until the current job ends. Yield
+        // before the next collection so the previous check cannot pin it.
+        await new Promise(resolve=>setImmediate(resolve));
+        global.gc();
+        await new Promise(resolve=>setImmediate(resolve));
+        if(ref.deref()===undefined) return;
+      }
+      throw Error(label+' remained reachable after shutdown and GC turns');
+    }
+    function makeCycle(){
+      const engine=new Engine({hostCapabilities:['cycle.read']});
+      const callback=async()=>engine.activeSandboxes;
+      const callbackRef=new WeakRef(callback);
+      const engineRef=new WeakRef(engine);
+      engine.registerHost('cycle.read',callback);
+      return {engine,callbackRef,engineRef};
+    }
+    (async()=>{
+      const engine=new Engine({hostCapabilities:['callback.read']});
+      let callback=new Function('return async function(){return null;}')();
+      const callbackRef=new WeakRef(callback);
+      engine.registerHost('callback.read',callback);
+      callback=null;
+      assert.equal(await engine.shutdown(),true);
+      await assertCollected(callbackRef,'registered callback while Engine is live');
+      assert.equal(engine.activeSandboxes,0);
+
+      const cycle=makeCycle();
+      assert.equal(await cycle.engine.shutdown(),true);
+      cycle.engine=null;
+      await assertCollected(cycle.callbackRef,'callback-to-Engine cycle');
+      await assertCollected(cycle.engineRef,'Engine wrapper in callback cycle');
+      console.log('callback-captures-released');
+    })().catch(error=>{console.error(error);process.exitCode=1;});`;
+  const completed=spawnSync(process.execPath,['--expose-gc','-e',script],{
+    encoding:'utf8',timeout:5000,
+  });
+  assert.equal(completed.error,undefined,completed.stderr);
+  assert.equal(completed.status,0,completed.stderr);
+  assert.match(completed.stdout,/callback-captures-released/);
+});

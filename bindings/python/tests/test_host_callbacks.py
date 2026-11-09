@@ -1,8 +1,10 @@
 """Real native callback dispatch, identity and cancellation on asyncio."""
 import asyncio
+import gc
 import json
 import os
 import threading
+import weakref
 
 import pytest
 
@@ -106,3 +108,55 @@ print('shutdown-ok')
     completed = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=10)
     assert completed.returncode == 0, completed.stderr
     assert 'shutdown-ok' in completed.stdout
+
+
+async def test_shutdown_releases_registered_callback_while_engine_wrapper_lives():
+    engine = Engine(host_capabilities=['callback.read'])
+
+    async def callback(context, input_json):
+        return 'null'
+
+    callback_ref = weakref.ref(callback)
+    engine.register_host('callback.read', callback)
+    del callback
+
+    report = await engine.shutdown()
+    assert report.clean
+    for _ in range(4):
+        gc.collect()
+        await asyncio.sleep(0)
+        if callback_ref() is None:
+            break
+
+    # Keep the public wrapper alive while checking that shutdown retired its
+    # callback registry and released the Python function it owned.
+    assert engine.backend == 'deno'
+    assert callback_ref() is None
+
+
+def _make_engine_callback_cycle():
+    engine = Engine(host_capabilities=['callback.read'])
+
+    async def callback(context, input_json):
+        # Exercise the hidden Rust -> Python callback -> Engine reference cycle.
+        _ = engine.backend
+        return 'null'
+
+    callback_ref = weakref.ref(callback)
+    engine.register_host('callback.read', callback)
+    return engine, callback_ref
+
+
+async def test_shutdown_breaks_callback_cycle_after_engine_wrapper_drop():
+    engine, callback_ref = _make_engine_callback_cycle()
+    report = await engine.shutdown()
+    assert report.clean
+    del engine
+
+    for _ in range(4):
+        gc.collect()
+        await asyncio.sleep(0)
+        if callback_ref() is None:
+            break
+
+    assert callback_ref() is None

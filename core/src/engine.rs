@@ -105,10 +105,8 @@ impl Engine {
         output_limit: usize,
         callback: impl denosanbox_core::policy::Callback + 'static,
     ) -> Result<RegisteredCallback> {
-        self.inner
-            .hosts
-            .lock()
-            .unwrap()
+        let mut hosts = self.inner.hosts.lock().unwrap();
+        hosts
             .register(name, input_limit, output_limit, callback)
             .map_err(map_policy)
     }
@@ -125,10 +123,11 @@ impl Engine {
         Fut:
             std::future::Future<Output = denosanbox_core::policy::Result<Vec<u8>>> + Send + 'static,
     {
-        self.inner
-            .hosts
-            .lock()
-            .unwrap()
+        let mut hosts = self.inner.hosts.lock().unwrap();
+        if self.inner.shutting_down.load(Ordering::SeqCst) || hosts.is_retired() {
+            return Err(Error::Closed);
+        }
+        hosts
             .register_async(name, input_limit, output_limit, callback)
             .map_err(map_policy)
     }
@@ -565,7 +564,13 @@ impl Engine {
         })
     }
 
-    /// Closes every sandbox owned by this engine.
+    /// Closes every sandbox owned by this engine and freezes host registration.
+    ///
+    /// Registered host callback handlers are detached from the registry and
+    /// their captures dropped here, outside all registry and worker locks and
+    /// before waiting on any sandbox. A callback invocation that already
+    /// started keeps its own handler until it really returns; that is not
+    /// cancelled by this method. Idempotent and safe to call concurrently.
     ///
     /// Joining happens on native reaper threads, never on the async executor.
     pub async fn shutdown(&self) -> Result<ShutdownReport> {

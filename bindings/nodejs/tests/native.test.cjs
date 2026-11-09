@@ -17,11 +17,11 @@ test('N-API and embedded V8 coexist across independent engines and lifecycle', a
     assert.deepEqual(await b.call('next', 'B'), {count:1,input:'B'});
     assert.deepEqual(await a.call('next', null), {count:2,input:null});
     assert.equal(process.pid, pid);
-    assert.equal(await a.close(), true);
+    assert.equal((await a.close()).closedCleanly, true);
     assert.equal(await first.shutdown(), true);
     assert.deepEqual(await b.call('next', null), {count:2,input:null});
-    assert.equal(await b.close(), true);
-    assert.equal(await b.close(), true);
+    assert.equal((await b.close()).closedCleanly, true);
+    assert.equal((await b.close()).closedCleanly, true);
   } finally { await first.shutdown(); await second.shutdown(); }
 });
 test('native execution leaves Node event loop responsive; deadlines isolate failure', async () => {
@@ -89,7 +89,7 @@ test('host callback observes sandbox cancellation through AbortSignal', async ()
     await assert.rejects(invocation,error=>!error.message.includes('private-host-secret'));
     assert.equal(aborted,true);
     await new Promise(resolve=>setTimeout(resolve,20));
-    assert.equal(await sandbox.close(),true);
+    assert.equal((await sandbox.close()).closedCleanly,true);
   } finally { await engine.shutdown(); }
 });
 
@@ -104,7 +104,7 @@ test('explicit native callback shutdown permits Node process exit', () => {
       const plugin=engine.prepare("export async function run(){return await sandbox.host.call('pid',null);}");
       const sandbox=await engine.create(plugin,{hostGrants:{pid:'process'}});
       if(await sandbox.call('run',null)!==process.pid) throw Error('PID mismatch');
-      if(!await sandbox.close() || !await engine.shutdown()) throw Error('incomplete close');
+      if(!(await sandbox.close()).closedCleanly || !await engine.shutdown()) throw Error('incomplete close');
       console.log('shutdown-ok');
     })().catch(error=>{console.error(error);process.exitCode=1;});`;
   const completed=spawnSync(process.execPath,['-e',script],{encoding:'utf8',timeout:10000});

@@ -41,8 +41,12 @@ try {
 
 Calls return Promises and execute on the Rust runtime rather than the Node event
 loop. `cancel()` requests terminal cancellation of its sandbox; it does not
-roll back side effects. `close()` / `shutdown()` must be awaited, and return
-whether core reports clean shutdown. Losing a JavaScript reference is not a
+roll back side effects. `close()` / `shutdown()` must be awaited: `close()`
+resolves to the facade `CloseReport` (`closedCleanly`, `forcedTermination`,
+`invocationsCompleted`, `invocationsCancelled`, `pendingHostOperations`) and
+`shutdown()` resolves to whether core reports clean shutdown. An incomplete
+report is never upgraded to success; `Symbol.asyncDispose` throws
+`incomplete_close` with the pending count. Losing a JavaScript reference is not a
 substitute for explicit close. JSON messages are limited to the default core
 1 MiB limit. Errors expose a stable `kind` and a human-readable message.
 
@@ -68,10 +72,64 @@ state separation, Promise calls, Node timers during an infinite guest loop,
 deadlines, cancellation, repeated close, and shutdown order. Never infer addon
 support solely from the preliminary C shim.
 
+## Module graphs, profiles, policy and mounts
+
+```js
+const plugin = engine.prepareModules({
+  'main.ts': "import { twice } from './lib/math.ts'; export function run(n: number) { return twice(n); }",
+  'lib/math.ts': 'export function twice(n: number): number { return n * 2; }',
+}, 'main.ts', 'javascript-only');
+plugin.modulePaths; // ['lib/math.ts', 'main.ts']
+plugin.profile;     // 'javascript-only'
+```
+
+`prepare(source, entrypoint)` remains the one-module shortcut. `prepareModules`
+freezes a host-supplied graph; static imports, re-exports, computed dynamic
+imports and a guest `new Worker('./worker.js', {type: 'module'})` graph
+resolve only inside it. `profile` is explicit: `'javascript-only'` (default) or
+`'pure-js-npm'` (host-prepared vendored package graph plus the trusted
+`worker_threads` alias). No profile grants VFS/env/network/callback access.
+
+`new Engine(options)` also exposes the facade hard limits (`EngineLimits`),
+enforced on every `create`, including a `PreparedPlugin` prepared by a
+different engine: `maxActiveSandboxes`, `maxPendingInvocations`,
+`engineMessageBytes` (the hard JSON limit, distinct from the policy
+`maxMessageBytes`), `defaultInvocationTimeoutMs`, `maxInvocationTimeoutMs`,
+`maxModules`, `maxModuleBytes`, `maxGraphBytes`. The effective values are
+readable through `engine.limits`.
+
+`new Engine(options)` builds the immutable, deny-by-default ceiling from trusted
+host values: `hostCapabilities`, `readRoots`, `writeRoots`, and resource limits
+mapped one-to-one to the facade policy `Limits`: `heapTargetBytes` (per-isolate
+JS heap target, not RSS), `memoryBudgetBytes` (aggregate budget for the sandbox
+and descendants), `maxSandboxes`, `deadlineMs`, `queueDepth`,
+`maxMessageBytes`, `maxLogBytes`. `engine.create(plugin, options)` sends the
+per-sandbox *request* (`capabilities`, `readRoots`, `writeRoots`, `deadlineMs`,
+`queueDepth`, `maxMessageBytes`, `maxLogBytes`, `defaultTimeoutMs`,
+`memoryLimitBytes`) which the facade narrows against the ceiling; exceeding it
+rejects with `kind === 'policy'`. `memoryLimitBytes` is the isolate heap
+reservation while `memoryBudgetBytes` is the subtree budget.
+
+`sandbox` guest access to the private VFS (`sandbox.fs.readTextFile`/
+`writeTextFile`) and env (`sandbox.env.get/set`) requires the matching roots and
+the `env` capability in both the ceiling and the sandbox request. Hosted
+directories are attached with trusted values only:
+
+```js
+engine.mountDirectory(sandbox, '/mount', '/srv/tenant-a', 'read-write'); // or 'read'
+```
+
+The facade retains the directory capability (rejects symlinks and traversal)
+and still requires the sandbox policy to allow `/mount`. Every sandbox `call`
+takes exactly one JSON `input` value (plus optional `{timeoutMs, signal}`), so
+export one object when an operation needs several fields:
+`sandbox.call('read', {path: '/mount/host.txt'})`. Grant scopes always
+come from the host's `hostGrants` object; a forged scope inside guest JSON has
+no effect.
+
 ## Remaining release requirements
 
-Async host callbacks use bounded N-API threadsafe dispatch and return Promises. Shared behavior fixtures and explicit process shutdown run against the native addon. Broader platform/Node version support and registry publication remain outside the tested matrix.
-Current `Engine.prepare` accepts one JavaScript or TypeScript module; TypeScript uses the Rust offline transpiler. Additional-module construction is not exposed yet. No automatic
+Async host callbacks use bounded N-API threadsafe dispatch and return Promises. Shared behavior fixtures, multi-module/profile/VFS/mount tests and explicit process shutdown run against the native addon. Broader platform/Node version support and registry publication remain outside the tested matrix. No automatic
 fallback is provided for unsupported APIs, platforms, or failed native loading.
 
 The same-process threat model applies: native faults and process OOM can affect
@@ -115,7 +173,10 @@ callback queues are bounded to 32 entries. Callback failures are sanitized.
 
 The completed local callback gate passed **10 native tests** with zero skips,
 including the four shared behavior fixtures and process exit after explicit
-callback close. An actual `npm pack` archive was installed into a separate local
+callback close. Multi-module/profile/VFS/mount parity tests were added in
+`tests/modules.test.cjs` (including a bounded 9 MiB `ArrayBuffer` probe against a
+16 MiB heap target / 24 MiB tree budget; no unbounded heap allocation is run);
+see `bindings/python/VALIDATION.md` for status. An actual `npm pack` archive was installed into a separate local
 package directory, then loaded and exercised with an async host PID callback;
 that installed-package smoke test passed. No package was published. The loader
 and package engine field intentionally accept only Node **24.22.1** until more

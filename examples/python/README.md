@@ -11,12 +11,18 @@ maturin develop --release
 cd ../..
 python examples/python/main.py
 python examples/python/deadline_and_cancel.py
+python examples/python/modules_vfs.py
 ```
 
-`main.py` creates two independent sandboxes from one prepared plugin and
-demonstrates independent module state and JSON calls. The bare deno_core
-profile does not expose `Deno.pid`; guest-to-host callback PID verification
-remains part of the unfinished callback release gate.
+`main.py` prepares a two-module TypeScript graph with `prepare_modules`,
+creates two independent sandboxes from it and demonstrates independent module
+state, JSON calls and the explicit profile. The bare deno_core profile does not
+expose `Deno.pid`; host PID verification is done by real async callbacks (see
+`modules_vfs.py` and `bindings/python/tests/test_host_callbacks.py`).
+
+`modules_vfs.py` shows the engine policy ceiling and per-sandbox request (private
+VFS + `env` capability), a read-only `mount_directory` and a scoped async host
+callback that reports the Python host PID.
 
 `deadline_and_cancel.py` shows a runaway `while (true)` loop terminated by a
 per-call deadline and by cancelling the Python task awaiting `Sandbox.call()`.

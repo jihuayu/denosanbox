@@ -26,6 +26,13 @@ against the matching core checkout.
 
 - `Engine.prepare()` validates and freezes a single-module JavaScript ESM graph.
   The synchronous Rust call runs with the Python GIL released.
+- `Engine.prepare_modules(modules, entrypoint, profile=...)` validates and
+  freezes a host-supplied multi-module graph (see below).
+- `EngineOptions` / `SandboxOptions` express trusted host configuration: the
+  immutable engine ceiling and the per-sandbox request that the facade narrows
+  against it.
+- `Engine.mount_directory(sandbox, prefix, path, access)` attaches a trusted
+  host directory to a live sandbox through the facade.
 - `await Engine.create(prepared)` creates an independent isolate and module
   instance set.
 - `await Sandbox.call(export, input_json, timeout_ms=None)` invokes an exported
@@ -33,7 +40,10 @@ against the matching core checkout.
 - `Sandbox.cancel()` terminally cancels the current invocation and marks the
   sandbox closed.
 - `await Sandbox.close()` requests close, joins the worker and returns a
-  `CloseReport` reflecting actual completed/cancelled counts.
+  `CloseReport` reflecting facade completed/cancelled counts and
+  `pending_host_operations`. A report with `closed_cleanly=False` is returned
+  as-is (never upgraded) and later `close()` calls report again until cleanup
+  finishes.
 - `await Engine.shutdown()` closes every live sandbox and returns a
   `ShutdownReport`.
 - Errors are translated into a stable `SandboxError` subclass hierarchy. Every
@@ -45,12 +55,8 @@ the Python host process. The bare deno_core profile does not expose `Deno.pid`; 
 
 ## Not implemented
 
-- Multi-module graph construction from Python. `prepare(source, entrypoint)`
-  creates a one-module graph; the Rust `PluginSource` still supports multiple
-  modules for other bindings.
-- JSX and broad permission-policy helpers. Single-module TypeScript (`.ts` /
-  `.mts`) uses the core offline transpiler; a multi-module Python builder is
-  not exposed yet.
+- JSX/TSX/CommonJS/native addons (rejected by the core with typed errors).
+- Network policy helpers, worker/delegation helpers and host import bridges.
 - A published wheel distribution and platforms beyond the tested matrix.
 
 ## Build and install from source
@@ -108,6 +114,93 @@ JSON input is bounded in bytes before parsing and the GIL is released during par
 facade's `serde_json::Value` contract without exposing Rust serialization
 types. `timeout_ms` overrides the engine/sandbox default for one call; the core
 enforces a deadline and terminates runaway V8 execution.
+
+## Module graphs and profiles
+
+`prepare_modules` takes a mapping of root-relative paths (`main.ts`,
+`lib/util.ts`, `worker.js`, ...) to host-supplied source text plus an
+`entrypoint` key. Static imports, re-exports, computed dynamic imports and a
+guest `new Worker('./worker.js', {type: 'module'})` graph resolve only
+inside that immutable map; nothing is downloaded. `PreparedPlugin.module_paths`
+lists the frozen paths and `PreparedPlugin.profile` records the profile.
+
+`profile` is explicit and never auto-enabled:
+
+- `"javascript-only"` (default): plain ES modules.
+- `"pure-js-npm"`: additionally authorizes a host-prepared vendored package
+  graph (`PluginSource.add_package` from Rust) and the trusted
+  `worker_threads` / `node:worker_threads` alias.
+
+Neither profile grants VFS, environment, network or callback privileges; those
+come from the engine ceiling plus the sandbox request. `prepare_modules` calls
+the facade's `Engine::prepare_with_profile(PluginSource, CompatibilityProfile)`.
+If a facade build predates that method, `pure-js-npm` fails with
+`RuntimeUnavailableError` instead of silently running as JavaScript-only.
+
+```python
+plugin = engine.prepare_modules({
+    "main.ts": "import { twice } from './lib/math.ts'; export function run(n: number) { return twice(n); }",
+    "lib/math.ts": "export function twice(n: number): number { return n * 2; }",
+}, "main.ts")
+assert plugin.module_paths == ("lib/math.ts", "main.ts")
+```
+
+## Policy ceiling, resource limits, private VFS and mounts
+
+`EngineOptions` is trusted host configuration for the immutable engine ceiling.
+It starts empty (no grants) and may explicitly grant capability names
+(`host_capabilities`, e.g. `"env"` or a registered callback name) and virtual
+read/write roots (`read_roots`, `write_roots`). Policy resource limits map
+one-to-one onto the facade `Limits`:
+
+| `EngineOptions` | facade `Limits` | meaning |
+| --- | --- | --- |
+| `heap_target_bytes` | `heap_target_bytes` | JS heap target of one isolate (not RSS) |
+| `memory_budget_bytes` | `memory_budget_bytes` | aggregate managed-memory budget for a sandbox and its descendants |
+| `max_sandboxes` | `max_sandboxes` | live sandbox count in the subtree |
+| `deadline_ms` | `deadline` | per-invocation policy deadline |
+| `queue_depth` | `queue_depth` | pending invocations / host calls |
+| `max_message_bytes` | `max_message_bytes` | serialized message size |
+| `max_log_bytes` | `max_log_bytes` | retained log bytes |
+
+Engine hard limits (`max_active_sandboxes`, `max_message_bytes`,
+`max_module_bytes`, ...) remain constructor arguments and are readable through
+`Engine.limits`.
+
+`SandboxOptions` is what the host *requests* for one sandbox
+(`capabilities`, `read_roots`, `write_roots`, `deadline_ms`, `queue_depth`,
+`max_message_bytes`, `max_log_bytes`, `default_timeout_ms`,
+`memory_limit_bytes`, `host_grants`). The facade intersects it with the ceiling;
+a request above the ceiling raises `PolicyError`. Guest JavaScript never sees
+or edits these values, and host grants take their business scope from the
+trusted `host_grants` mapping, never from guest JSON.
+
+```python
+from denosanbox import Engine, EngineOptions, SandboxOptions
+
+engine = Engine(options=EngineOptions(host_capabilities=["env"],
+                                      read_roots=["/private"], write_roots=["/private"]))
+plugin = engine.prepare("""
+export async function run(input) {
+  await sandbox.fs.writeTextFile('/private/x', input.value);
+  sandbox.env.set('PRIVATE', input.value);
+  return {text: await sandbox.fs.readTextFile('/private/x'), env: sandbox.env.get('PRIVATE')};
+}""")
+sandbox = await engine.create(plugin, options=SandboxOptions(
+    capabilities=["env"], read_roots=["/private"], write_roots=["/private"]))
+```
+
+`sandbox.fs`, `sandbox.env` and `sandbox.cwd()` act only on the sandbox's
+private resource view. `mount_directory` attaches a host directory to that view:
+
+```python
+engine.mount_directory(sandbox, "/mount", "/srv/tenant-a", "read-write")  # or "read"
+```
+
+All mount arguments are trusted host values. The facade keeps the directory
+capability, rejects symlinks and traversal, and still requires the sandbox
+policy to allow the virtual prefix (`/mount`). A read-only mount rejects guest
+writes; a sandbox without the mount cannot reach the host directory.
 
 ## Async host callbacks
 
@@ -180,8 +273,13 @@ Unknown future kinds fall back to `SandboxError` while preserving `kind` and
   isolates, JSON round-trips, cancellation during creation, an infinite loop terminated by
   a deadline, cancellation on Python task cancellation, and deterministic
   close reports. These tests require the Deno backend and fail if it is unavailable.
+- `tests/test_modules_vfs.py` exercises multi-module/TypeScript/dynamic-import
+  and guest Worker graphs, the explicit `pure-js-npm` profile, private VFS and
+  env under ceiling+request, `mount_directory` (read-only and read-write),
+  engine hard limits, zero-timeout rejection and the cross-Engine
+  `PreparedPlugin` regression.
 
 `tests/test_host_callbacks.py` covers async loop/GIL dispatch, same-PID calls,
 trusted scope, ungranted denial, callback cancellation, sanitized failures, and
 explicit close before interpreter shutdown. Shared behavior fixtures also run
-against Rust, Node, and the Go/C adapter.
+against the Rust runner and the native Node package.

@@ -10,7 +10,8 @@ CASES = json.loads((Path(__file__).resolve().parents[3] / 'fixtures/behavior/v1.
 async def test_shared_behavior(case):
     engine = Engine()
     try:
-        plugin = engine.prepare(case['source'], case['entrypoint'])
+        # One-module graph through the multi-module API (same facade path).
+        plugin = engine.prepare_modules({case['entrypoint']: case['source']}, case['entrypoint'])
         sandboxes = [await engine.create(plugin), await engine.create(plugin)]
         for step in case['steps']:
             sandbox = sandboxes[step['sandbox']]

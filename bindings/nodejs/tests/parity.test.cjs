@@ -7,7 +7,8 @@ for (const fixture of cases) {
   test(`shared behavior: ${fixture.id}`, async () => {
     const engine = new Engine();
     try {
-      const plugin = engine.prepare(fixture.source, fixture.entrypoint);
+      // One-module graph through the multi-module API (same facade path).
+      const plugin = engine.prepareModules({[fixture.entrypoint]: fixture.source}, fixture.entrypoint);
       const sandboxes = [await engine.create(plugin), await engine.create(plugin)];
       for (const step of fixture.steps) {
         const call = sandboxes[step.sandbox].call(step.export, step.input);

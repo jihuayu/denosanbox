@@ -16,6 +16,7 @@ from denosanbox import (
     ClosedError,
     DeadlineExceededError,
     Engine,
+    RuntimeUnavailableError,
 )
 
 pytestmark = pytest.mark.deno

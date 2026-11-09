@@ -95,6 +95,10 @@ pub trait Driver {
     fn invoke(&mut self, invocation: Invocation) -> Result<Value>;
 
     /// Releases the runtime and reports observed counters.
+    /// Consume and dispose the driver-owned runtime. Outstanding host work
+    /// remains owned/accounted by HostContext and is reported separately in
+    /// pending_host_operations; its completion can be observed after disposal.
+    /// A failure to dispose the driver itself must return Err.
     fn close(self: Box<Self>) -> Result<CloseReport>;
 
     /// Measured runtime metrics. Unmeasured quantities stay `None`; a driver

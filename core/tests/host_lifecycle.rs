@@ -232,7 +232,7 @@ async fn running_callback_retains_capture_until_real_completion() {
             let _ = release_rx
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(3));
+                .recv_timeout(Duration::from_secs(10));
             Ok(b"null".to_vec())
         })
         .unwrap();
@@ -280,6 +280,7 @@ async fn running_callback_retains_capture_until_real_completion() {
         drops.load(Ordering::SeqCst),
         engine.active_sandboxes(),
     );
+    let first_close = tokio::time::timeout(Duration::from_secs(2), sandbox.close()).await;
     // Release before assertions, even if a captured observation is wrong.
     let _ = release_tx.send(());
     let outcome = tokio::time::timeout(Duration::from_secs(3), invocation)
@@ -296,12 +297,25 @@ async fn running_callback_retains_capture_until_real_completion() {
         "retirement must precede waiting for the callback"
     );
     assert_eq!(observed, (1, 0, 1));
+    let first_close = first_close.unwrap().unwrap();
+    assert!(!first_close.closed_cleanly);
+    assert!(first_close.pending_host_operations > 0);
     assert_eq!(report.sandboxes_closed, 1);
     assert!(outcome.is_err());
     wait_until(
         "capture and admission release",
         Duration::from_secs(2),
         || drops.load(Ordering::SeqCst) == 1 && engine.active_sandboxes() == 0,
+    );
+    let settled = sandbox.close().await.unwrap();
+    assert!(
+        settled.closed_cleanly,
+        "completed native cleanup must be observable"
+    );
+    assert_eq!(settled.pending_host_operations, 0);
+    assert!(
+        settled.forced_termination,
+        "termination history remains visible"
     );
     drop(sandbox);
 }

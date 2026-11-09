@@ -1038,23 +1038,29 @@ impl WorkerState {
                 }
             }
             let joined = self.joined.load(Ordering::Acquire);
-            let mut report = self
-                .report
-                .lock()
-                .expect("report mutex poisoned")
-                .clone()
-                .unwrap_or_else(|| CloseReport {
-                    invocations_completed: self.completed.load(Ordering::SeqCst),
-                    invocations_cancelled: self.cancelled.load(Ordering::SeqCst),
-                    forced_termination: self.control.is_cancelled(),
-                    closed_cleanly: false,
-                    pending_host_operations: self.host.outstanding(),
-                });
+            let driver_report = self.report.lock().expect("report mutex poisoned").clone();
+            let waiting_for_host_work = driver_report
+                .as_ref()
+                .is_some_and(|report| report.pending_host_operations > 0);
+            let mut report = driver_report.unwrap_or_else(|| CloseReport {
+                invocations_completed: self.completed.load(Ordering::SeqCst),
+                invocations_cancelled: self.cancelled.load(Ordering::SeqCst),
+                forced_termination: self.control.is_cancelled(),
+                closed_cleanly: false,
+                pending_host_operations: self.host.outstanding(),
+            });
             if !joined {
                 report.closed_cleanly = false;
                 report.forced_termination = true;
             }
             report.pending_host_operations = self.host.outstanding();
+            if joined && waiting_for_host_work && report.pending_host_operations == 0 {
+                // A successfully disposed driver may have reported native
+                // work still draining. Reobserve that work, rather than
+                // retaining its old incomplete snapshot forever. Driver
+                // disposal errors have no successful pending-work report.
+                report.closed_cleanly = true;
+            }
             let children: Vec<_> = self
                 .children
                 .lock()
